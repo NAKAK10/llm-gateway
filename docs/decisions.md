@@ -2,6 +2,26 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-07-30 — Hand-rolled release workflow instead of cargo-dist
+
+The trigger model is "merge dev→main releases whatever version Cargo.toml
+says", not "push a tag" — cargo-dist is tag-driven, so it would need an
+auto-tagging shim anyway, and its generated workflow is ~2000 lines we would
+own without understanding. The hand-rolled `release.yml` is ~100 lines:
+version check (no-op when the tag exists, so docs-only merges are safe),
+macOS arm64+x86_64 build, GitHub Release, formula regeneration pushed to
+NAKAK10/homebrew-tap via a write-scoped deploy key (`TAP_DEPLOY_KEY` secret —
+narrower than any PAT). Revisit cargo-dist if targets multiply.
+
+## 2026-07-30 — Repo made public
+
+Required for a normal Homebrew experience (binary downloads from Releases
+need no auth). Pre-publication audit: full-history blob scan for key
+patterns and personal data came back clean; the one finding — a committed
+`target/` directory leaking local paths — was purged with filter-branch and
+force-pushed before anything else happened. Commit identity is the public
+NAKAK10 address.
+
 ## 2026-07-30 — Response bodies are never parsed or rebuilt
 
 The gateway rewrites the request's `model` field and nothing else; responses

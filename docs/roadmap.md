@@ -11,7 +11,9 @@
 - [x] `launch` for Claude Code / Codex / opencode — zero client-config edits
 - [ ] real-world smoke: each client through the gateway + the reverse test
       (stop the gateway, confirm every client fails = nothing bypasses it)
-- [ ] `dist` (cargo-dist) release pipeline + Homebrew tap
+- [x] release pipeline: merge dev→main builds macOS binaries, publishes the
+      GitHub Release and updates NAKAK10/homebrew-tap (hand-rolled workflow,
+      not cargo-dist — see decisions.md)
 
 ## Blocked on external facts
 
