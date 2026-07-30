@@ -11,6 +11,11 @@ and streams the response back **byte-for-byte unmodified**. Model selection,
 fallback, cost accounting and auditable routing decisions all live in one
 config file.
 
+The one deliberate exception is a [cross-protocol route](#cross-protocol-routing):
+when the client's protocol and the provider's differ, the request and response
+*are* rebuilt, because the alternative is that the pair simply does not work.
+Same-protocol traffic — still the overwhelming majority — is untouched.
+
 ```
 llm-gateway launch claude    ─┐
 llm-gateway launch codex      ┼→  llm-gateway serve :4000  →  anthropic / openai /
@@ -72,10 +77,128 @@ agent files** — every request flows through the gateway:
 | Codex CLI | `~/.codex/agents/*.toml` `model =` | provider is global, models pass through via `gpt-*` |
 | opencode | `agents/*.md` `model: openai/…` | `launch` also redirects the built-in providers named in `launch.opencode.overrideProviders` (default `openai`, `anthropic`), because opencode picks a provider per model reference — without this, pinned agents would silently bypass the gateway |
 
-Routing is by model name today: an exact route name wins, otherwise the
-longest wildcard prefix. Content-based (semantic) routing that picks a route
-from the request itself is Phase 2 — `routes[].description` is its future
-classification corpus.
+Routing is by model name by default: an exact route name wins, otherwise the
+longest wildcard prefix. Content-based (semantic) routing, which picks a route
+from the request itself, is available for routes that opt in — see
+[Semantic routing](#semantic-routing) below.
+
+## Semantic routing
+
+Content-based routing picks a route from the *content* of the request instead
+of its `model` name. It runs only for a route that carries a `semantic` block;
+everything else stays exact-name-first, then longest-wildcard-prefix.
+
+**Requires a build with the `semantic` cargo feature** — the Homebrew binary
+has it, `cargo install` without `--features semantic` does not. The feature is
+opt-in at build time because the embedding model is ~500MB. A binary without it
+warns at startup and forwards such routes to their own `model` directly, so the
+config stays valid either way. The model is downloaded on first `serve` with a
+`semantic` route configured, and is only loaded into memory when one exists.
+
+`routes[].semantic` is an optional field on any route:
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `candidates` | `string[]` | `[]` | Route names eligible for selection. Empty means "every other route that has a `description`". |
+| `threshold` | `number` | `0.45` | If the top-1 cosine similarity of the request against the candidates falls below this, the auto route's own `model` is used instead. |
+
+Design points:
+
+- **The auto route's own `model` is where requests land when no candidate
+  clears the threshold** — so a route with `semantic` still needs a `model`,
+  exactly like any other route.
+- **An explicit route name is never overridden.** Classification only runs
+  when a request names a route that itself carries `semantic`. This
+  continues the existing rule that an exact route name always wins and is
+  always predictable (see `src/route.rs`, Phase 2 in `docs/roadmap.md`).
+- **Candidates must have a `description`** — that's the classification
+  corpus (long descriptions can live in `llm/*.md`, as today).
+- **Candidates the incoming request cannot reach are excluded at match
+  time** — a request to `/v1/chat/completions` will never resolve to an
+  `anthropic-messages` candidate, because nothing translates in that
+  direction. A Claude Code request *can* pick an `openai-chat` candidate,
+  since that direction is translated (see
+  [Cross-protocol routing](#cross-protocol-routing)).
+- **Route names with `semantic` cannot use a wildcard (`*`).**
+
+```json5
+routes: {
+  "auto": {
+    semantic: {
+      candidates: ["role-light", "role-deep", "role-code"],
+      threshold: 0.45,
+    },
+    // Where requests land when no candidate clears the threshold.
+    model: {
+      default: "ollama-local/qwen3:8b",
+      fallbacks: ["openrouter/qwen/qwen3-8b"],
+    },
+  },
+
+  "role-light": {
+    description: "Short, well-defined chores: summarizing, formatting, commit messages, naming",
+    model: {
+      default: "ollama-local/qwen3:8b",
+      fallbacks: ["groq/llama-3.3-70b-versatile"],
+    },
+  },
+
+  "role-deep": {
+    description: "./llm/role-deep.md",
+    model: {
+      default: "openrouter/anthropic/claude-opus-5",
+      fallbacks: ["openrouter/google/gemini-3-pro"],
+    },
+  },
+
+  "role-code": {
+    description: "Code generation, refactoring, test writing, bug fixes",
+    model: {
+      default: "openrouter/qwen/qwen3-coder",
+      fallbacks: ["deepseek/deepseek-coder"],
+    },
+  },
+}
+```
+
+## Cross-protocol routing
+
+Claude Code only ever speaks Anthropic Messages, and almost every cheap or
+local provider only speaks OpenAI Chat. So one direction is translated:
+
+| client speaks | provider speaks | result |
+|---|---|---|
+| `anthropic-messages` | `openai-chat` | translated — Claude Code reaches Ollama, Groq, DeepSeek, Gemini, Mistral, Together, Sakana AI, PLaMo |
+| same on both sides | — | byte-for-byte passthrough, as before |
+| anything else | — | `400` with an explanation, as before |
+
+```json5
+providers: {
+  "ollama-local": { baseUrl: "http://127.0.0.1:11434/v1", api: "openai-chat" },
+},
+routes: {
+  // Reached from Claude Code with: llm-gateway launch claude --model role-cheap
+  "role-cheap": { model: { default: "ollama-local/qwen3:8b" } },
+}
+```
+
+What a translated route costs you:
+
+- **Prompt caching, `thinking` blocks, citations and Anthropic server-side
+  tools** (`web_search`, `bash`, `text_editor`) are dropped — the target
+  protocol has nowhere to put them. `cache_creation_input_tokens` is always 0.
+- **`/v1/messages/count_tokens` is answered locally with an estimate**, because
+  `openai-chat` has no token-counting endpoint. Returning nothing would break
+  Claude Code's context sizing; the estimate is marked
+  `result: "estimated_locally"` in the trace log.
+- **The response is rebuilt**, so it is not byte-identical to what the provider
+  sent. `llm-gateway trace` marks those requests with
+  `xlat=anthropic-messages->openai-chat` — always check that field first when
+  output looks subtly off.
+- Usage accounting is *not* affected: token counts are read from the upstream
+  bytes before translation.
+
+Full list of what is and is not carried across: `docs/gotchas.md`.
 
 ## Supported providers
 
@@ -99,6 +222,9 @@ copy-paste config for each.
 | PLaMo (Preferred Networks) | `https://api.platform.preferredai.jp/v1` | `openai-chat` | `PLAMO_API_KEY` |
 | Ollama Cloud | `https://ollama.com/v1` | `openai-chat` | `OLLAMA_API_KEY` |
 | Ollama (local) | `http://127.0.0.1:11434/v1` | `openai-chat` | *(none needed)* |
+
+Every `openai-chat` provider in this table is reachable from Claude Code too —
+see [Cross-protocol routing](#cross-protocol-routing).
 
 ## Configuration reference
 

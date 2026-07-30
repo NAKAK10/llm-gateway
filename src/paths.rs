@@ -56,6 +56,12 @@ pub fn llm_dir() -> PathBuf {
     config_dir().join("llm")
 }
 
+/// `~/.config/llm-gateway/models/potion-multilingual-128M/` — the static
+/// embedding model used for semantic routing (`semantic` feature only).
+pub fn semantic_model_dir() -> PathBuf {
+    config_dir().join("models").join("potion-multilingual-128M")
+}
+
 /// Resolve a `logging.dir` value, which may be relative to the config dir.
 pub fn logs_dir(configured: &str) -> PathBuf {
     let p = PathBuf::from(configured);

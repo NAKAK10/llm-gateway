@@ -29,6 +29,12 @@ and the endpoint answered.
 | Ollama Cloud | `https://ollama.com/v1` | `openai-chat` | `OLLAMA_API_KEY` |
 | Ollama (local) | `http://127.0.0.1:11434/v1` | `openai-chat` | *(none)* |
 
+The `api` value decides which endpoints can reach a provider — with one
+crossing: an `anthropic-messages` client (Claude Code) can reach any
+`openai-chat` provider here, because that direction is translated. See
+[Cross-protocol routing](../README.md#cross-protocol-routing) for what such a
+route gives up.
+
 `baseUrl` rules (see `docs/config-reference.md`): no trailing slash;
 `anthropic-messages` providers give the host root (the gateway appends
 `/v1/messages`), OpenAI-kind providers include the `/v1`-style prefix (the

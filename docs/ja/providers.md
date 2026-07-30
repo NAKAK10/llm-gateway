@@ -30,6 +30,14 @@
 | Ollama Cloud | `https://ollama.com/v1` | `openai-chat` | `OLLAMA_API_KEY` |
 | Ollama(ローカル) | `http://127.0.0.1:11434/v1` | `openai-chat` | *(不要)* |
 
+`api` の値がそのプロバイダーにどのエンドポイントから到達できるかを決めます
+— ただし 1 つだけ交差があります: `anthropic-messages` のクライアント
+(Claude Code)は、ここに載っている任意の `openai-chat` プロバイダーに
+到達できます。その方向は変換されるからです。そのようなルートで何を諦める
+ことになるかは
+[クロスプロトコルルーティング](../../README.ja.md#クロスプロトコルルーティング)
+を参照してください。
+
 `baseUrl` のルール(`docs/config-reference.md` 参照): 末尾スラッシュなし。
 `anthropic-messages` のプロバイダーはホストのルートを指定(ゲートウェイが
 `/v1/messages` を付加)、OpenAI 系のプロバイダーは `/v1` 相当のプレフィックス

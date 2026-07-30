@@ -296,12 +296,11 @@ mod tests {
         config.routes.insert(
             "route-a".to_string(),
             crate::config::RouteConfig {
-                title: None,
-                description: None,
                 model: crate::config::ModelConfig {
                     default: "p/m".to_string(),
                     fallbacks: Vec::new(),
                 },
+                ..Default::default()
             },
         );
 

@@ -2,6 +2,57 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-07-31 — One-way translation: Anthropic Messages in, OpenAI Chat out
+
+Issue #3. `launch claude` had two possible destinations (Anthropic,
+OpenRouter-as-Anthropic) because Claude Code only speaks `/v1/messages` and
+every other provider in the table speaks `openai-chat`. "Send the cheap work to
+local Ollama" — the most basic reason to run a gateway at all — was impossible
+for the client most people use it with. So the `anthropic-messages` →
+`openai-chat` direction is now translated (`src/translate/`).
+
+Scope decisions:
+
+- **One direction only.** The reverse (`openai-chat` client → Anthropic
+  provider) has no unmet need: OpenRouter already exposes an
+  Anthropic-compatible endpoint, and the OpenAI-protocol clients can all reach
+  `openai-chat` providers directly. Responses ⇄ anything stays untranslated
+  (issue #4).
+- **The passthrough guarantee is kept where it applies.** Same-protocol
+  requests do not touch the new code path at all: `proxy` picks
+  `passthrough::respond(observed)` directly, and translation is only reachable
+  for a pair that previously returned `400`. No working config changes
+  behaviour.
+- **Cross-protocol *fallback* is still refused by validation.** `proxy` selects
+  one translation per route from its first target; a route mixing protocols
+  would make the answer depend on which upstream happened to respond. Uniform
+  target lists keep that unambiguous.
+- **Usage accounting reads the upstream bytes, before translation.** The
+  observer (`usage/tee.rs`) sits below the translation layer, so token counts
+  come from what the provider actually reported rather than from a rebuilt
+  body.
+- **`count_tokens` is answered locally with an estimate.** `openai-chat` has no
+  equivalent endpoint. A `400` would leave Claude Code unable to size its
+  context window (it decides when to compact from that number), and forwarding
+  the question to a *different* provider would answer with a token count for
+  the wrong tokenizer. An approximate answer, marked in the trace log, is the
+  least-wrong option.
+- **Every translated request is marked in the trace log**
+  (`resolved.translation`, shown as `xlat=…` by `llm-gateway trace`), because
+  "why does this output look slightly different?" needs an answer that does not
+  require reading the config.
+
+Lossy by construction: prompt caching, `thinking` blocks, citations and
+Anthropic server-side tools have no `openai-chat` representation and are
+dropped. `openai-chat` `reasoning_content` is dropped in the other direction
+rather than forged into a `thinking` block, which would need a `signature` only
+Anthropic can produce. Documented in `docs/gotchas.md`.
+
+Not evaluated further: `va-ai-api-bridge` (the roadmap's first candidate) would
+have been another dependency for something that is ~700 lines here and needs to
+match *these* clients' quirks exactly — `finish_reason: "stop"` alongside tool
+calls, Ollama's missing `index`/`id` on tool calls, mid-stream error frames.
+
 ## 2026-07-30 — Hand-rolled release workflow instead of cargo-dist
 
 The trigger model is "merge dev→main releases whatever version Cargo.toml

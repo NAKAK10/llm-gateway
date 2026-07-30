@@ -366,12 +366,11 @@ pub fn build_config(
         config.routes.insert(
             "claude-*".to_string(),
             RouteConfig {
-                title: None,
-                description: None,
                 model: ModelConfig {
                     default: "anthropic/*".to_string(),
                     fallbacks,
                 },
+                ..Default::default()
             },
         );
     }
@@ -384,12 +383,11 @@ pub fn build_config(
         config.routes.insert(
             "gpt-*".to_string(),
             RouteConfig {
-                title: None,
-                description: None,
                 model: ModelConfig {
                     default: "openai/*".to_string(),
                     fallbacks,
                 },
+                ..Default::default()
             },
         );
     }
@@ -398,12 +396,11 @@ pub fn build_config(
         config.routes.insert(
             "role-default".to_string(),
             RouteConfig {
-                title: None,
-                description: None,
                 model: ModelConfig {
                     default: format!("{}/*", first.id()),
                     fallbacks: Vec::new(),
                 },
+                ..Default::default()
             },
         );
     }

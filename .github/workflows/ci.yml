@@ -17,10 +17,16 @@ jobs:
         # macOS is the primary target (Keychain, launch integration);
         # Linux keeps the portable core honest.
         os: [macos-latest, ubuntu-latest]
+        # Default features keep the gateway's normal (small) dependency
+        # footprint honest; `semantic` additionally builds/tests the static
+        # embedding model download path used by semantic routing (issue #2).
+        features: ["", "semantic"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --all-targets ${{ matrix.features && format('--features {0}', matrix.features) || '' }} -- -D warnings
+      - run: cargo test ${{ matrix.features && format('--features {0}', matrix.features) || '' }}

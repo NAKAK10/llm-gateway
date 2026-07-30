@@ -26,7 +26,7 @@ upstream may be registered under several ids to expose different protocols.
 | field | default | notes |
 |---|---|---|
 | `baseUrl` | *(required)* | No trailing slash. For `anthropic-messages` this is the host root (`https://api.anthropic.com`) — the gateway appends `/v1/messages`. For the OpenAI kinds include the version prefix (`…/v1`) — the gateway appends `/chat/completions` or `/responses`. |
-| `api` | *(required)* | `openai-chat` \| `openai-responses` \| `anthropic-messages`. |
+| `api` | *(required)* | `openai-chat` \| `openai-responses` \| `anthropic-messages`. A route may be reached from a client speaking a different protocol only when the gateway can translate the pair — today `anthropic-messages` in → `openai-chat` out, i.e. Claude Code to any OpenAI-compatible provider. Anything else is a `400`. |
 | `apiKey` | *(none)* | Literal string \| `"${ENV_VAR}"` \| `"keychain:<name>"` (macOS Keychain, service `llm-gateway/<name>`). Resolved **per request attempt**, so rotation applies live. |
 | `headers` | `{}` | Extra request headers, e.g. OpenRouter's optional `HTTP-Referer` / `X-Title`. |
 | `injectUsage` | `true` | Streamed `openai-chat` only: adds `stream_options.include_usage` so token counts exist. Appends one usage-only chunk at stream end. |
@@ -44,6 +44,8 @@ among wildcards the longest prefix wins. Wildcard routes are not listed in
 | `description` | *(none)* | Inline text, or a path when it starts with `./` `../` `/` `~/` (relative paths resolve against the config dir). Future semantic routing classifies against this — write it as "when should this route be picked". |
 | `model.default` | *(required)* | `"<provider>/<model>"`, split on the **first** `/` only — `openrouter/anthropic/claude-x` and `ollama-cloud/glm:cloud` both parse. `*` in the model part is replaced by the requested name. |
 | `model.fallbacks` | `[]` | Tried in order, only before the first response byte, only on connect failure / timeout / 408 / 429 / 5xx. Must use providers with the same `api` as the default. |
+| `semantic.candidates` | `[]` | **Needs a build with the `semantic` cargo feature; without it these routes forward to their own `model` and a startup warning says so.** Route names eligible for selection when *this* route is requested by name. Empty means "every other route that has a `description`". Candidates must have a `description` (the classification corpus); candidates the incoming request's protocol can neither match nor be translated to are excluded at match time. An explicit route name is never overridden — classification only runs for a route that itself carries `semantic`. A route name with `semantic` cannot end in `*`. |
+| `semantic.threshold` | `0.45` | If the top-1 cosine similarity against the candidates falls below this, `model` on this route is used instead — so a route with `semantic` still requires `model`. |
 
 ## launch.\<client\>
 
@@ -71,5 +73,9 @@ cache_write_tok, dur_ms, status(success|aborted|error), stream, error?`
 `trace-*.jsonl`:
 `ts, req_id, client, endpoint, requested_model, input{messages_n,
 last_user_text?, tokens_est, tools, has_image, stream}, routing{mode,
-matched_route, reason, …scores when semantic}, resolved{provider, model, api},
+matched_route, reason, …scores when semantic}, resolved{provider, model, api, translation?},
 attempts[{n, target, result, ms}], usage?{in_tok, out_tok}`
+
+`resolved.translation` is present only when the request crossed protocols
+(e.g. `"anthropic-messages->openai-chat"`); its absence means the response was
+forwarded byte-for-byte.

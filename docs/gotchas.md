@@ -58,6 +58,50 @@ Traps we already know about. If you hit one that isn't here, add it.
   startup environment.
 - **`localhost` may resolve to `::1`.** Every config and doc uses `127.0.0.1`.
 
+## Cross-protocol translation
+
+Only one direction exists: `anthropic-messages` in → `openai-chat` out
+(`src/translate/`). It runs *only* when the client's protocol and the provider's
+differ; same-protocol traffic never enters this code path.
+
+- **The byte-for-byte guarantee does not hold on a translated route.** Say so in
+  any user-facing description, and check `llm-gateway trace` for
+  `xlat=anthropic-messages->openai-chat` before debugging a "weird output" report.
+- **Silently dropped, because the target protocol has nowhere to put them:**
+  prompt caching (`cache_control`, and `cache_creation_input_tokens` is always
+  0), `thinking` blocks and the `thinking` request config, citations,
+  `document`/`search_result` content blocks, `top_k`, and Anthropic server-side
+  tools (`web_search_*`, `bash_*`, `text_editor_*` — they run inside
+  Anthropic's infrastructure, so no other provider could execute them anyway).
+- **`reasoning_content` / `reasoning` deltas are dropped, not converted.** A
+  real Anthropic `thinking` block carries a `signature` only Anthropic can
+  produce; forwarding the reasoning as ordinary text would present it as the
+  answer. A thinking-heavy local model therefore looks silent until it starts
+  answering — and with a small `max_tokens` it can return **no text at all**
+  (measured: `qwen3.5:4b` with `max_tokens: 64` spent all 64 tokens on
+  `reasoning` and returned an empty `content`). That is the upstream's answer,
+  not a gateway bug: check the provider directly before hunting for one.
+- **`finish_reason: "stop"` alongside `tool_calls` is common** (Ollama, several
+  OpenAI-compatible servers). The Anthropic side must report
+  `stop_reason: "tool_use"` anyway, or the client never executes the tool call
+  it was just handed. Same rule in the streaming and non-streaming translator.
+- **`function.arguments` is a JSON *string* on the OpenAI side and an object on
+  the Anthropic side.** In a stream the fragments must be forwarded verbatim as
+  `input_json_delta.partial_json` — a fragment is not valid JSON on its own, and
+  re-serialising it corrupts the call.
+- **Ollama omits `index` and `id` on streamed tool calls.** Keying blocks by
+  `index` alone merges two calls into one; ids have to be synthesized.
+- **The terminal events must be emitted on every path.** `[DONE]`, a
+  `finish_reason`, a mid-stream `{"error":…}` frame, or an upstream that just
+  stops — the client must always get `content_block_stop` + `message_delta` +
+  `message_stop`, or it waits forever.
+- **`/v1/messages/count_tokens` cannot be forwarded** (`openai-chat` has no such
+  endpoint) and is answered with a local estimate. It is an estimate, not a
+  count: `result: "estimated_locally"` in the trace log is how you tell.
+- **Usage accounting is unaffected** — `usage/tee.rs` observes the upstream
+  bytes below the translation layer. If you ever move that observer above it,
+  every translated request starts reporting the *translator's* numbers.
+
 ## Config / security
 
 - `config.json` can hold literal keys → `0600` on create, warned on drift,

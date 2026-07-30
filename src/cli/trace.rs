@@ -108,9 +108,22 @@ pub fn format_line(record: &TraceRecord) -> String {
         Some(usage) => format!(" in={} out={}", usage.in_tok, usage.out_tok),
         None => String::new(),
     };
+    // Only semantic routing has a score to show; explicit matches leave it
+    // `None` and this stays empty, so the common case is unaffected.
+    let score_suffix = match record.routing.score {
+        Some(score) => format!(" score={score:.2}"),
+        None => String::new(),
+    };
+    // Shown because a translated response is the one case where the bytes the
+    // client saw are not the bytes the provider sent — "why does this output
+    // look slightly different?" starts here.
+    let translation_suffix = match &record.resolved.translation {
+        Some(label) => format!(" xlat={label}"),
+        None => String::new(),
+    };
 
     format!(
-        "{time} {client}→{route} [{provider}/{model}] {result}{attempts_suffix}{usage_suffix}",
+        "{time} {client}→{route}{score_suffix} [{provider}/{model}]{translation_suffix} {result}{attempts_suffix}{usage_suffix}",
         client = record.client,
         route = record.routing.matched_route,
         provider = record.resolved.provider,
@@ -153,6 +166,7 @@ mod tests {
                 provider: "anthropic".to_string(),
                 model: "claude-sonnet-4-6".to_string(),
                 api: "anthropic-messages".to_string(),
+                translation: None,
             },
             attempts: vec![TraceAttempt {
                 n: 1,
@@ -198,6 +212,32 @@ mod tests {
         assert_eq!(
             format_line(&record),
             "12:34:56 claude-code→claude-* [anthropic/claude-sonnet-4-6] ok_first_byte in=120 out=340"
+        );
+    }
+
+    #[test]
+    fn a_translated_route_is_marked_so_a_rebuilt_response_is_never_a_surprise() {
+        let mut record = base_record();
+        record.resolved.provider = "ollama".to_string();
+        record.resolved.model = "qwen3.5:latest".to_string();
+        record.resolved.api = "openai-chat".to_string();
+        record.resolved.translation = Some("anthropic-messages->openai-chat".to_string());
+        assert_eq!(
+            format_line(&record),
+            "12:34:56 claude-code→claude-* [ollama/qwen3.5:latest] \
+             xlat=anthropic-messages->openai-chat ok_first_byte"
+        );
+    }
+
+    #[test]
+    fn semantic_score_is_appended_when_present() {
+        let mut record = base_record();
+        record.routing.mode = "semantic".to_string();
+        record.routing.matched_route = "role-writer".to_string();
+        record.routing.score = Some(0.812);
+        assert_eq!(
+            format_line(&record),
+            "12:34:56 claude-code→role-writer score=0.81 [anthropic/claude-sonnet-4-6] ok_first_byte"
         );
     }
 }

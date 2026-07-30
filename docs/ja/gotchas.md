@@ -65,6 +65,56 @@
 - **`localhost` は `::1` に解決されることがある。** すべての設定とドキュメントは
   `127.0.0.1` を使う。
 
+## クロスプロトコル変換
+
+方向は一つだけ: `anthropic-messages` 受信 → `openai-chat` 送信
+(`src/translate/`)。走るのはクライアントとプロバイダーのプロトコルが
+異なる場合*だけ*で、同一プロトコル同士のトラフィックはこの経路に一切入らない。
+
+- **変換されたルートではバイト単位無加工の保証が成り立たない。** ユーザー
+  向けの説明には必ずそう書くこと。「出力がおかしい」という報告を調べる前に
+  `llm-gateway trace` で `xlat=anthropic-messages->openai-chat` を確認する。
+- **静かに破棄されるもの(変換先プロトコルに置き場がないため):**
+  プロンプトキャッシュ(`cache_control`。`cache_creation_input_tokens` は
+  常に 0)、`thinking` ブロックと `thinking` リクエスト設定、citation、
+  `document`/`search_result` コンテンツブロック、`top_k`、Anthropic の
+  サーバーサイドツール(`web_search_*`、`bash_*`、`text_editor_*` —
+  Anthropic 自身のインフラ内で実行されるものなので、どのみち他の
+  プロバイダーには実行しようがない)。
+- **`reasoning_content` / `reasoning` の delta は変換されず破棄される。**
+  本物の Anthropic `thinking` ブロックは Anthropic だけが発行できる
+  `signature` を持つ — reasoning を普通のテキストとして転送すれば、
+  それが答えであるかのように見えてしまう。そのため reasoning の長い
+  ローカルモデルは、答え始めるまで黙っているように見える。`max_tokens` が
+  小さいと**本文がまったく無いまま返る**ことすらある(実測: `qwen3.5:4b`
+  に `max_tokens: 64` — 64 トークンすべてを reasoning に使い、`content` は
+  空文字列だった)。ゲートウェイのバグではなく、上流がそう返している。
+- **`finish_reason: "stop"` が `tool_calls` と同時に来ることは珍しくない**
+  (Ollama や複数の OpenAI 互換サーバー)。それでも Anthropic 側は
+  `stop_reason: "tool_use"` を報告しなければならない — さもないとクライアントは
+  渡されたツール呼び出しを一切実行しない。ストリーミング / 非ストリーミング
+  どちらの変換器でも同じ規則。
+- **`function.arguments` は OpenAI 側では JSON *文字列*、Anthropic 側では
+  オブジェクト。** ストリーム中はフラグメントをそのまま
+  `input_json_delta.partial_json` として転送しなければならない — 断片単体は
+  有効な JSON ではなく、再シリアライズすると呼び出しが壊れる。
+- **Ollama はストリーミングのツール呼び出しで `index` と `id` を省略する。**
+  `index` だけでブロックをキーイングすると 2 つの呼び出しが 1 つに
+  合体してしまう。id は合成するしかない。
+- **終端イベントはどの経路でも必ず送出しなければならない。** `[DONE]`、
+  `finish_reason`、ストリーム途中の `{"error":…}` フレーム、あるいは
+  アップストリームがただ止まる場合 — どの場合でもクライアントは
+  `content_block_stop` + `message_delta` + `message_stop` を受け取らなければ
+  永遠に待ち続ける。
+- **`/v1/messages/count_tokens` は転送できない**(`openai-chat` に該当する
+  エンドポイントがない)ためローカルの推定値で応答する。カウントではなく
+  推定値であることは、トレースログの `result: "estimated_locally"` で
+  見分けられる。
+- **使用量集計には影響しない** — `usage/tee.rs` は変換レイヤーより下の
+  アップストリームのバイト列を観測している。この観測ポイントを変換レイヤーの
+  上に移してしまうと、変換されたリクエストはすべて*変換器側*の数値を
+  報告し始める。
+
 ## 設定 / セキュリティ
 
 - `config.json` はリテラルのキーを保持しうる → 作成時に `0600`、権限ドリフトは

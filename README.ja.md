@@ -11,6 +11,12 @@ OpenAI Responses(`/v1/responses`)— を話し、リクエストの `model`
 ストリーミングで返します。モデル選択、フォールバック、コスト集計、
 監査可能なルーティング記録は、すべてひとつの設定ファイルに集約されます。
 
+唯一の意図的な例外が[クロスプロトコルルーティング](#クロスプロトコルルーティング)です。
+クライアントとプロバイダーのプロトコルが異なる場合に限り、リクエストと
+レスポンスを実際に組み立て直します — そうしなければその組み合わせはそもそも
+動かないからです。同一プロトコル同士の通信(依然として大多数を占めます)
+には手を加えません。
+
 ```
 llm-gateway launch claude    ─┐
 llm-gateway launch codex      ┼→  llm-gateway serve :4000  →  anthropic / openai /
@@ -72,9 +78,132 @@ llm-gateway stats           # ルートごとの消費量を表示
 | Codex CLI | `~/.codex/agents/*.toml` の `model =` | プロバイダー指定はグローバルなので全 agent が経由。モデル名は `gpt-*` が転送 |
 | opencode | `agents/*.md` の `model: openai/…` | `launch` が `launch.opencode.overrideProviders`(既定 `openai`, `anthropic`)の組み込みプロバイダーもゲートウェイに向ける。opencode はモデル参照ごとにプロバイダーを選ぶため、これが無いと固定 agent が黙ってゲートウェイを素通りする |
 
-現時点のルーティングは**モデル名ベース**です(完全一致 → 最長 wildcard)。
-リクエスト内容から route を選ぶセマンティック分類は Phase 2 で、
-`routes[].description` がその分類コーパスになります。
+既定のルーティングは**モデル名ベース**です(完全一致 → 最長 wildcard)。
+リクエスト内容から route を選ぶセマンティック分類は、`semantic` を持つ
+route でのみ動きます — 下記の
+[セマンティックルーティング](#セマンティックルーティング)を参照してください。
+
+## セマンティックルーティング
+
+コンテンツベースルーティングは、`model` 名ではなくリクエストの**内容**から
+route を選びます。動くのは `semantic` ブロックを持つ route のときだけで、
+それ以外は従来どおり「完全一致 → 最長 wildcard」です。
+
+**`semantic` cargo feature 付きのビルドが必要です** — Homebrew 版には
+入っていますが、`--features semantic` なしの `cargo install` には入りません。
+埋め込みモデルが ~500MB あるため、ビルド時オプトインにしています。feature
+無しのバイナリは起動時に警告を出し、該当 route をそのまま自身の `model` に
+転送するので、設定はどちらでも有効です。モデルは `semantic` 付き route が
+ある状態で最初に `serve` したときにダウンロードされ、そのような route が
+存在するときだけメモリに読み込まれます。
+
+`routes[].semantic` はどの route にも追加できる任意フィールドです:
+
+| フィールド | 型 | 既定 | 意味 |
+|---|---|---|---|
+| `candidates` | `string[]` | `[]` | 選択対象になる route 名。空なら「`description` を持つ他の全 route」。 |
+| `threshold` | `number` | `0.45` | リクエストと候補群との top-1 cosine 類似度がこれを下回った場合、auto route 自身の `model` が代わりに使われる。 |
+
+設計上のポイント:
+
+- **auto route 自身の `model` は、どの候補も閾値に届かなかったときの
+  行き先**です。だから `semantic` を持つ route にも、他の route と同様に
+  `model` が必要です。
+- **明示的な route 名は絶対に上書きされません。** 分類が走るのは
+  `semantic` を持つ route 自身が名前で要求されたときだけです。これは
+  既存の「明示的な route 名は常に勝ち、常に予測可能」という設計方針の
+  継続です(`src/route.rs`、`docs/roadmap.md` の Phase 2 参照)。
+- **候補には `description` が必須です** — これが分類コーパスになります
+  (長い説明は今と同じく `llm/*.md` に置けます)。
+- **リクエストが届き得ない候補は、実行時に除外されます** —
+  `/v1/chat/completions` へのリクエストが `anthropic-messages` の候補に
+  解決されることは決してありません。その方向への変換が存在しないからです。
+  一方 Claude Code からのリクエストは `openai-chat` の候補を選べます —
+  その方向は変換されるからです
+  ([クロスプロトコルルーティング](#クロスプロトコルルーティング)参照)。
+- **`semantic` を持つ route 名にワイルドカード(`*`)は使えません。**
+
+```json5
+routes: {
+  "auto": {
+    semantic: {
+      candidates: ["role-light", "role-deep", "role-code"],
+      threshold: 0.45,
+    },
+    // どの候補も閾値に届かなかったときの行き先
+    model: {
+      default: "ollama-local/qwen3:8b",
+      fallbacks: ["openrouter/qwen/qwen3-8b"],
+    },
+  },
+
+  "role-light": {
+    description: "短い定型作業。要約、整形、コミットメッセージ生成、命名",
+    model: {
+      default: "ollama-local/qwen3:8b",
+      fallbacks: ["groq/llama-3.3-70b-versatile"],
+    },
+  },
+
+  "role-deep": {
+    description: "./llm/role-deep.md",
+    model: {
+      default: "openrouter/anthropic/claude-opus-5",
+      fallbacks: ["openrouter/google/gemini-3-pro"],
+    },
+  },
+
+  "role-code": {
+    description: "コード生成、リファクタリング、テスト作成、バグ修正",
+    model: {
+      default: "openrouter/qwen/qwen3-coder",
+      fallbacks: ["deepseek/deepseek-coder"],
+    },
+  },
+}
+```
+
+## クロスプロトコルルーティング
+
+Claude Code は Anthropic Messages しか話しませんが、安価あるいはローカルな
+プロバイダーのほとんどは OpenAI Chat しか話しません。そこで一方向だけを
+変換します:
+
+| クライアントが話す | プロバイダーが話す | 結果 |
+|---|---|---|
+| `anthropic-messages` | `openai-chat` | 変換される — Claude Code から Ollama、Groq、DeepSeek、Gemini、Mistral、Together、Sakana AI、PLaMo に到達できる |
+| 両側が同じ | — | 従来どおりバイト単位の無加工転送 |
+| それ以外の組み合わせ | — | 従来どおり説明付きの `400` |
+
+```json5
+providers: {
+  "ollama-local": { baseUrl: "http://127.0.0.1:11434/v1", api: "openai-chat" },
+},
+routes: {
+  // Claude Code から: llm-gateway launch claude --model role-cheap
+  "role-cheap": { model: { default: "ollama-local/qwen3:8b" } },
+}
+```
+
+変換されたルートで失われるもの:
+
+- **プロンプトキャッシュ、`thinking` ブロック、citation、Anthropic の
+  サーバーサイドツール**(`web_search`、`bash`、`text_editor`)は破棄されます
+  — 変換先のプロトコルにはそれらの置き場がありません。
+  `cache_creation_input_tokens` は常に 0 になります。
+- **`/v1/messages/count_tokens` はローカルの推定値で応答します** —
+  `openai-chat` にはトークンカウント用のエンドポイントがないためです。
+  何も返さなければ Claude Code のコンテキストサイズ計算が壊れるので、
+  推定値であることをトレースログの `result: "estimated_locally"` で示します。
+- **レスポンスは組み立て直される**ため、プロバイダーが送ってきたものと
+  バイト単位で同一ではありません。`llm-gateway trace` はこれらの
+  リクエストに `xlat=anthropic-messages->openai-chat` を付けます —
+  出力がおかしいと感じたら、まずこのフィールドを確認してください。
+- 使用量集計には**影響しません**: トークン数は変換前のアップストリームの
+  バイト列から読み取ります。
+
+何が引き継がれ、何が引き継がれないかの完全な一覧は
+`docs/ja/gotchas.md` を参照してください。
 
 ## サポートしているプロバイダー
 
@@ -98,6 +227,9 @@ llm-gateway stats           # ルートごとの消費量を表示
 | PLaMo (Preferred Networks) | `https://api.platform.preferredai.jp/v1` | `openai-chat` | `PLAMO_API_KEY` |
 | Ollama Cloud | `https://ollama.com/v1` | `openai-chat` | `OLLAMA_API_KEY` |
 | Ollama(ローカル) | `http://127.0.0.1:11434/v1` | `openai-chat` | *(不要)* |
+
+この表の `openai-chat` プロバイダーはすべて Claude Code からも到達できます
+— [クロスプロトコルルーティング](#クロスプロトコルルーティング)参照。
 
 ## 設定リファレンス
 

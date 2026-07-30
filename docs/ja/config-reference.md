@@ -26,7 +26,7 @@ id は `model` 文字列の最初の `/` より前に現れる部分です。同
 | フィールド | デフォルト | 補足 |
 |---|---|---|
 | `baseUrl` | *(必須)* | 末尾スラッシュなし。`anthropic-messages` はホストのルート(`https://api.anthropic.com`)— ゲートウェイが `/v1/messages` を付加する。OpenAI 系はバージョンプレフィックス(`…/v1`)まで含める — ゲートウェイが `/chat/completions` または `/responses` を付加する。 |
-| `api` | *(必須)* | `openai-chat` \| `openai-responses` \| `anthropic-messages`。 |
+| `api` | *(必須)* | `openai-chat` \| `openai-responses` \| `anthropic-messages`。あるルートに、その `api` とは異なるプロトコルを話すクライアントから到達できるのは、ゲートウェイがその組み合わせを変換できる場合だけ — 現時点では `anthropic-messages` 受信 → `openai-chat` 送信のみ(つまり Claude Code から任意の OpenAI 互換プロバイダーへ)。それ以外の組み合わせは `400` になる。 |
 | `apiKey` | *(なし)* | リテラル文字列 \| `"${ENV_VAR}"` \| `"keychain:<name>"`(macOS Keychain、サービス名 `llm-gateway/<name>`)。**リクエスト試行ごとに**解決されるため、ローテーションは即時反映。 |
 | `headers` | `{}` | 追加リクエストヘッダー。例: OpenRouter の任意ヘッダー `HTTP-Referer` / `X-Title`。 |
 | `injectUsage` | `true` | ストリーミングの `openai-chat` のみ: トークン数が取れるよう `stream_options.include_usage` を付加する。ストリーム末尾に usage のみのチャンクが 1 つ追加される。 |
@@ -71,5 +71,9 @@ cache_write_tok, dur_ms, status(success|aborted|error), stream, error?`
 `trace-*.jsonl`:
 `ts, req_id, client, endpoint, requested_model, input{messages_n,
 last_user_text?, tokens_est, tools, has_image, stream}, routing{mode,
-matched_route, reason, …セマンティック時はスコアも}, resolved{provider, model, api},
+matched_route, reason, …セマンティック時はスコアも}, resolved{provider, model, api, translation?},
 attempts[{n, target, result, ms}], usage?{in_tok, out_tok}`
+
+`resolved.translation` はリクエストがプロトコルをまたいだ場合にのみ存在し
+(例: `"anthropic-messages->openai-chat"`)、存在しなければレスポンスが
+バイト単位で無加工のまま転送されたことを意味します。
