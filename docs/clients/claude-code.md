@@ -36,6 +36,43 @@ Notes:
 - To avoid writing the token into the file, use `"apiKeyHelper"` with a script
   that prints it instead.
 
+## Routing Claude Code to a non-Anthropic provider
+
+Claude Code only speaks Anthropic Messages, but the gateway translates
+`anthropic-messages` → `openai-chat`, so any OpenAI-compatible provider works
+as a destination — Ollama (local or cloud), Groq, DeepSeek, Gemini, Mistral,
+Together, Sakana AI, PLaMo.
+
+Add a route with a plain name (route names may not contain `:` or `/`, so the
+provider's own model id stays on the right-hand side):
+
+```json5
+providers: {
+  "ollama-local": { baseUrl: "http://127.0.0.1:11434/v1", api: "openai-chat" },
+},
+routes: {
+  "role-cheap": {
+    description: "Short chores: summarizing, formatting, commit messages",
+    model: { default: "ollama-local/qwen3:8b" },
+  },
+}
+```
+
+Then pick it, either per session:
+
+```sh
+llm-gateway launch claude --model role-cheap
+```
+
+or from inside Claude Code with `/model role-cheap` — the name has to match the
+route exactly.
+
+What you give up on such a route is listed in the README
+([Cross-protocol routing](../../README.md#cross-protocol-routing)); the short
+version is prompt caching, thinking blocks, Anthropic server-side tools, and an
+exact token count. `llm-gateway trace` marks these requests
+`xlat=anthropic-messages->openai-chat`.
+
 ## Verify
 
 ```sh
@@ -54,6 +91,8 @@ your traffic is going through the gateway.
 | 400 mentioning betas / `context_management` | `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` (temporarily, to isolate) |
 | settings changes not taking effect | settings `env` overrides shell exports — check the file, not your shell |
 | count_tokens errors | the gateway forwards `/v1/messages/count_tokens`; check `llm-gateway providers` |
+| context size looks wrong on an `openai-chat` route | expected: that protocol has no counting endpoint, so the number is a local estimate |
+| a local model seems to answer nothing, then everything | its `reasoning_content` is dropped in translation; only the answer is forwarded |
 
 ## Rollback
 

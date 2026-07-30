@@ -37,6 +37,43 @@ Claude Code が解決した id をそのまま転送するため、Anthropic が
 - トークンをファイルに書きたくない場合は、`"apiKeyHelper"` にトークンを
   出力するスクリプトを指定してください。
 
+## Claude Code を Anthropic 以外のプロバイダーへルーティングする
+
+Claude Code は Anthropic Messages しか話しませんが、ゲートウェイは
+`anthropic-messages` → `openai-chat` を変換するので、OpenAI 互換の
+プロバイダーなら送り先として何でも使えます — Ollama(ローカル/クラウド)、
+Groq、DeepSeek、Gemini、Mistral、Together、Sakana AI、PLaMo。
+
+普通の名前でルートを追加します(ルート名に `:` や `/` は使えないので、
+プロバイダー自身のモデル id は右辺にそのまま残せます):
+
+```json5
+providers: {
+  "ollama-local": { baseUrl: "http://127.0.0.1:11434/v1", api: "openai-chat" },
+},
+routes: {
+  "role-cheap": {
+    description: "短い定型作業: 要約、整形、コミットメッセージ生成",
+    model: { default: "ollama-local/qwen3:8b" },
+  },
+}
+```
+
+あとはこれを選ぶだけです。セッションごとに指定するなら:
+
+```sh
+llm-gateway launch claude --model role-cheap
+```
+
+あるいは Claude Code の中から `/model role-cheap` — 名前はルート名と
+完全一致している必要があります。
+
+このようなルートで諦めることになるものは README にまとまっています
+([クロスプロトコルルーティング](../../../README.ja.md#クロスプロトコルルーティング))。
+手短に言えば、プロンプトキャッシュ、thinking ブロック、Anthropic の
+サーバーサイドツール、そして正確なトークン数です。`llm-gateway trace` は
+これらのリクエストに `xlat=anthropic-messages->openai-chat` を付けます。
+
 ## 動作確認
 
 ```sh
@@ -55,6 +92,8 @@ claude -p "ping"             # client=claude-code のトレース行が出るこ
 | betas / `context_management` に言及する 400 | `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`(切り分けのため一時的に) |
 | settings の変更が反映されない | settings の `env` はシェルの export を上書きする — シェルではなくファイルを確認 |
 | count_tokens のエラー | ゲートウェイは `/v1/messages/count_tokens` を転送する; `llm-gateway providers` を確認 |
+| `openai-chat` のルートでコンテキストサイズがおかしく見える | 想定どおり: そのプロトコルにはカウント用エンドポイントがないため、数値はローカルの推定値 |
+| ローカルモデルが最初は何も答えず、途中から急に答え始めるように見える | `reasoning_content` が変換で破棄されているだけ; 転送されるのは答えの部分のみ |
 
 ## 元に戻す
 

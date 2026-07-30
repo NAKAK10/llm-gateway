@@ -11,6 +11,12 @@ OpenAI Responses(`/v1/responses`)— を話し、リクエストの `model`
 ストリーミングで返します。モデル選択、フォールバック、コスト集計、
 監査可能なルーティング記録は、すべてひとつの設定ファイルに集約されます。
 
+唯一の意図的な例外が[クロスプロトコルルーティング](#クロスプロトコルルーティング)です。
+クライアントとプロバイダーのプロトコルが異なる場合に限り、リクエストと
+レスポンスを実際に組み立て直します — そうしなければその組み合わせはそもそも
+動かないからです。同一プロトコル同士の通信(依然として大多数を占めます)
+には手を加えません。
+
 ```
 llm-gateway launch claude    ─┐
 llm-gateway launch codex      ┼→  llm-gateway serve :4000  →  anthropic / openai /
@@ -104,9 +110,12 @@ llm-gateway stats           # ルートごとの消費量を表示
   継続です(`src/route.rs`、`docs/roadmap.md` の Phase 2 参照)。
 - **候補には `description` が必須です** — これが分類コーパスになります
   (長い説明は今と同じく `llm/*.md` に置けます)。
-- **リクエストのプロトコルに合わない候補は、実行時に除外されます** —
-  たとえば `/v1/chat/completions` へのリクエストが `anthropic-messages`
-  の候補に解決されることはありません。
+- **リクエストが届き得ない候補は、実行時に除外されます** —
+  `/v1/chat/completions` へのリクエストが `anthropic-messages` の候補に
+  解決されることは決してありません。その方向への変換が存在しないからです。
+  一方 Claude Code からのリクエストは `openai-chat` の候補を選べます —
+  その方向は変換されるからです
+  ([クロスプロトコルルーティング](#クロスプロトコルルーティング)参照)。
 - **`semantic` を持つ route 名にワイルドカード(`*`)は使えません。**
 
 ```json5
@@ -149,6 +158,48 @@ routes: {
 }
 ```
 
+## クロスプロトコルルーティング
+
+Claude Code は Anthropic Messages しか話しませんが、安価あるいはローカルな
+プロバイダーのほとんどは OpenAI Chat しか話しません。そこで一方向だけを
+変換します:
+
+| クライアントが話す | プロバイダーが話す | 結果 |
+|---|---|---|
+| `anthropic-messages` | `openai-chat` | 変換される — Claude Code から Ollama、Groq、DeepSeek、Gemini、Mistral、Together、Sakana AI、PLaMo に到達できる |
+| 両側が同じ | — | 従来どおりバイト単位の無加工転送 |
+| それ以外の組み合わせ | — | 従来どおり説明付きの `400` |
+
+```json5
+providers: {
+  "ollama-local": { baseUrl: "http://127.0.0.1:11434/v1", api: "openai-chat" },
+},
+routes: {
+  // Claude Code から: llm-gateway launch claude --model role-cheap
+  "role-cheap": { model: { default: "ollama-local/qwen3:8b" } },
+}
+```
+
+変換されたルートで失われるもの:
+
+- **プロンプトキャッシュ、`thinking` ブロック、citation、Anthropic の
+  サーバーサイドツール**(`web_search`、`bash`、`text_editor`)は破棄されます
+  — 変換先のプロトコルにはそれらの置き場がありません。
+  `cache_creation_input_tokens` は常に 0 になります。
+- **`/v1/messages/count_tokens` はローカルの推定値で応答します** —
+  `openai-chat` にはトークンカウント用のエンドポイントがないためです。
+  何も返さなければ Claude Code のコンテキストサイズ計算が壊れるので、
+  推定値であることをトレースログの `result: "estimated_locally"` で示します。
+- **レスポンスは組み立て直される**ため、プロバイダーが送ってきたものと
+  バイト単位で同一ではありません。`llm-gateway trace` はこれらの
+  リクエストに `xlat=anthropic-messages->openai-chat` を付けます —
+  出力がおかしいと感じたら、まずこのフィールドを確認してください。
+- 使用量集計には**影響しません**: トークン数は変換前のアップストリームの
+  バイト列から読み取ります。
+
+何が引き継がれ、何が引き継がれないかの完全な一覧は
+`docs/ja/gotchas.md` を参照してください。
+
 ## サポートしているプロバイダー
 
 以下はすべて `llm-gateway init` がそのまま雛形を生成できます。プロバイダーは
@@ -171,6 +222,9 @@ routes: {
 | PLaMo (Preferred Networks) | `https://api.platform.preferredai.jp/v1` | `openai-chat` | `PLAMO_API_KEY` |
 | Ollama Cloud | `https://ollama.com/v1` | `openai-chat` | `OLLAMA_API_KEY` |
 | Ollama(ローカル) | `http://127.0.0.1:11434/v1` | `openai-chat` | *(不要)* |
+
+この表の `openai-chat` プロバイダーはすべて Claude Code からも到達できます
+— [クロスプロトコルルーティング](#クロスプロトコルルーティング)参照。
 
 ## 設定リファレンス
 

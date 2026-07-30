@@ -15,9 +15,12 @@ use crate::error::ValidationReport;
 /// Errors (block startup):
 /// - a route references a provider that is not defined
 /// - a `model` string is not `"<provider>/<model>"`
-/// - a route's fallbacks do not all speak the same `ApiKind` as its default —
-///   crossing protocols needs translation, which does not exist yet, so a
-///   config that would silently produce garbage is refused instead
+/// - a route's fallbacks do not all speak the same `ApiKind` as its default.
+///   Cross-protocol translation exists for the *client*-to-provider direction
+///   (`crate::translate`), but a route's own target list is still required to be
+///   uniform: `proxy` picks one translation per route from its first target, and
+///   a mixed list would make which translation ran depend on which upstream
+///   happened to answer
 /// - a route name contains `:` or `/`
 /// - `server.host` is not loopback and `server.api_key` is unset
 /// - a `description` path does not exist
@@ -40,11 +43,12 @@ use crate::error::ValidationReport;
 ///   not reported for routes with `semantic`, which host the classification
 ///   rather than being a target of it
 /// - a provider is defined but no route uses it
-/// - a `semantic` route's candidates mix `ApiKind`s with the route's own
-///   `model` — a request whose endpoint/protocol does not match a candidate's
-///   `ApiKind` excludes that candidate from selection at runtime, which can be
-///   surprising even though it is sometimes intentional (several clients
-///   sharing one auto route)
+/// - a `semantic` route has a candidate whose `ApiKind` the route's own
+///   protocol can neither match nor be translated to — such a candidate is
+///   excluded from selection at runtime, which can be surprising even though it
+///   is sometimes intentional (several clients sharing one auto route). A
+///   candidate reachable *through* translation is not reported: that is the
+///   supported way to let a Claude Code request pick an `openai-chat` model
 pub fn validate(config: &Config, config_path: &Path) -> ValidationReport {
     let mut report = ValidationReport::default();
 
@@ -284,13 +288,19 @@ fn validate_semantic<'a>(
                 used_providers,
                 &mut scratch,
             )?;
-            (api != default_api).then_some(*candidate_name)
+            // A candidate the request's protocol can be translated *to* is
+            // reachable, so it is not a mismatch worth warning about — that
+            // is exactly the "Claude Code picks a local openai-chat model"
+            // case cross-protocol translation exists for.
+            let unreachable = api != default_api
+                && crate::translate::Translation::select(default_api, api).is_none();
+            unreachable.then_some(*candidate_name)
         })
         .collect();
 
     if !mismatched.is_empty() {
         report.warn(format!(
-            "route `{route_name}`: candidate(s) {} speak a different ApiKind than this route's own model ({default_api}); a request whose endpoint/protocol does not match a candidate excludes it from selection at runtime",
+            "route `{route_name}`: candidate(s) {} speak an ApiKind this route's own protocol ({default_api}) can neither match nor be translated to; a request whose endpoint/protocol cannot reach a candidate excludes it from selection at runtime",
             mismatched.join(", ")
         ));
     }
@@ -818,20 +828,47 @@ mod tests {
         assert!(report.is_ok(), "{:?}", report.errors);
     }
 
+    /// An `anthropic-messages` auto route with an `openai-chat` candidate is
+    /// the shape cross-protocol translation exists for — "let Claude Code send
+    /// the cheap requests to local Ollama" — so it must not be warned about.
     #[test]
-    fn semantic_candidate_api_kind_mismatch_is_a_warning_not_an_error() {
+    fn a_semantic_candidate_reachable_through_translation_is_not_warned_about() {
         let mut c = minimal_config();
         c.providers
-            .insert("openrouter".into(), provider(ApiKind::OpenaiChat));
+            .insert("ollama".into(), provider(ApiKind::OpenaiChat));
         c.routes
-            .insert("role-other".into(), route("openrouter/some-model", &[]));
+            .insert("role-cheap".into(), route("ollama/qwen3.5", &[]));
         c.routes.insert(
             "auto".into(),
             semantic_route(
                 "anthropic/opus-pinned",
-                &["role-writer", "role-other"],
+                &["role-writer", "role-cheap"],
                 0.45,
             ),
+        );
+
+        let report = validate(&c, &nonexistent_path());
+        assert!(report.is_ok(), "{:?}", report.errors);
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("role-cheap")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn a_semantic_candidate_no_protocol_can_reach_is_a_warning_not_an_error() {
+        // Reverse direction: an `openai-chat` auto route with an
+        // `anthropic-messages` candidate. Nothing translates that way, so the
+        // candidate can never be selected at runtime.
+        let mut c = minimal_config();
+        c.providers
+            .insert("ollama".into(), provider(ApiKind::OpenaiChat));
+        c.routes
+            .insert("role-cheap".into(), route("ollama/qwen3.5", &[]));
+        c.routes.insert(
+            "auto".into(),
+            semantic_route("ollama/qwen3.5", &["role-writer", "role-cheap"], 0.45),
         );
 
         let report = validate(&c, &nonexistent_path());
@@ -840,7 +877,7 @@ mod tests {
             report
                 .warnings
                 .iter()
-                .any(|w| w.contains("auto") && w.contains("role-other") && w.contains("ApiKind")),
+                .any(|w| w.contains("auto") && w.contains("role-writer") && w.contains("ApiKind")),
             "{:?}",
             report.warnings
         );

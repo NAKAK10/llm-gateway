@@ -75,6 +75,14 @@ pub struct TraceResolved {
     pub provider: String,
     pub model: String,
     pub api: String,
+    /// Which cross-protocol translation ran, e.g.
+    /// `anthropic-messages->openai-chat`. Absent on the passthrough path,
+    /// which is the case worth being able to distinguish at a glance: only a
+    /// translated response was rebuilt rather than forwarded byte-for-byte, so
+    /// this is the field to look at first when output differs subtly from what
+    /// the provider would have returned directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translation: Option<String>,
 }
 
 /// One upstream attempt.
@@ -147,6 +155,7 @@ mod tests {
                 provider: "anthropic".to_string(),
                 model: "claude-sonnet-4-6".to_string(),
                 api: "anthropic-messages".to_string(),
+                translation: None,
             },
             attempts: vec![TraceAttempt {
                 n: 1,

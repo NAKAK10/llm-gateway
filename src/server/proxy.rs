@@ -8,6 +8,12 @@
 //! The request body *is* parsed (that is unavoidable — `model` must be
 //! rewritten); the response body is not. See `passthrough` for why that
 //! asymmetry is the point.
+//!
+//! The one exception is a **translated route** — a client whose protocol
+//! differs from the target provider's, which used to be refused outright. There
+//! the request is rebuilt and the response is rebuilt on the way back (see
+//! `crate::translate`). Both paths live side by side in this file, and which
+//! one a request took is recorded in the trace log's `resolved.translation`.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -26,6 +32,8 @@ use crate::record::usage_log::UsageRecord;
 use crate::record::Recorder;
 use crate::route;
 use crate::server::{client_name, endpoint_api, error_response, passthrough, AppState};
+use crate::translate::adapter::{self, ResponseShape};
+use crate::translate::Translation;
 use crate::upstream::{self, Attempt};
 use crate::usage::tee::{self, StreamOutcome};
 
@@ -91,27 +99,35 @@ pub async fn proxy(
         }
     };
 
-    // Same-protocol check. Validation guarantees a route's targets all share
-    // one ApiKind, so checking the first is checking them all.
+    // Protocol check. Validation guarantees a route's targets all share one
+    // ApiKind, so checking the first is checking them all.
+    //
+    // Equal protocols are the passthrough path and stay byte-for-byte. When
+    // they differ, a translation may exist — that is what lets Claude Code
+    // (`anthropic-messages` only) reach the many `openai-chat` providers. Only
+    // a direction nothing can translate is still refused, because forwarding a
+    // request in the wrong protocol produces a confusing upstream 400 instead
+    // of an explanation.
     let route_api = resolution.targets[0].api;
-    if route_api != expected_api {
-        return error_response(
-            http::StatusCode::BAD_REQUEST,
-            &format!(
-                "route `{}` is backed by {route_api} providers but {endpoint} speaks \
-                 {expected_api}; use the matching endpoint or point the route at a \
-                 {expected_api} provider",
-                resolution.route_name,
-            ),
-        );
-    }
-
-    // Token counting is a question, not a generation: the answer is
-    // model-specific, so falling back to a different provider would return a
-    // confidently wrong number. First target only.
-    if count_tokens {
-        resolution.targets.truncate(1);
-    }
+    let translation = if route_api == expected_api {
+        None
+    } else {
+        match Translation::select(expected_api, route_api) {
+            Some(translation) => Some(translation),
+            None => {
+                return error_response(
+                    http::StatusCode::BAD_REQUEST,
+                    &format!(
+                        "route `{}` is backed by {route_api} providers but {endpoint} speaks \
+                         {expected_api}, and this gateway cannot translate {expected_api} → \
+                         {route_api}; use the matching endpoint or point the route at a \
+                         {expected_api} provider",
+                        resolution.route_name,
+                    ),
+                );
+            }
+        }
+    };
 
     let streaming = payload
         .get("stream")
@@ -128,11 +144,37 @@ pub async fn proxy(
         )
     });
 
+    // Token counting is a question, not a generation: the answer is
+    // model-specific, so falling back to a different provider would return a
+    // confidently wrong number. First target only.
+    if count_tokens {
+        if let Some(translation) = translation.filter(|t| !t.can_forward_count_tokens()) {
+            return count_tokens_locally(
+                &state,
+                &client,
+                endpoint,
+                &requested_model,
+                trace_input,
+                &resolution,
+                translation,
+                &payload,
+                semantic_attempt,
+            );
+        }
+        resolution.targets.truncate(1);
+    }
+
     let started = Instant::now();
     let mut attempts = Vec::new();
 
     let build = |target: &route::Target| -> crate::error::Result<Attempt> {
-        let mut request = payload.clone();
+        // One translation for the whole resolution, not one per target:
+        // validation guarantees every target of a route speaks the same
+        // protocol, so the pair decided above holds for each attempt.
+        let mut request = match translation {
+            Some(translation) => translation.request(&payload),
+            None => payload.clone(),
+        };
         request["model"] = serde_json::Value::String(target.model_ref.model.clone());
 
         // Streamed chat responses carry no usage unless asked; asking costs one
@@ -183,7 +225,7 @@ pub async fn proxy(
                         &requested_model,
                         input,
                         &resolution,
-                        None,
+                        intended_resolved(&resolution, translation),
                         attempts,
                         None,
                         semantic_attempt,
@@ -203,7 +245,12 @@ pub async fn proxy(
         provider: accepted.target_provider.clone(),
         model: accepted.target_model.clone(),
         api: accepted.api.as_str().to_string(),
+        translation: translation.map(|t| t.label().to_string()),
     };
+    // The model to report in a translated response body, when the upstream one
+    // does not name itself. Cloned before `model` below is moved into the
+    // report closure.
+    let response_model = accepted.target_model.clone();
     let record_usage = !count_tokens;
     let route_name = resolution.route_name.clone();
     let provider = accepted.target_provider.clone();
@@ -247,7 +294,7 @@ pub async fn proxy(
                 &requested,
                 input,
                 &resolution,
-                Some(resolved),
+                resolved,
                 attempts,
                 (!usage.is_empty()).then_some(TraceUsage {
                     in_tok: usage.input_tokens,
@@ -258,13 +305,123 @@ pub async fn proxy(
         }
     });
 
+    // Usage is observed on the *upstream* bytes, in the upstream's protocol,
+    // before any translation — which is what keeps token accounting correct on
+    // a translated route (`usage::parse` never sees a rebuilt body).
     let observed = tee::observe(
         accepted.response.bytes_stream(),
         accepted.api,
         streaming,
         report,
     );
-    passthrough::respond(status, &upstream_headers, observed)
+
+    match translation {
+        // The passthrough path: nothing at all between the upstream stream and
+        // the client's socket.
+        None => passthrough::respond(status, &upstream_headers, observed),
+        Some(translation) => {
+            // An error body is a plain JSON object even when the request asked
+            // for a stream, so the status decides the shape before `streaming`
+            // does.
+            let shape = if !status.is_success() {
+                ResponseShape::Error {
+                    status: status.as_u16(),
+                }
+            } else if streaming {
+                ResponseShape::Sse {
+                    model: response_model,
+                }
+            } else {
+                ResponseShape::Json {
+                    model: response_model,
+                }
+            };
+            passthrough::respond(
+                status,
+                &upstream_headers,
+                adapter::translate_body(observed, translation, shape),
+            )
+        }
+    }
+}
+
+/// Answer `POST /v1/messages/count_tokens` locally, for a route whose provider
+/// has no token-counting endpoint to forward the question to.
+///
+/// Returning an estimate is better than the alternatives. A `400` would leave
+/// Claude Code unable to size its context window — it decides when to compact
+/// from this number — so the session degrades in a way that looks like a model
+/// problem rather than a missing endpoint. Forwarding to a *different*
+/// (Anthropic) provider would be worse still: a token count is model-specific,
+/// so the answer would be confidently wrong instead of approximately right.
+///
+/// The estimate is recorded in the trace log as an attempt with
+/// `result: "estimated_locally"`, so a count that looks off can be traced to
+/// this function rather than to the provider.
+#[allow(clippy::too_many_arguments)]
+fn count_tokens_locally(
+    state: &AppState,
+    client: &str,
+    endpoint: &str,
+    requested_model: &str,
+    trace_input: Option<TraceInput>,
+    resolution: &route::Resolution,
+    translation: Translation,
+    payload: &serde_json::Value,
+    semantic_attempt: Option<SemanticAttempt>,
+) -> Response {
+    let input_tokens = crate::translate::request::estimate_input_tokens(payload);
+    let target = &resolution.targets[0];
+
+    if let Some(input) = trace_input {
+        state.recorder.trace(trace_record(
+            client,
+            endpoint,
+            requested_model,
+            input,
+            resolution,
+            intended_resolved(resolution, Some(translation)),
+            vec![crate::record::trace_log::TraceAttempt {
+                n: 1,
+                target: target.to_string(),
+                result: "estimated_locally".to_string(),
+                ms: 0,
+            }],
+            None,
+            semantic_attempt,
+        ));
+    }
+
+    json_response(
+        http::StatusCode::OK,
+        &serde_json::json!({ "input_tokens": input_tokens }),
+    )
+}
+
+/// The `resolved` block for a request no upstream ever answered — the first
+/// target is the one that would have served it, so that is what gets recorded.
+fn intended_resolved(
+    resolution: &route::Resolution,
+    translation: Option<Translation>,
+) -> TraceResolved {
+    let target = &resolution.targets[0];
+    TraceResolved {
+        provider: target.model_ref.provider.clone(),
+        model: target.model_ref.model.clone(),
+        api: target.api.as_str().to_string(),
+        translation: translation.map(|t| t.label().to_string()),
+    }
+}
+
+/// A JSON body the gateway produced itself, as opposed to one it forwarded.
+fn json_response(status: http::StatusCode, body: &serde_json::Value) -> Response {
+    let mut response = Response::new(axum::body::Body::from(body.to_string()));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -274,7 +431,7 @@ fn trace_record(
     requested_model: &str,
     input: TraceInput,
     resolution: &route::Resolution,
-    resolved: Option<TraceResolved>,
+    resolved: TraceResolved,
     attempts: Vec<crate::record::trace_log::TraceAttempt>,
     usage: Option<TraceUsage>,
     semantic_attempt: Option<SemanticAttempt>,
@@ -287,11 +444,7 @@ fn trace_record(
         requested_model: requested_model.to_string(),
         input,
         routing: routing_from(resolution, semantic_attempt),
-        resolved: resolved.unwrap_or_else(|| TraceResolved {
-            provider: resolution.targets[0].model_ref.provider.clone(),
-            model: resolution.targets[0].model_ref.model.clone(),
-            api: resolution.targets[0].api.as_str().to_string(),
-        }),
+        resolved,
         attempts,
         usage,
     }

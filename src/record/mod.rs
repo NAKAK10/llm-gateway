@@ -221,6 +221,7 @@ mod tests {
                 provider: "anthropic".to_string(),
                 model: "claude-sonnet-4-6".to_string(),
                 api: "anthropic-messages".to_string(),
+                translation: None,
             },
             attempts: vec![],
             usage: None,

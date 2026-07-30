@@ -22,8 +22,9 @@ use crate::semantic::embed::Embedder;
 /// One candidate available to an auto route's classifier.
 ///
 /// `vector` is already L2-normalized (see `Embedder::load`) and `api` is the
-/// protocol the candidate's own `model.default` speaks, so a request whose
-/// endpoint does not match can be excluded before scoring rather than after.
+/// protocol the candidate's own `model.default` speaks, so a candidate the
+/// request cannot reach — not the same protocol, and not translatable to it —
+/// can be excluded before scoring rather than after.
 #[derive(Debug, Clone)]
 struct Candidate {
     name: String,
@@ -118,13 +119,14 @@ pub struct Verdict {
     /// request text, if the top-scoring candidate cleared the route's
     /// `threshold`. `None` means the caller should fall back to the auto
     /// route's own `model` — either no candidate cleared the bar, no
-    /// candidate matched `expected_api`, or `text` failed to embed.
+    /// candidate was reachable from `expected_api`, or `text` failed to
+    /// embed.
     pub matched: Option<(String, f32)>,
-    /// Every candidate considered (after excluding `ApiKind` mismatches),
-    /// scored and sorted descending by score. Kept even when `matched` is
-    /// `None`, so a caller building a trace record can still show what
-    /// almost matched. Empty when `text` failed to embed or no candidate
-    /// matched `expected_api`.
+    /// Every candidate considered (after excluding the unreachable ones —
+    /// see [`rank`]), scored and sorted descending by score. Kept even when
+    /// `matched` is `None`, so a caller building a trace record can still
+    /// show what almost matched. Empty when `text` failed to embed or no
+    /// candidate was reachable.
     pub candidates: Vec<(String, f32)>,
     /// How long embedding the request text took.
     pub embed_ms: u64,
@@ -140,7 +142,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// Every candidate considered (after excluding `ApiKind` mismatches), scored
+/// Every candidate considered (after excluding the unreachable ones), scored
 /// and sorted descending by score, plus the winner if one cleared
 /// `threshold` — the pieces `rank` produces and `Classifier::classify`
 /// assembles into a [`Verdict`].
@@ -150,8 +152,16 @@ struct Scored {
 }
 
 /// Score `candidates` against an already-embedded `vector`, keeping only
-/// those whose `api` matches `expected_api`, and decide whether the winner
-/// clears `threshold`.
+/// those the request can actually reach, and decide whether the winner clears
+/// `threshold`.
+///
+/// Reachable means one of two things: the candidate speaks `expected_api`
+/// itself, or the gateway can translate from `expected_api` to what it speaks
+/// (see [`crate::translate::Translation`]). The second case is what lets an
+/// auto route reached over `/v1/messages` pick an `openai-chat` candidate —
+/// "send the cheap requests to local Ollama" is the whole point of semantic
+/// routing for a Claude Code user, and before translation existed that
+/// candidate could never win.
 ///
 /// `all` is returned regardless of whether anything clears `threshold` —
 /// unlike an early `None`, this keeps sub-threshold candidates visible to a
@@ -164,7 +174,10 @@ struct Scored {
 fn rank(vector: &[f32], candidates: &[Candidate], expected_api: ApiKind, threshold: f32) -> Scored {
     let mut scored: Vec<(String, f32)> = candidates
         .iter()
-        .filter(|c| c.api == expected_api)
+        .filter(|c| {
+            c.api == expected_api
+                || crate::translate::Translation::select(expected_api, c.api).is_some()
+        })
         .map(|c| (c.name.clone(), dot(vector, &c.vector)))
         .collect();
 
@@ -267,8 +280,8 @@ impl Classifier {
     /// current index — the one case a caller cannot get anything useful
     /// back, since there is no `threshold` or candidate list to score
     /// against. Every other outcome is `Some(Verdict)`: `Verdict::matched`
-    /// is `None` when embedding `text` fails, no candidate matches
-    /// `expected_api`, or the best score misses `threshold`, and in all of
+    /// is `None` when embedding `text` fails, no candidate is reachable
+    /// from `expected_api`, or the best score misses `threshold`, and in all of
     /// those cases the caller should fall back to `auto_route`'s own
     /// `model` — but `Verdict::candidates` is still populated where
     /// possible, for a caller that wants to record what was considered.
@@ -371,28 +384,51 @@ mod tests {
     }
 
     #[test]
-    fn rank_excludes_candidates_with_a_different_api_kind() {
+    fn rank_excludes_candidates_the_request_cannot_reach() {
+        // `openai-chat` in, `anthropic-messages` candidate: no translation
+        // exists in that direction, so the candidate is unreachable.
         let candidates = vec![
-            candidate("wrong-api", vec![1.0, 0.0], ApiKind::OpenaiChat),
-            candidate("right-api", vec![0.9, 0.1], ApiKind::AnthropicMessages),
+            candidate("unreachable", vec![1.0, 0.0], ApiKind::AnthropicMessages),
+            candidate("reachable", vec![0.9, 0.1], ApiKind::OpenaiChat),
         ];
 
-        let scored = rank(&[1.0, 0.0], &candidates, ApiKind::AnthropicMessages, 0.0);
+        let scored = rank(&[1.0, 0.0], &candidates, ApiKind::OpenaiChat, 0.0);
 
-        let (route, _) = scored
-            .winner
-            .expect("the matching-api candidate clears 0.0");
-        assert_eq!(route, "right-api");
+        let (route, _) = scored.winner.expect("the reachable candidate clears 0.0");
+        assert_eq!(route, "reachable");
         assert_eq!(scored.all.len(), 1, "{:?}", scored.all);
     }
 
     #[test]
-    fn rank_has_no_winner_when_no_candidate_matches_the_expected_api() {
-        let candidates = vec![candidate("only", vec![1.0, 0.0], ApiKind::OpenaiChat)];
+    fn rank_has_no_winner_when_no_candidate_is_reachable() {
+        let candidates = vec![candidate(
+            "only",
+            vec![1.0, 0.0],
+            ApiKind::AnthropicMessages,
+        )];
 
-        let scored = rank(&[1.0, 0.0], &candidates, ApiKind::AnthropicMessages, 0.0);
+        let scored = rank(&[1.0, 0.0], &candidates, ApiKind::OpenaiChat, 0.0);
         assert!(scored.winner.is_none());
         assert!(scored.all.is_empty());
+    }
+
+    /// The case cross-protocol translation exists for: a Claude Code request
+    /// (`anthropic-messages`) picking a local Ollama candidate
+    /// (`openai-chat`). Before translation this candidate was silently
+    /// excluded, which made "route cheap work to Ollama" impossible for the
+    /// one client that most needs it.
+    #[test]
+    fn rank_keeps_a_candidate_reachable_only_through_translation() {
+        let candidates = vec![candidate(
+            "ollama-local",
+            vec![1.0, 0.0],
+            ApiKind::OpenaiChat,
+        )];
+
+        let scored = rank(&[1.0, 0.0], &candidates, ApiKind::AnthropicMessages, 0.5);
+
+        let (route, _) = scored.winner.expect("a translatable candidate can win");
+        assert_eq!(route, "ollama-local");
     }
 
     #[test]

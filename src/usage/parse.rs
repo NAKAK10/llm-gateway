@@ -191,7 +191,11 @@ impl SseUsageScanner {
 }
 
 /// Find the first occurrence of `needle` in `haystack`, byte-wise.
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+///
+/// Shared with `translate::stream`, which frames an SSE stream the same way
+/// this scanner does — one implementation of "where does this event end?" is
+/// one place for that answer to be wrong.
+pub(crate) fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }

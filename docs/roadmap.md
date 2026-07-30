@@ -40,12 +40,22 @@ designated auto route (never overriding an explicit route name).
 
 ## Phase 3 — cross-protocol translation
 
-Anthropic Messages ⇄ OpenAI Chat ⇄ Responses, enabling cross-protocol
-fallbacks. Evaluate `va-ai-api-bridge` (MIT) first; if its tool_use/thinking/
-image/stop_reason round-trips fail, implement from scratch using
-superagent-gateway's translate/stream sources as a behavioural spec (never as
-code — no license). Lower urgency than originally planned: OpenRouter's
-Anthropic-compatible endpoint already covers the main redundancy need.
+- [x] `anthropic-messages` in → `openai-chat` out (issue #3), request +
+      streaming and non-streaming response + error envelope + a local
+      `count_tokens` estimate. Written from scratch rather than pulling in
+      `va-ai-api-bridge`; see decisions.md for why, and for what the
+      translation drops.
+- [ ] the reverse direction (`openai-chat` client → `anthropic-messages`
+      provider). No unmet need yet: OpenRouter exposes an Anthropic-compatible
+      endpoint, and the OpenAI-protocol clients already reach `openai-chat`
+      providers directly.
+- [ ] anything involving `openai-responses` (issue #4). Codex is the only
+      client that speaks it, and `launch.codex.wireApi: "chat"` sidesteps the
+      problem entirely.
+- [ ] cross-protocol *fallbacks* within one route. Still refused by validation:
+      `proxy` derives one translation per route from its first target, so a
+      mixed target list would make the answer depend on which upstream
+      responded. Needs per-target translation selection first.
 
 ## Phase 4 — agent CLIs as backends
 

@@ -11,6 +11,11 @@ and streams the response back **byte-for-byte unmodified**. Model selection,
 fallback, cost accounting and auditable routing decisions all live in one
 config file.
 
+The one deliberate exception is a [cross-protocol route](#cross-protocol-routing):
+when the client's protocol and the provider's differ, the request and response
+*are* rebuilt, because the alternative is that the pair simply does not work.
+Same-protocol traffic — still the overwhelming majority — is untouched.
+
 ```
 llm-gateway launch claude    ─┐
 llm-gateway launch codex      ┼→  llm-gateway serve :4000  →  anthropic / openai /
@@ -104,9 +109,12 @@ Design points:
   always predictable (see `src/route.rs`, Phase 2 in `docs/roadmap.md`).
 - **Candidates must have a `description`** — that's the classification
   corpus (long descriptions can live in `llm/*.md`, as today).
-- **Candidates whose protocol doesn't match the incoming request are
-  excluded at match time** — e.g. a request to `/v1/chat/completions` will
-  never resolve to an `anthropic-messages` candidate.
+- **Candidates the incoming request cannot reach are excluded at match
+  time** — a request to `/v1/chat/completions` will never resolve to an
+  `anthropic-messages` candidate, because nothing translates in that
+  direction. A Claude Code request *can* pick an `openai-chat` candidate,
+  since that direction is translated (see
+  [Cross-protocol routing](#cross-protocol-routing)).
 - **Route names with `semantic` cannot use a wildcard (`*`).**
 
 ```json5
@@ -149,6 +157,45 @@ routes: {
 }
 ```
 
+## Cross-protocol routing
+
+Claude Code only ever speaks Anthropic Messages, and almost every cheap or
+local provider only speaks OpenAI Chat. So one direction is translated:
+
+| client speaks | provider speaks | result |
+|---|---|---|
+| `anthropic-messages` | `openai-chat` | translated — Claude Code reaches Ollama, Groq, DeepSeek, Gemini, Mistral, Together, Sakana AI, PLaMo |
+| same on both sides | — | byte-for-byte passthrough, as before |
+| anything else | — | `400` with an explanation, as before |
+
+```json5
+providers: {
+  "ollama-local": { baseUrl: "http://127.0.0.1:11434/v1", api: "openai-chat" },
+},
+routes: {
+  // Reached from Claude Code with: llm-gateway launch claude --model role-cheap
+  "role-cheap": { model: { default: "ollama-local/qwen3:8b" } },
+}
+```
+
+What a translated route costs you:
+
+- **Prompt caching, `thinking` blocks, citations and Anthropic server-side
+  tools** (`web_search`, `bash`, `text_editor`) are dropped — the target
+  protocol has nowhere to put them. `cache_creation_input_tokens` is always 0.
+- **`/v1/messages/count_tokens` is answered locally with an estimate**, because
+  `openai-chat` has no token-counting endpoint. Returning nothing would break
+  Claude Code's context sizing; the estimate is marked
+  `result: "estimated_locally"` in the trace log.
+- **The response is rebuilt**, so it is not byte-identical to what the provider
+  sent. `llm-gateway trace` marks those requests with
+  `xlat=anthropic-messages->openai-chat` — always check that field first when
+  output looks subtly off.
+- Usage accounting is *not* affected: token counts are read from the upstream
+  bytes before translation.
+
+Full list of what is and is not carried across: `docs/gotchas.md`.
+
 ## Supported providers
 
 `llm-gateway init` can scaffold any of these out of the box. A provider is
@@ -171,6 +218,9 @@ copy-paste config for each.
 | PLaMo (Preferred Networks) | `https://api.platform.preferredai.jp/v1` | `openai-chat` | `PLAMO_API_KEY` |
 | Ollama Cloud | `https://ollama.com/v1` | `openai-chat` | `OLLAMA_API_KEY` |
 | Ollama (local) | `http://127.0.0.1:11434/v1` | `openai-chat` | *(none needed)* |
+
+Every `openai-chat` provider in this table is reachable from Claude Code too —
+see [Cross-protocol routing](#cross-protocol-routing).
 
 ## Configuration reference
 
