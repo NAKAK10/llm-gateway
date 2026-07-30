@@ -27,7 +27,7 @@ id は `model` 文字列の最初の `/` より前に現れる部分です。同
 |---|---|---|
 | `baseUrl` | *(必須)* | 末尾スラッシュなし。`anthropic-messages` はホストのルート(`https://api.anthropic.com`)— ゲートウェイが `/v1/messages` を付加する。OpenAI 系はバージョンプレフィックス(`…/v1`)まで含める — ゲートウェイが `/chat/completions` または `/responses` を付加する。 |
 | `api` | *(必須)* | `openai-chat` \| `openai-responses` \| `anthropic-messages`。あるルートに、その `api` とは異なるプロトコルを話すクライアントから到達できるのは、ゲートウェイがその組み合わせを変換できる場合だけ — 現時点では `anthropic-messages` 受信 → `openai-chat` 送信のみ(つまり Claude Code から任意の OpenAI 互換プロバイダーへ)。それ以外の組み合わせは `400` になる。 |
-| `apiKey` | *(なし)* | リテラル文字列 \| `"${ENV_VAR}"` \| `"keychain:<name>"`(macOS Keychain、サービス名 `llm-gateway/<name>`)。**リクエスト試行ごとに**解決されるため、ローテーションは即時反映。 |
+| `apiKey` | *(なし)* | リテラル文字列 \| `"${ENV_VAR}"` \| `"keychain:<name>"`(macOS Keychain、サービス名 `llm-gateway/<name>`)\| `"command:<cmd>"`(コマンドの標準出力、例: `command:gh auth token`)。**リクエスト試行ごとに**解決されるため、ローテーションは即時反映 — これが `command:` 形式の存在理由でもある。`serve` プロセスの環境変数は起動時に固定され、外部から更新できないため `${VAR}` ではローテーションするトークンを扱えない。コマンドは試行のたびに実行されるので、高速なものにすること。 |
 | `headers` | `{}` | 追加リクエストヘッダー。例: OpenRouter の任意ヘッダー `HTTP-Referer` / `X-Title`。 |
 | `injectUsage` | `true` | ストリーミングの `openai-chat` のみ: トークン数が取れるよう `stream_options.include_usage` を付加する。ストリーム末尾に usage のみのチャンクが 1 つ追加される。 |
 

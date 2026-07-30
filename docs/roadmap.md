@@ -53,6 +53,13 @@ designated auto route (never overriding an explicit route name). Behind the
 - [ ] anything involving `openai-responses` (issue #4). Codex is the only
       client that speaks it, and `launch.codex.wireApi: "chat"` sidesteps the
       problem entirely.
+- [ ] let a provider choose its auth header (`Authorization: Bearer` vs
+      `x-api-key`), independently of its `api`. This is what stands between us
+      and GitHub Copilot's own `/v1/messages` endpoint: Copilot advertises it
+      for its Claude models, so Claude Code could reach them with **no
+      translation at all** — full fidelity, byte-for-byte — but it requires
+      Bearer, and an `anthropic-messages` provider currently authenticates with
+      `x-api-key`.
 - [ ] cross-protocol *fallbacks* within one route. Still refused by validation:
       `proxy` derives one translation per route from its first target, so a
       mixed target list would make the answer depend on which upstream

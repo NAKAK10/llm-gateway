@@ -27,7 +27,7 @@ upstream may be registered under several ids to expose different protocols.
 |---|---|---|
 | `baseUrl` | *(required)* | No trailing slash. For `anthropic-messages` this is the host root (`https://api.anthropic.com`) — the gateway appends `/v1/messages`. For the OpenAI kinds include the version prefix (`…/v1`) — the gateway appends `/chat/completions` or `/responses`. |
 | `api` | *(required)* | `openai-chat` \| `openai-responses` \| `anthropic-messages`. A route may be reached from a client speaking a different protocol only when the gateway can translate the pair — today `anthropic-messages` in → `openai-chat` out, i.e. Claude Code to any OpenAI-compatible provider. Anything else is a `400`. |
-| `apiKey` | *(none)* | Literal string \| `"${ENV_VAR}"` \| `"keychain:<name>"` (macOS Keychain, service `llm-gateway/<name>`). Resolved **per request attempt**, so rotation applies live. |
+| `apiKey` | *(none)* | Literal string \| `"${ENV_VAR}"` \| `"keychain:<name>"` (macOS Keychain, service `llm-gateway/<name>`) \| `"command:<cmd>"` (stdout of a command, e.g. `command:gh auth token`). Resolved **per request attempt**, so rotation applies live — which is the point of the `command:` form, since a `serve` process's environment is fixed at startup and cannot be updated from outside. A command runs on every attempt, so keep it fast. |
 | `headers` | `{}` | Extra request headers, e.g. OpenRouter's optional `HTTP-Referer` / `X-Title`. |
 | `injectUsage` | `true` | Streamed `openai-chat` only: adds `stream_options.include_usage` so token counts exist. Appends one usage-only chunk at stream end. |
 

@@ -113,6 +113,14 @@ async fn probe(client: &reqwest::Client, id: String, provider: ProviderConfig) -
         req
     };
 
+    // The provider's own headers go on the probe too, or a provider that needs
+    // one would be reported as broken when it is merely configured — and this
+    // command exists precisely to tell those two apart.
+    let mut request = request;
+    for (name, value) in &provider.headers {
+        request = request.header(name, value);
+    }
+
     let (status, error) = match request.send().await {
         Ok(response) => (Some(response.status().as_u16()), None),
         Err(err) => (None, Some(err.to_string())),

@@ -19,6 +19,7 @@
 | Anthropic | `https://api.anthropic.com` | `anthropic-messages` | `ANTHROPIC_API_KEY` |
 | OpenAI | `https://api.openai.com/v1` | `openai-responses` | `OPENAI_API_KEY` |
 | OpenRouter | `https://openrouter.ai/api/v1` | `openai-chat` / `anthropic-messages` | `OPENROUTER_API_KEY` |
+| GitHub Copilot | `https://api.githubcopilot.com` | `openai-chat` | *(GitHub トークン — 下記参照)* |
 | Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | `openai-chat` | `GEMINI_API_KEY` |
 | xAI (Grok) | `https://api.x.ai/v1` | `openai-chat` | `XAI_API_KEY` |
 | Mistral | `https://api.mistral.ai/v1` | `openai-chat` | `MISTRAL_API_KEY` |
@@ -95,6 +96,65 @@ openrouter: {
 モデル id は `/` を含みます(`anthropic/claude-sonnet-4.6`)。ルートの
 ターゲットは*最初の* `/` でのみ分割されるため、
 `openrouter/anthropic/claude-sonnet-4.6` は正しくパースされます。
+
+### GitHub Copilot
+
+あなたの Copilot サブスクリプションに、ゲートウェイがフロントに立つ
+どのクライアントからでも到達できます — Claude Code も
+[クロスプロトコルルーティング](../../README.ja.md#クロスプロトコルルーティング)
+経由で含みます。
+
+```json5
+"github-copilot": {
+  baseUrl: "https://api.githubcopilot.com",
+  api: "openai-chat",
+  // `gh` はこのトークンを自身のスケジュールで更新するので、コピーせず
+  // リクエストのたびに読み直す。複数アカウントがあるなら `--user <login>` を追加。
+  apiKey: "command:gh auth token",
+  headers: { "X-GitHub-Api-Version": "2026-06-01" },
+},
+```
+
+`llm-gateway init` は `gh` が `PATH` にあればこのプロバイダーを提案し、
+`command:` の参照を含めて上記そのままの雛形を書き出します。
+
+認証情報は普通の GitHub トークンです — Copilot 専用の API キーも
+トークン交換のステップもありません。どれも動きます:
+
+- `gh auth login` してから `command:gh auth token`(推奨: 期限切れになりません)。
+- `GITHUB_COPILOT_TOKEN` に置いた個人アクセストークンを
+  `"${GITHUB_COPILOT_TOKEN}"` として参照。
+- エディタ連携が既に保存しているトークンを Keychain に貼り付けたもの
+  (`keychain:github-copilot`)。
+
+`X-GitHub-Api-Version` は必須ではなく、素の `Authorization: Bearer` だけでも
+動きます — ただしピン留めしておけば、GitHub 側のデフォルトが将来変わっても
+セッション途中でレスポンスの形が変わることはありません。
+
+**実際に使えるモデルは一覧より狭いです。**
+`GET https://api.githubcopilot.com/models` は、プランで触れないモデルも含めて
+Copilot が知っている全モデルを返します。触れないモデルは
+`400 model_not_supported` を返します。手がかりになるのは `policy.state`
+フィールドで、プレミアムモデルは概ね GitHub Copilot の設定で先に有効化が
+必要です。確認するには:
+
+```sh
+curl -s https://api.githubcopilot.com/models \
+  -H "Authorization: Bearer $(gh auth token)" \
+  -H "X-GitHub-Api-Version: 2026-06-01" \
+  | jq -r '.data[] | select(.capabilities.type=="chat") | "\(.id)\t\(.policy.state // "-")"'
+```
+
+もう 2 点:
+
+- リクエストは他の Copilot 利用と同様にあなたの Copilot クォータに
+  課金されます。ゲートウェイは Copilot の `x-initiator` / `Openai-Intent`
+  分類ヘッダーを送りません — 正しい値は個々のリクエストに依存するため、
+  ゲートウェイ全体で一定の値を送ると半分は誤りになるからです。
+- Copilot は Claude モデル向けに `/v1/messages` も公開しており、これなら
+  変換なしで済むはずですが、ゲートウェイはまだ使えません: そのエンドポイントは
+  `Authorization: Bearer` を要求する一方、`anthropic-messages` プロバイダーは
+  `x-api-key` で認証するためです。フォローアップとして追跡中です。
 
 ### Google Gemini
 

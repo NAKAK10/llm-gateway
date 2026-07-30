@@ -115,7 +115,49 @@
   上に移してしまうと、変換されたリクエストはすべて*変換器側*の数値を
   報告し始める。
 
+## GitHub Copilot
+
+- **認証情報はただの GitHub トークンで、`Authorization: Bearer` として使う。**
+  Copilot 専用の API キーもトークン交換のステップもない —
+  古い連携が使っていた `copilot_internal/v2/token` は不要で、素の HTTP
+  クライアントに対しては `403` を返すだけ。探しに行かないこと。
+- **`gh auth token` は*アクティブな*アカウントのトークンを返す。** 複数
+  アカウントでログインしていると、それが黙って間違ったアカウントになる —
+  ライセンスを持つのが別アカウントの場合、`403 unauthorized: not licensed to
+  use Copilot` になる。`command:gh auth token --user <login>` で固定すること。
+- **他のツールのモデルピッカーは entitlement の証拠にならない。** 例えば
+  opencode はライブの `/models` 取得に失敗するとキャッシュ済みの models.dev
+  カタログにフォールバックするので、そのアカウントで使えないモデルまで一覧に
+  出続ける。entitlement は一覧ではなく、実際に生成させて確認すること。
+- **403 は 2 種類あり、原因が違う。** `unauthorized: not licensed to use
+  Copilot` は API 向けの Copilot entitlement が無い状態 — 実際には未払いや
+  失効が最も多いので、まず支払い状況を確認する。`unauthorized: not
+  authorized to use this Copilot feature` は entitlement はあるがこの
+  トークンまたは機能が対象外の状態 — サブスクリプションが組織由来なら、組織側の
+  Copilot ポリシーとシート割り当てを確認する。
+- **一覧に載っているモデルが使えるモデルとは限らない。** `/models` にはプランで
+  触れないモデルも含まれ、それらは `400 model_not_supported`(アカウントに
+  無いエンドポイントには `no_available_model_endpoints`)を返す。route に
+  入れる前に `policy.state` でフィルタし、GitHub Copilot の設定でプレミアム
+  モデルを有効化しておくこと。
+- **Copilot は Claude モデル向けに `/v1/messages` も公開している** — これなら
+  変換を完全にスキップできるはずだが、`Authorization: Bearer` を要求する一方、
+  このゲートウェイの `anthropic-messages` プロバイダーは `x-api-key` で
+  認証する。プロバイダーが認証ヘッダーを選べるようになるまで、Copilot は
+  `openai-chat` プロバイダーとしてのみ使える。
+- **`x-initiator` / `Openai-Intent` は意図的に送らない。** Copilot はこれらで
+  トラフィックを分類しており、正しい値は個々のリクエスト(人間のターンか
+  ツールループか)に依存する — ゲートウェイ全体で一定の値を送れば半分は
+  誤りになる。
+
 ## 設定 / セキュリティ
+
+- **`command:` の秘密情報参照はリクエスト試行のたびに実行される。** これが
+  ローテーションするトークン(`gh auth token`)を再起動なしで扱える理由だが、
+  リクエストごとのコストでもある — 呼び出しのたびにネットワークへ出る
+  ヘルパーは、ここではなくキャッシュする層の裏に置くべき。`${VAR}` では
+  代替できない: `serve` プロセスの環境変数は起動時に固定され、外部から
+  更新する手段がないため。
 
 - `config.json` はリテラルのキーを保持しうる → 作成時に `0600`、権限ドリフトは
   警告、`config show` と `launch --print` ではマスク、`config gitignore` で

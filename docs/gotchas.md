@@ -102,7 +102,50 @@ differ; same-protocol traffic never enters this code path.
   bytes below the translation layer. If you ever move that observer above it,
   every translated request starts reporting the *translator's* numbers.
 
+## GitHub Copilot
+
+- **The credential is a plain GitHub token, used as `Authorization: Bearer`.**
+  There is no Copilot-specific API key and no token-exchange step —
+  `copilot_internal/v2/token`, which older integrations used, is not needed and
+  answers `403` to a plain HTTP client anyway. Don't go looking for it.
+- **`gh auth token` returns the *active* account's token.** With more than one
+  account logged in, that is silently the wrong one — a `403 unauthorized: not
+  licensed to use Copilot` when the licensed account is the other one. Pin it:
+  `command:gh auth token --user <login>`.
+- **A model picker in another tool is not evidence of entitlement.** opencode,
+  for one, falls back to its cached models.dev catalog when the live `/models`
+  call fails, so every Copilot model still appears in its list — including ones
+  the account cannot use. Prove entitlement by generating, not by listing.
+- **Two different 403s, two different causes.** `unauthorized: not licensed to
+  use Copilot` means the account has no usable Copilot entitlement for the API —
+  in practice most often an unpaid or lapsed subscription, so check billing
+  before anything else;
+  `unauthorized: not authorized to use this Copilot feature` means the account
+  has one but this token or feature is not covered — check the org's Copilot
+  policy and seat assignment when the subscription comes from an organization.
+- **A listed model is not necessarily a usable model.** `/models` includes
+  models your plan cannot touch; they answer `400 model_not_supported` (and
+  `no_available_model_endpoints` for an endpoint your account lacks). Filter by
+  `policy.state` and enable premium models in your Copilot settings before
+  putting them in a route.
+- **Copilot advertises `/v1/messages` for its Claude models**, which would skip
+  translation entirely — but it wants `Authorization: Bearer`, while an
+  `anthropic-messages` provider in this gateway authenticates with `x-api-key`.
+  Until a provider can choose its auth header, Copilot is an `openai-chat`
+  provider only.
+- **`x-initiator` / `Openai-Intent` are deliberately not sent.** Copilot uses
+  them to classify traffic and their correct value depends on the individual
+  request (human turn vs tool loop); a gateway-wide constant would be wrong half
+  the time.
+
 ## Config / security
+
+- **`command:` secret references run on every request attempt.** That is what
+  makes a rotating token (`gh auth token`) work without a restart, and it is
+  also a per-request cost — a helper that hits the network on each call belongs
+  behind something that caches, not here. `${VAR}` cannot substitute: a `serve`
+  process's environment is fixed when it starts, so nothing outside can refresh
+  it.
 
 - `config.json` can hold literal keys → `0600` on create, warned on drift,
   masked in `config show` and `launch --print`, `config gitignore` template.

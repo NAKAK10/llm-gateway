@@ -69,26 +69,38 @@ pub fn run() -> Result<()> {
         )
         .interact()?;
 
+    // A credential another installed tool already holds is better read from
+    // that tool than copied out of it: `gh` refreshes its token on its own
+    // schedule, so a copy would work today and 401 next week.
+    let discovered: Vec<(KnownProvider, SecretRef)> = selected_providers
+        .iter()
+        .filter_map(|provider| provider.discovered_key().map(|key| (*provider, key)))
+        .collect();
+
     // A password left empty falls back to the `${VAR}` form for that one
     // provider, even though the overall storage choice is Literal — typing a
     // real key is optional, not doing so should not write an empty string.
     let mut providers: Vec<(KnownProvider, Option<String>)> = Vec::new();
     let mut env_fallback: Vec<KnownProvider> = Vec::new();
     for provider in &selected_providers {
-        let literal = if storage == KeyStorage::Literal && provider.needs_key() {
-            let value = cliclack::password(format!("API key for {}", provider.label()))
-                .mask('*')
-                .allow_empty()
-                .interact()?;
-            if value.is_empty() {
-                env_fallback.push(*provider);
-                None
+        let already_discovered = discovered
+            .iter()
+            .any(|(candidate, _)| candidate == provider);
+        let literal =
+            if storage == KeyStorage::Literal && provider.needs_key() && !already_discovered {
+                let value = cliclack::password(format!("API key for {}", provider.label()))
+                    .mask('*')
+                    .allow_empty()
+                    .interact()?;
+                if value.is_empty() {
+                    env_fallback.push(*provider);
+                    None
+                } else {
+                    Some(value)
+                }
             } else {
-                Some(value)
-            }
-        } else {
-            None
-        };
+                None
+            };
         providers.push((*provider, literal));
     }
 
@@ -103,6 +115,18 @@ pub fn run() -> Result<()> {
                 provider_config.api_key = Some(key);
             }
         }
+    }
+    for (provider, key) in &discovered {
+        if let Some(provider_config) = config.providers.get_mut(provider.id()) {
+            provider_config.api_key = Some(key.clone());
+        }
+        // Said out loud because it is the one key the user was not asked for —
+        // silently wiring a credential would be worse than one extra line.
+        cliclack::log::info(format!(
+            "{}: reading the token from `{}` on each request, so a refresh needs no config change",
+            provider.label(),
+            key.masked(),
+        ))?;
     }
 
     let dir = paths::config_dir();
@@ -164,6 +188,7 @@ pub enum KnownProvider {
     Anthropic,
     OpenAi,
     OpenRouter,
+    GithubCopilot,
     Gemini,
     Xai,
     Mistral,
@@ -178,10 +203,11 @@ pub enum KnownProvider {
 
 impl KnownProvider {
     /// Every provider the wizard offers, in menu order.
-    pub const ALL: [KnownProvider; 13] = [
+    pub const ALL: [KnownProvider; 14] = [
         Self::Anthropic,
         Self::OpenAi,
         Self::OpenRouter,
+        Self::GithubCopilot,
         Self::Gemini,
         Self::Xai,
         Self::Mistral,
@@ -199,6 +225,7 @@ impl KnownProvider {
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
             Self::OpenRouter => "openrouter",
+            Self::GithubCopilot => "github-copilot",
             Self::Gemini => "gemini",
             Self::Xai => "xai",
             Self::Mistral => "mistral",
@@ -217,6 +244,7 @@ impl KnownProvider {
             Self::Anthropic => "Anthropic",
             Self::OpenAi => "OpenAI",
             Self::OpenRouter => "OpenRouter",
+            Self::GithubCopilot => "GitHub Copilot",
             Self::Gemini => "Google Gemini",
             Self::Xai => "xAI (Grok)",
             Self::Mistral => "Mistral",
@@ -235,6 +263,7 @@ impl KnownProvider {
             Self::Anthropic => "https://api.anthropic.com",
             Self::OpenAi => "https://api.openai.com/v1",
             Self::OpenRouter => "https://openrouter.ai/api/v1",
+            Self::GithubCopilot => "https://api.githubcopilot.com",
             Self::Gemini => "https://generativelanguage.googleapis.com/v1beta/openai",
             Self::Xai => "https://api.x.ai/v1",
             Self::Mistral => "https://api.mistral.ai/v1",
@@ -254,6 +283,7 @@ impl KnownProvider {
             Self::Anthropic => ApiKind::AnthropicMessages,
             Self::OpenAi => ApiKind::OpenaiResponses,
             Self::OpenRouter
+            | Self::GithubCopilot
             | Self::Gemini
             | Self::Xai
             | Self::Mistral
@@ -273,6 +303,9 @@ impl KnownProvider {
             Self::Anthropic => "ANTHROPIC_API_KEY",
             Self::OpenAi => "OPENAI_API_KEY",
             Self::OpenRouter => "OPENROUTER_API_KEY",
+            // Not `GITHUB_TOKEN`: that name is set to something unrelated in
+            // every CI environment, and a repo token silently 403s here.
+            Self::GithubCopilot => "GITHUB_COPILOT_TOKEN",
             Self::Gemini => "GEMINI_API_KEY",
             Self::Xai => "XAI_API_KEY",
             Self::Mistral => "MISTRAL_API_KEY",
@@ -291,6 +324,58 @@ impl KnownProvider {
     pub fn needs_key(self) -> bool {
         !matches!(self, Self::OllamaLocal)
     }
+
+    /// Extra request headers this provider wants, beyond auth.
+    ///
+    /// Only GitHub Copilot has any. It answers a bare
+    /// `Authorization: Bearer <github token>` perfectly well, so this is not a
+    /// requirement — pinning `X-GitHub-Api-Version` just means a future default
+    /// change on GitHub's side cannot alter the shape of the responses
+    /// mid-session.
+    ///
+    /// Deliberately *not* sent: `x-initiator` and `Openai-Intent`. Copilot uses
+    /// them to classify traffic, and their correct value depends on the
+    /// individual request (whether the last turn came from the human or from a
+    /// tool loop). A gateway-wide constant would be wrong half the time, and a
+    /// wrong classification is worse than none.
+    pub fn headers(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::GithubCopilot => &[("X-GitHub-Api-Version", "2026-06-01")],
+            _ => &[],
+        }
+    }
+
+    /// The credential reference to suggest when the user has a tool that already
+    /// holds one, instead of asking them to paste a key.
+    ///
+    /// GitHub Copilot is the case that needs this: the credential is an ordinary
+    /// GitHub token that `gh` already has and refreshes on its own, so the right
+    /// answer is to read it from `gh` on every attempt rather than copy it.
+    /// Returns `None` when the tool is not installed, so the wizard falls back
+    /// to the normal key question.
+    pub fn discovered_key(self) -> Option<SecretRef> {
+        match self {
+            Self::GithubCopilot if command_exists("gh") => {
+                Some(SecretRef::new("command:gh auth token"))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Whether `name` is an executable on `PATH`.
+///
+/// `command -v` is a shell builtin, so this goes through `sh` — which also makes
+/// it agree with how `command:` secret references are run.
+fn command_exists(name: &str) -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {name}"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// How keys should be referenced in the generated file.
@@ -332,7 +417,11 @@ pub fn build_config(
                 base_url: provider.base_url().to_string(),
                 api: provider.api(),
                 api_key: Some(provider_api_key(*provider, literal.clone(), storage)),
-                headers: Default::default(),
+                headers: provider
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect(),
                 inject_usage: true,
             },
         );
@@ -466,6 +555,72 @@ fn provider_api_key(
 mod tests {
     use super::*;
 
+    /// The scaffolded Copilot provider must be reachable from Claude Code,
+    /// which means `openai-chat` plus the translation layer — the whole reason
+    /// it can be offered at all.
+    #[test]
+    fn github_copilot_is_scaffolded_as_an_openai_chat_provider() {
+        let config = build_config(
+            &[Client::Claude],
+            &[(KnownProvider::GithubCopilot, None)],
+            KeyStorage::Keychain,
+        );
+
+        let provider = config
+            .providers
+            .get("github-copilot")
+            .expect("github-copilot provider");
+        assert_eq!(provider.api, crate::config::ApiKind::OpenaiChat);
+        assert_eq!(provider.base_url, "https://api.githubcopilot.com");
+        assert_eq!(
+            provider
+                .headers
+                .get("X-GitHub-Api-Version")
+                .map(String::as_str),
+            Some("2026-06-01")
+        );
+        // Traffic-classification headers are request-dependent; a constant
+        // would be wrong half the time, so none is written.
+        assert!(
+            !provider.headers.contains_key("x-initiator"),
+            "{:?}",
+            provider.headers
+        );
+        assert!(
+            !provider.headers.contains_key("Openai-Intent"),
+            "{:?}",
+            provider.headers
+        );
+    }
+
+    #[test]
+    fn only_copilot_gets_extra_headers() {
+        let config = build_config(
+            &[Client::Claude],
+            &[
+                (KnownProvider::Anthropic, None),
+                (KnownProvider::OllamaLocal, None),
+            ],
+            KeyStorage::Keychain,
+        );
+        for id in ["anthropic", "ollama-local"] {
+            assert!(
+                config.providers[id].headers.is_empty(),
+                "{id} should have no extra headers"
+            );
+        }
+    }
+
+    #[test]
+    fn copilots_env_var_is_not_the_overloaded_github_token() {
+        // `GITHUB_TOKEN` is set to an unrelated repo token in every CI
+        // environment, which would 403 against Copilot and look like a bug.
+        assert_eq!(
+            KnownProvider::GithubCopilot.env_var(),
+            "GITHUB_COPILOT_TOKEN"
+        );
+    }
+
     #[test]
     fn claude_route_gets_openrouter_anthropic_fallback() {
         let config = build_config(
@@ -560,5 +715,43 @@ mod tests {
         );
         let provider = config.providers.get("ollama-local").unwrap();
         assert_eq!(provider.api_key.as_ref().unwrap().0, "local");
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn command_exists_agrees_with_the_shell() {
+        assert!(command_exists("sh"), "sh must be on PATH");
+        assert!(!command_exists("llm-gateway-definitely-not-a-real-binary"));
+    }
+
+    /// Only Copilot has a tool to discover a credential from; every other
+    /// provider must fall through to the wizard's normal key question.
+    #[test]
+    fn no_other_provider_discovers_a_key() {
+        for provider in KnownProvider::ALL {
+            if provider == KnownProvider::GithubCopilot {
+                continue;
+            }
+            assert!(
+                provider.discovered_key().is_none(),
+                "{} should not discover a key",
+                provider.id()
+            );
+        }
+    }
+
+    /// Machine-dependent by nature, so this asserts the *shape* rather than
+    /// which branch was taken: whatever comes back must be a `command:`
+    /// reference that names `gh`, and nothing else.
+    #[test]
+    fn a_discovered_copilot_key_is_a_gh_command_reference() {
+        if let Some(key) = KnownProvider::GithubCopilot.discovered_key() {
+            assert_eq!(key.kind(), crate::config::secret::SecretKind::Command);
+            assert!(key.raw().contains("gh auth token"), "{}", key.raw());
+        }
     }
 }
