@@ -18,6 +18,7 @@ and the endpoint answered.
 | Anthropic | `https://api.anthropic.com` | `anthropic-messages` | `ANTHROPIC_API_KEY` |
 | OpenAI | `https://api.openai.com/v1` | `openai-responses` | `OPENAI_API_KEY` |
 | OpenRouter | `https://openrouter.ai/api/v1` | `openai-chat` / `anthropic-messages` | `OPENROUTER_API_KEY` |
+| GitHub Copilot | `https://api.githubcopilot.com` | `openai-chat` | *(a GitHub token — see below)* |
 | Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | `openai-chat` | `GEMINI_API_KEY` |
 | xAI (Grok) | `https://api.x.ai/v1` | `openai-chat` | `XAI_API_KEY` |
 | Mistral | `https://api.mistral.ai/v1` | `openai-chat` | `MISTRAL_API_KEY` |
@@ -91,6 +92,65 @@ openrouter: {
 Model ids contain a `/` (`anthropic/claude-sonnet-4.6`); route targets split
 on the *first* `/` only, so `openrouter/anthropic/claude-sonnet-4.6` parses
 fine.
+
+### GitHub Copilot
+
+Your Copilot subscription, reachable from any client the gateway fronts —
+including Claude Code, via [cross-protocol
+translation](../README.md#cross-protocol-routing).
+
+```json5
+"github-copilot": {
+  baseUrl: "https://api.githubcopilot.com",
+  api: "openai-chat",
+  // `gh` refreshes this token on its own schedule, so read it per request
+  // instead of copying it. Add `--user <login>` if you have several accounts.
+  apiKey: "command:gh auth token",
+  headers: { "X-GitHub-Api-Version": "2026-06-01" },
+},
+```
+
+`llm-gateway init` offers this provider and fills in exactly the above,
+including the `command:` reference, whenever `gh` is on your `PATH`.
+
+The credential is an ordinary GitHub token — there is no separate Copilot API
+key and no token-exchange step. Any of these work:
+
+- `gh auth login`, then `command:gh auth token` (recommended: it never goes
+  stale).
+- A personal access token in `GITHUB_COPILOT_TOKEN`, referenced as
+  `"${GITHUB_COPILOT_TOKEN}"`.
+- Whatever token an editor integration already stored, pasted into the
+  Keychain (`keychain:github-copilot`).
+
+`X-GitHub-Api-Version` is not required — a bare `Authorization: Bearer` works —
+but pinning it means a future default change on GitHub's side cannot alter the
+response shape mid-session.
+
+**Which models you can actually use is narrower than the list.**
+`GET https://api.githubcopilot.com/models` returns everything Copilot knows
+about, including models your plan cannot touch; those answer
+`400 model_not_supported`. The `policy.state` field is the closer signal, and
+premium models generally need enabling in your GitHub Copilot settings first.
+Check with:
+
+```sh
+curl -s https://api.githubcopilot.com/models \
+  -H "Authorization: Bearer $(gh auth token)" \
+  -H "X-GitHub-Api-Version: 2026-06-01" \
+  | jq -r '.data[] | select(.capabilities.type=="chat") | "\(.id)\t\(.policy.state // "-")"'
+```
+
+Two more things worth knowing:
+
+- Requests are billed against your Copilot quota like any other Copilot usage.
+  The gateway does not send Copilot's `x-initiator` / `Openai-Intent`
+  classification headers, because their correct value depends on the individual
+  request and a constant would be wrong half the time.
+- Copilot also advertises `/v1/messages` for its Claude models, which would
+  mean no translation at all. The gateway cannot use it yet: that endpoint
+  requires `Authorization: Bearer`, while an `anthropic-messages` provider is
+  authenticated with `x-api-key`. Tracked as a follow-up.
 
 ### Google Gemini
 

@@ -2,6 +2,40 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-07-31 — GitHub Copilot is an ordinary provider; `command:` secrets exist for it
+
+Copilot needs no special support in the gateway. `https://api.githubcopilot.com`
+speaks `openai-chat` and accepts a plain GitHub token as
+`Authorization: Bearer`, so with cross-protocol translation in place it is
+reachable from every client the gateway fronts, Claude Code included. Verified
+against the real API: `gpt-4.1` driving Claude Code through a full
+tool_use → tool_result loop.
+
+Two decisions came out of getting there:
+
+- **A new `command:<cmd>` secret form**, rather than a Copilot-specific auth
+  mechanism. The actual problem is generic: the credential is minted and
+  rotated by another tool (`gh`), so any copy of it goes stale. `${VAR}` cannot
+  fix that — a `serve` process's environment is frozen when it starts — while a
+  command re-run per attempt is always current. `keychain:` already spawns a
+  process per attempt, so this adds no new cost model. It also means `init` can
+  offer Copilot without asking for a key at all.
+- **No editor impersonation.** An earlier attempt went at
+  `copilot_internal/v2/token` with VS Code-shaped identity headers, on the
+  assumption that a token exchange was required, and got a `403` pointing at
+  GitHub's terms. That assumption was simply wrong — the current API wants
+  nothing but a Bearer token — and the correct fix was to stop guessing, read
+  what a working client (opencode) actually sends, and send that: a Bearer
+  token, an honest `User-Agent`, and a pinned `X-GitHub-Api-Version`.
+
+Not implemented: Copilot's own `/v1/messages` endpoint, which would let Claude
+Code reach its Claude models with no translation at all. It requires
+`Authorization: Bearer`, and an `anthropic-messages` provider here authenticates
+with `x-api-key`; giving a provider control over its auth header is the
+prerequisite, and it could not be verified on the account at hand (that endpoint
+answers `no_available_model_endpoints` there). Left as a follow-up rather than
+shipped unverified.
+
 ## 2026-07-31 — One-way translation: Anthropic Messages in, OpenAI Chat out
 
 Issue #3. `launch claude` had two possible destinations (Anthropic,

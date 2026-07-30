@@ -217,6 +217,7 @@ routes: {
 | Anthropic | `https://api.anthropic.com` | `anthropic-messages` | `ANTHROPIC_API_KEY` |
 | OpenAI | `https://api.openai.com/v1` | `openai-responses` | `OPENAI_API_KEY` |
 | OpenRouter | `https://openrouter.ai/api/v1` | `openai-chat`(`anthropic-messages` も可) | `OPENROUTER_API_KEY` |
+| GitHub Copilot | `https://api.githubcopilot.com` | `openai-chat` | *(GitHub トークン、例: `command:gh auth token`)* |
 | Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | `openai-chat` | `GEMINI_API_KEY` |
 | xAI (Grok) | `https://api.x.ai/v1` | `openai-chat` | `XAI_API_KEY` |
 | Mistral | `https://api.mistral.ai/v1` | `openai-chat` | `MISTRAL_API_KEY` |
