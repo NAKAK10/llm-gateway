@@ -61,6 +61,22 @@ llm-gateway stats           # what was spent, per route
 client's config. Manual (permanent) setup for every client is documented in
 `docs/clients/`.
 
+## Per-agent models
+
+Sub-agents that pin their own model keep working, with **zero changes to the
+agent files** — every request flows through the gateway:
+
+| client | agent model source | how it reaches the gateway |
+|---|---|---|
+| Claude Code | subagent `model:` frontmatter | env redirect covers the whole process; ids resolve via `claude-*` |
+| Codex CLI | `~/.codex/agents/*.toml` `model =` | provider is global, models pass through via `gpt-*` |
+| opencode | `agents/*.md` `model: openai/…` | `launch` also redirects the built-in providers named in `launch.opencode.overrideProviders` (default `openai`, `anthropic`), because opencode picks a provider per model reference — without this, pinned agents would silently bypass the gateway |
+
+Routing is by model name today: an exact route name wins, otherwise the
+longest wildcard prefix. Content-based (semantic) routing that picks a route
+from the request itself is Phase 2 — `routes[].description` is its future
+classification corpus.
+
 ## Supported providers
 
 `llm-gateway init` can scaffold any of these out of the box. A provider is
@@ -121,9 +137,13 @@ previous config serving and logs the error.
     },
   },
   launch: {
+    // `model` is only the client's MAIN/default model, and it is a route
+    // name — a role route (`role-strategy`) or a passthrough id caught by a
+    // wildcard. Per-agent models are untouched; see "Per-agent models" below.
     claude:   { model: "claude-sonnet-4-6", extraArgs: [] },
     codex:    { model: "gpt-5.6", wireApi: "responses", extraArgs: [] },
-    opencode: { model: "role-default", models: [], extraArgs: [] },
+    opencode: { model: "role-default", models: [],
+                overrideProviders: ["openai", "anthropic"], extraArgs: [] },
   },
   logging: {
     dir: "./logs",            // relative to the config dir
