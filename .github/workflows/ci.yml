@@ -1,8 +1,9 @@
 name: ci
 
+# `dev` is the default working branch; `main` receives release merges.
 on:
   push:
-    branches: [main]
+    branches: [dev, main]
   pull_request:
 
 env:

@@ -22,10 +22,20 @@ variables / CLI overrides — **no client config file is ever modified**.
 ## Install
 
 ```sh
-cargo install --path .
-# or, once releases exist:
-# brew install NAKAK10/tap/llm-gateway
+brew install NAKAK10/tap/llm-gateway
+# or from source:
+cargo install --git https://github.com/NAKAK10/llm-gateway
 ```
+
+## Releasing (maintainers)
+
+`dev` is the default branch. To ship a release: bump `version` in
+`Cargo.toml` on `dev`, then merge `dev` into `main`. The release workflow
+builds macOS binaries (arm64 + x86_64), publishes `v{version}` on GitHub
+Releases, and updates the formula in
+[NAKAK10/homebrew-tap](https://github.com/NAKAK10/homebrew-tap)
+automatically. Merging without a version bump releases nothing (the tag
+already exists), so docs-only merges are safe.
 
 ## Quick start
 
