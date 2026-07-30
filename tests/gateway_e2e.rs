@@ -91,6 +91,8 @@ async fn spawn_gateway(config: Config, inbound_key: Option<&str>) -> SocketAddr 
         http: reqwest::Client::new(),
         recorder,
         inbound_key: inbound_key.map(String::from),
+        #[cfg(feature = "semantic")]
+        classifier: None,
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -114,12 +114,17 @@ fn embed_candidate(
 /// Outcome of classifying one request against an auto route's candidates.
 #[derive(Debug, Clone)]
 pub struct Verdict {
-    /// The winning candidate's route name.
-    pub route: String,
-    /// Its cosine similarity to the request text.
-    pub score: f32,
+    /// The winning candidate's route name and its cosine similarity to the
+    /// request text, if the top-scoring candidate cleared the route's
+    /// `threshold`. `None` means the caller should fall back to the auto
+    /// route's own `model` — either no candidate cleared the bar, no
+    /// candidate matched `expected_api`, or `text` failed to embed.
+    pub matched: Option<(String, f32)>,
     /// Every candidate considered (after excluding `ApiKind` mismatches),
-    /// scored and sorted descending by `score`.
+    /// scored and sorted descending by score. Kept even when `matched` is
+    /// `None`, so a caller building a trace record can still show what
+    /// almost matched. Empty when `text` failed to embed or no candidate
+    /// matched `expected_api`.
     pub candidates: Vec<(String, f32)>,
     /// How long embedding the request text took.
     pub embed_ms: u64,
@@ -135,24 +140,28 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// Winning route, its score, and every scored candidate (descending) — the
-/// pieces `rank` produces and `Classifier::classify` assembles into a
-/// [`Verdict`].
-type Ranked = (String, f32, Vec<(String, f32)>);
+/// Every candidate considered (after excluding `ApiKind` mismatches), scored
+/// and sorted descending by score, plus the winner if one cleared
+/// `threshold` — the pieces `rank` produces and `Classifier::classify`
+/// assembles into a [`Verdict`].
+struct Scored {
+    all: Vec<(String, f32)>,
+    winner: Option<(String, f32)>,
+}
 
 /// Score `candidates` against an already-embedded `vector`, keeping only
 /// those whose `api` matches `expected_api`, and decide whether the winner
 /// clears `threshold`.
 ///
+/// `all` is returned regardless of whether anything clears `threshold` —
+/// unlike an early `None`, this keeps sub-threshold candidates visible to a
+/// caller that wants to record them (e.g. for tracing) even when the
+/// classification decision itself is "fall back".
+///
 /// Pure and model-independent on purpose: this is the actual classification
 /// decision (matching, ranking, thresholding), split out from `Classifier`
 /// so it can be unit-tested without a loaded embedding model.
-fn rank(
-    vector: &[f32],
-    candidates: &[Candidate],
-    expected_api: ApiKind,
-    threshold: f32,
-) -> Option<Ranked> {
+fn rank(vector: &[f32], candidates: &[Candidate], expected_api: ApiKind, threshold: f32) -> Scored {
     let mut scored: Vec<(String, f32)> = candidates
         .iter()
         .filter(|c| c.api == expected_api)
@@ -161,11 +170,15 @@ fn rank(
 
     scored.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-    let (top_route, top_score) = scored.first().cloned()?;
-    if top_score < threshold {
-        return None;
+    let winner = scored
+        .first()
+        .cloned()
+        .filter(|(_, score)| *score >= threshold);
+
+    Scored {
+        all: scored,
+        winner,
     }
-    Some((top_route, top_score, scored))
 }
 
 /// Decides, from a monotonically increasing generation counter, whether a
@@ -250,11 +263,15 @@ impl Classifier {
 
     /// Classify `text` against `auto_route`'s candidates.
     ///
-    /// Returns `None` when `auto_route` has no `semantic` block, when
-    /// embedding `text` fails, or when no candidate (after excluding those
-    /// speaking a different `ApiKind` than `expected_api`) clears the
-    /// route's `threshold` — in every case the caller should fall back to
-    /// `auto_route`'s own `model`.
+    /// Returns `None` only when `auto_route` has no `semantic` block in the
+    /// current index — the one case a caller cannot get anything useful
+    /// back, since there is no `threshold` or candidate list to score
+    /// against. Every other outcome is `Some(Verdict)`: `Verdict::matched`
+    /// is `None` when embedding `text` fails, no candidate matches
+    /// `expected_api`, or the best score misses `threshold`, and in all of
+    /// those cases the caller should fall back to `auto_route`'s own
+    /// `model` — but `Verdict::candidates` is still populated where
+    /// possible, for a caller that wants to record what was considered.
     pub fn classify(&self, auto_route: &str, text: &str, expected_api: ApiKind) -> Option<Verdict> {
         self.stale_check.sync(self.shared.generation(), || {
             let config = self.shared.get();
@@ -266,16 +283,23 @@ impl Classifier {
         let entry = index.entry(auto_route)?;
 
         let started = Instant::now();
-        let vector = self.embedder.embed(text)?;
+        let vector = self.embedder.embed(text);
         let embed_ms = started.elapsed().as_millis() as u64;
 
-        let (route, score, candidates) =
-            rank(&vector, &entry.candidates, expected_api, entry.threshold)?;
+        let Some(vector) = vector else {
+            // Tokenizer panic or an empty result: nothing was scored, so
+            // there is no candidate list to hand back either.
+            return Some(Verdict {
+                matched: None,
+                candidates: Vec::new(),
+                embed_ms,
+            });
+        };
 
+        let scored = rank(&vector, &entry.candidates, expected_api, entry.threshold);
         Some(Verdict {
-            route,
-            score,
-            candidates,
+            matched: scored.winner,
+            candidates: scored.all,
             embed_ms,
         })
     }
@@ -313,13 +337,14 @@ mod tests {
             candidate("mid", vec![0.7, 0.7], ApiKind::AnthropicMessages),
         ];
 
-        let (route, score, scored) =
-            rank(&[1.0, 0.0], &candidates, ApiKind::AnthropicMessages, 0.0).unwrap();
+        let scored = rank(&[1.0, 0.0], &candidates, ApiKind::AnthropicMessages, 0.0);
 
+        let (route, score) = scored.winner.expect("top score clears threshold 0.0");
         assert_eq!(route, "high");
         assert!((score - 1.0).abs() < 1e-6);
         assert_eq!(
             scored
+                .all
                 .iter()
                 .map(|(name, _)| name.as_str())
                 .collect::<Vec<_>>(),
@@ -328,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn rank_returns_none_when_the_best_score_misses_threshold() {
+    fn rank_has_no_winner_when_the_best_score_misses_threshold_but_keeps_all_scored() {
         let candidates = vec![candidate(
             "only",
             vec![0.0, 1.0],
@@ -336,7 +361,13 @@ mod tests {
         )];
 
         // Orthogonal to the query vector: score 0.0, threshold 0.5.
-        assert!(rank(&[1.0, 0.0], &candidates, ApiKind::AnthropicMessages, 0.5).is_none());
+        let scored = rank(&[1.0, 0.0], &candidates, ApiKind::AnthropicMessages, 0.5);
+        assert!(scored.winner.is_none());
+        assert_eq!(
+            scored.all.len(),
+            1,
+            "the sub-threshold candidate is still kept for tracing"
+        );
     }
 
     #[test]
@@ -346,18 +377,22 @@ mod tests {
             candidate("right-api", vec![0.9, 0.1], ApiKind::AnthropicMessages),
         ];
 
-        let (route, _, scored) =
-            rank(&[1.0, 0.0], &candidates, ApiKind::AnthropicMessages, 0.0).unwrap();
+        let scored = rank(&[1.0, 0.0], &candidates, ApiKind::AnthropicMessages, 0.0);
 
+        let (route, _) = scored
+            .winner
+            .expect("the matching-api candidate clears 0.0");
         assert_eq!(route, "right-api");
-        assert_eq!(scored.len(), 1, "{scored:?}");
+        assert_eq!(scored.all.len(), 1, "{:?}", scored.all);
     }
 
     #[test]
-    fn rank_returns_none_when_no_candidate_matches_the_expected_api() {
+    fn rank_has_no_winner_when_no_candidate_matches_the_expected_api() {
         let candidates = vec![candidate("only", vec![1.0, 0.0], ApiKind::OpenaiChat)];
 
-        assert!(rank(&[1.0, 0.0], &candidates, ApiKind::AnthropicMessages, 0.0).is_none());
+        let scored = rank(&[1.0, 0.0], &candidates, ApiKind::AnthropicMessages, 0.0);
+        assert!(scored.winner.is_none());
+        assert!(scored.all.is_empty());
     }
 
     #[test]

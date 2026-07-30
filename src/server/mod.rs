@@ -28,7 +28,7 @@ use axum::routing::{get, post};
 use axum::Router;
 
 use crate::config::watch::SharedConfig;
-use crate::config::ApiKind;
+use crate::config::{ApiKind, Config};
 use crate::error::{Error, Result};
 use crate::record::{RecordMode, Recorder};
 use crate::{paths, upstream};
@@ -52,6 +52,13 @@ pub struct AppState {
     /// like host and port, it is part of the listener's identity, and
     /// re-resolving a Keychain reference per request would prompt constantly.
     pub inbound_key: Option<String>,
+    /// Loaded once at startup by [`prepare_classifier`], only when at least
+    /// one route in config has a `semantic` block — the embedding model is
+    /// ~489MiB resident, so nothing pays for it unless something asked for
+    /// it. `None` when no route needs it (or, with the `semantic` feature
+    /// disabled, always — see the warning `serve` logs in that case).
+    #[cfg(feature = "semantic")]
+    pub classifier: Option<Arc<crate::semantic::index::Classifier>>,
 }
 
 /// Load config, bind, and serve until interrupted.
@@ -84,11 +91,20 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
     };
     let recorder = Recorder::start(paths::logs_dir(&config.logging.dir), mode)?;
 
+    let http = upstream::client()?;
+
+    #[cfg(feature = "semantic")]
+    let classifier = prepare_classifier(&shared, &config, &http).await?;
+    #[cfg(not(feature = "semantic"))]
+    warn_if_semantic_routes_are_unusable(&config);
+
     let state = AppState {
         config: shared.clone(),
-        http: upstream::client()?,
+        http,
         recorder,
         inbound_key,
+        #[cfg(feature = "semantic")]
+        classifier,
     };
 
     // Watch after the first successful load: a broken edit from here on keeps
@@ -116,6 +132,65 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
 
     axum::serve(listener, router(state)).await?;
     Ok(())
+}
+
+/// Prepare the embedding model and build the initial [`crate::semantic::index::Classifier`],
+/// but only if `config` actually has a route that needs it.
+///
+/// `None` when no route has a `semantic` block — the ~489MiB resident model
+/// is never loaded in that case. Otherwise this blocks: `model_file::ensure`
+/// may download ~512MB on first run (progress goes to stderr already) and
+/// `Embedder::load` takes 1.5-4s, so the load runs on a blocking task rather
+/// than tying up an async worker. Blocking startup on this is a deliberate
+/// choice — see the design this implements — but it must be visible in the
+/// logs, hence the `info!` calls around it.
+#[cfg(feature = "semantic")]
+async fn prepare_classifier(
+    shared: &Arc<SharedConfig>,
+    config: &Config,
+    http: &reqwest::Client,
+) -> Result<Option<Arc<crate::semantic::index::Classifier>>> {
+    if !config.routes.values().any(|route| route.semantic.is_some()) {
+        return Ok(None);
+    }
+
+    tracing::info!(
+        "semantic routing is configured; preparing the embedding model \
+         (may download ~512MB on first run)..."
+    );
+    let files = crate::semantic::model_file::ensure(http).await?;
+
+    let shared = Arc::clone(shared);
+    let embedder =
+        tokio::task::spawn_blocking(move || crate::semantic::embed::Embedder::load(&files))
+            .await
+            .map_err(|err| {
+                Error::Other(format!("semantic model loading task panicked: {err}"))
+            })??;
+    tracing::info!("semantic routing model loaded");
+
+    Ok(Some(Arc::new(crate::semantic::index::Classifier::new(
+        shared, embedder,
+    ))))
+}
+
+/// Warn once, at startup, when config asks for semantic routing but this
+/// build cannot provide it.
+///
+/// The config schema is not feature-gated (see [`crate::config::SemanticConfig`]),
+/// so a route can have a `semantic` block even in a binary built without the
+/// `semantic` feature. That must not be a hard error: the route still works,
+/// it just always forwards to its own `model` — the same as if no candidate
+/// had ever cleared the threshold.
+#[cfg(not(feature = "semantic"))]
+fn warn_if_semantic_routes_are_unusable(config: &Config) {
+    if config.routes.values().any(|route| route.semantic.is_some()) {
+        tracing::warn!(
+            "config has route(s) with `semantic`, but this build does not have the `semantic` \
+             feature enabled; those routes will forward to their own `model` directly, without \
+             classification. Rebuild with `--features semantic` to enable it."
+        );
+    }
 }
 
 fn init_tracing() {
