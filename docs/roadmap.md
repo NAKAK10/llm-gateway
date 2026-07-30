@@ -26,16 +26,17 @@
   secondary sources say `chat` was removed 2026-02. The gateway serves both
   endpoints and `launch.codex.wireApi` switches, so measurement decides.
 
-## Phase 2 — semantic routing
+## Phase 2 — semantic routing (shipped)
 
 Pick a route from the *content* of the request when the client asks for a
-designated auto route (never overriding an explicit route name).
+designated auto route (never overriding an explicit route name). Behind the
+`semantic` cargo feature, which the distributed binary enables.
 
-- embed `routes[].description` (that's why long ones live in `llm/*.md`) and
+- [x] embed `routes[].description` (that's why long ones live in `llm/*.md`) and
   the request's last user text; cosine top-1 over a threshold wins
-- engine: `model2vec-rs` + `potion-multilingual-128M` (static, no ONNX, 101
+- [x] engine: `model2vec-rs` + `potion-multilingual-128M` (static, no ONNX, 101
   languages, distilled from BGE-M3); upgrade path: `fastembed` `BGEM3`
-- trace `routing.mode = "semantic"` with per-candidate scores — the schema
+- [x] trace `routing.mode = "semantic"` with per-candidate scores — the schema
   already has the fields (`candidates`, `score`, `threshold`, `embed_ms`)
 
 ## Phase 3 — cross-protocol translation

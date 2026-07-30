@@ -77,19 +77,23 @@ agent files** — every request flows through the gateway:
 | Codex CLI | `~/.codex/agents/*.toml` `model =` | provider is global, models pass through via `gpt-*` |
 | opencode | `agents/*.md` `model: openai/…` | `launch` also redirects the built-in providers named in `launch.opencode.overrideProviders` (default `openai`, `anthropic`), because opencode picks a provider per model reference — without this, pinned agents would silently bypass the gateway |
 
-Routing is by model name today: an exact route name wins, otherwise the
-longest wildcard prefix. Content-based (semantic) routing that picks a route
-from the request itself is Phase 2 — the config schema is finalized (see
-[Semantic routing](#semantic-routing-phase-2-design) below), but the
-classifier itself is not implemented yet.
+Routing is by model name by default: an exact route name wins, otherwise the
+longest wildcard prefix. Content-based (semantic) routing, which picks a route
+from the request itself, is available for routes that opt in — see
+[Semantic routing](#semantic-routing) below.
 
-## Semantic routing (Phase 2 design)
+## Semantic routing
 
-The config schema for content-based routing is finalized; the classifier
-itself is not implemented yet — routing today is still exact-name-first,
-then longest-wildcard-prefix (see "Per-agent models" above). This section
-documents the schema so configs written against it keep working once the
-classifier ships.
+Content-based routing picks a route from the *content* of the request instead
+of its `model` name. It runs only for a route that carries a `semantic` block;
+everything else stays exact-name-first, then longest-wildcard-prefix.
+
+**Requires a build with the `semantic` cargo feature** — the Homebrew binary
+has it, `cargo install` without `--features semantic` does not. The feature is
+opt-in at build time because the embedding model is ~500MB. A binary without it
+warns at startup and forwards such routes to their own `model` directly, so the
+config stays valid either way. The model is downloaded on first `serve` with a
+`semantic` route configured, and is only loaded into memory when one exists.
 
 `routes[].semantic` is an optional field on any route:
 
