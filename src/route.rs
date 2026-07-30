@@ -5,7 +5,7 @@
 //! semantic routing will add later, and keeping it out for now means an
 //! explicit route name always wins and is always predictable.
 
-use crate::config::{ApiKind, Config, ModelRef, ProviderConfig};
+use crate::config::{ApiKind, Config, ModelRef, ProviderConfig, SecretRef};
 use crate::error::{Error, Result};
 
 /// A resolved upstream: which provider, which model, and which protocol.
@@ -15,6 +15,11 @@ pub struct Target {
     pub api: ApiKind,
     /// `base_url` with no trailing slash.
     pub base_url: String,
+    /// Still unresolved — the secret is read per attempt, so a fixed Keychain
+    /// entry or rotated environment variable is picked up without a reload.
+    pub api_key: Option<SecretRef>,
+    /// Provider-level extra headers (e.g. OpenRouter attribution).
+    pub headers: Vec<(String, String)>,
     pub inject_usage: bool,
 }
 
@@ -95,6 +100,12 @@ fn build_target(model_ref: ModelRef, provider: &ProviderConfig) -> Target {
         model_ref,
         api: provider.api,
         base_url: provider.base_url.trim_end_matches('/').to_string(),
+        api_key: provider.api_key.clone(),
+        headers: provider
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
         inject_usage: provider.inject_usage,
     }
 }

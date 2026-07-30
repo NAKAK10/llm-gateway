@@ -105,6 +105,8 @@ mod tests {
             },
             api,
             base_url: base.to_string(),
+            api_key: None,
+            headers: Vec::new(),
             inject_usage: true,
         }
     }
