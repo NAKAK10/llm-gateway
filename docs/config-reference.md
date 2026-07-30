@@ -1,5 +1,7 @@
 # config.json reference
 
+[English](config-reference.md) | [日本語](ja/config-reference.md)
+
 Location: `~/.config/llm-gateway/config.json` (override the directory with
 `LLM_GATEWAY_CONFIG_DIR`). Parsed as JSON5: comments, trailing commas and
 unquoted keys are fine. Unknown fields are **rejected**, so typos fail loudly

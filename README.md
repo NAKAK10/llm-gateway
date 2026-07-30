@@ -1,5 +1,7 @@
 # llm-gateway
 
+English | [日本語](README.ja.md)
+
 One local endpoint in front of every agent CLI.
 
 `llm-gateway` speaks the three wire protocols its clients need — Anthropic
@@ -45,6 +47,42 @@ llm-gateway serve           # start the gateway on 127.0.0.1:4000
 llm-gateway launch claude   # start Claude Code through the gateway
 llm-gateway stats           # what was spent, per route
 ```
+
+## Supported clients
+
+| client | how |
+|---|---|
+| Claude Code | `llm-gateway launch claude` |
+| Codex CLI | `llm-gateway launch codex` |
+| opencode | `llm-gateway launch opencode` |
+| OpenClaw | manual setup — see `docs/clients/openclaw.md` |
+
+`launch` injects the redirect at start time; nothing is written to the
+client's config. Manual (permanent) setup for every client is documented in
+`docs/clients/`.
+
+## Supported providers
+
+`llm-gateway init` can scaffold any of these out of the box. A provider is
+just `baseUrl` + `api` + `apiKey`, so **any** OpenAI- or Anthropic-compatible
+endpoint works even if it is not on this list — see `docs/providers.md` for
+copy-paste config for each.
+
+| provider | `baseUrl` | `api` | key env var |
+|---|---|---|---|
+| Anthropic | `https://api.anthropic.com` | `anthropic-messages` | `ANTHROPIC_API_KEY` |
+| OpenAI | `https://api.openai.com/v1` | `openai-responses` | `OPENAI_API_KEY` |
+| OpenRouter | `https://openrouter.ai/api/v1` | `openai-chat` (also speaks `anthropic-messages`) | `OPENROUTER_API_KEY` |
+| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | `openai-chat` | `GEMINI_API_KEY` |
+| xAI (Grok) | `https://api.x.ai/v1` | `openai-chat` | `XAI_API_KEY` |
+| Mistral | `https://api.mistral.ai/v1` | `openai-chat` | `MISTRAL_API_KEY` |
+| DeepSeek | `https://api.deepseek.com/v1` | `openai-chat` | `DEEPSEEK_API_KEY` |
+| Groq | `https://api.groq.com/openai/v1` | `openai-chat` | `GROQ_API_KEY` |
+| Together AI | `https://api.together.xyz/v1` | `openai-chat` | `TOGETHER_API_KEY` |
+| Sakana AI (Fugu) | `https://api.sakana.ai/v1` | `openai-chat` | `SAKANA_API_KEY` |
+| PLaMo (Preferred Networks) | `https://api.platform.preferredai.jp/v1` | `openai-chat` | `PLAMO_API_KEY` |
+| Ollama Cloud | `https://ollama.com/v1` | `openai-chat` | `OLLAMA_API_KEY` |
+| Ollama (local) | `http://127.0.0.1:11434/v1` | `openai-chat` | *(none needed)* |
 
 ## Configuration reference
 

@@ -1,5 +1,7 @@
 # opencode — manual setup
 
+[English](opencode.md) | [日本語](../ja/clients/opencode.md)
+
 `llm-gateway launch opencode` is the supported path and needs none of this.
 This page makes the redirect permanent by hand. The gateway never writes
 `~/.config/opencode/opencode.json`.
