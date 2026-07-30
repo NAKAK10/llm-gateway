@@ -110,10 +110,7 @@ impl SseUsageScanner {
 
         // An event ends at a blank line (`\n\n`). Drain every complete event
         // currently in the buffer, keeping only the trailing partial one.
-        loop {
-            let Some(pos) = find_subslice(&self.buffer, EVENT_SEPARATOR) else {
-                break;
-            };
+        while let Some(pos) = find_subslice(&self.buffer, EVENT_SEPARATOR) {
             let event_end = pos + EVENT_SEPARATOR.len();
             let event: Vec<u8> = self.buffer.drain(..event_end).collect();
             self.handle_event(&event[..pos]);

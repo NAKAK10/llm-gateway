@@ -197,7 +197,7 @@ pub fn aggregate(
         // Day is a timeline, so it reads best in chronological order.
         GroupBy::Day => result.sort_by(|a, b| a.key.cmp(&b.key)),
         // Everything else reads best biggest-first.
-        _ => result.sort_by(|a, b| (b.in_tok + b.out_tok).cmp(&(a.in_tok + a.out_tok))),
+        _ => result.sort_by_key(|row| std::cmp::Reverse(row.in_tok + row.out_tok)),
     }
     result
 }
