@@ -17,6 +17,14 @@
 //!   against the running gateway before the child starts, turning a silent
 //!   failure into a message.
 //!
+//! Unlike Codex (global provider) and Claude Code (process-wide env), opencode
+//! selects a provider *per model reference* — an agent file pinning
+//! `model: openai/gpt-…` would go straight to OpenAI and silently bypass the
+//! gateway. So the injected config also **redirects the built-in providers**
+//! listed in `launch.opencode.overrideProviders` (default: openai, anthropic)
+//! to the gateway. Per-agent model choices keep working unchanged; the
+//! wildcard routes (`gpt-*`, `claude-*`) forward the ids as-is.
+//!
 //! `--isolate` adds `--pure`, which disables external plugins.
 
 use std::collections::HashSet;
@@ -40,7 +48,13 @@ pub fn build(
     };
 
     let wanted_models = resolved_models(config, models);
-    let content = config_content(&base_url, api_key.as_deref(), &wanted_models);
+    let overrides: &[String] = config
+        .launch
+        .opencode
+        .as_ref()
+        .map(|c| c.override_providers.as_slice())
+        .unwrap_or(&[]);
+    let content = config_content(&base_url, api_key.as_deref(), &wanted_models, overrides);
 
     let env = vec![(
         "OPENCODE_CONFIG_CONTENT".to_string(),
@@ -82,7 +96,40 @@ pub fn config_content(
     base_url: &str,
     api_key: Option<&str>,
     models: &[String],
+    override_providers: &[String],
 ) -> serde_json::Value {
+    let mut model_entries = serde_json::Map::new();
+    for m in models {
+        model_entries.insert(m.clone(), serde_json::json!({}));
+    }
+
+    let mut providers = serde_json::Map::new();
+    providers.insert(
+        "gateway".to_string(),
+        serde_json::json!({
+            "npm": "@ai-sdk/openai-compatible",
+            "options": gateway_options(base_url, api_key),
+            "models": model_entries,
+        }),
+    );
+
+    // Redirect the named built-in providers so per-agent `model:
+    // openai/…` references also flow through the gateway. Only `options`
+    // is set — opencode merges configs key-by-key, so the provider keeps
+    // its native npm package (and therefore its native wire protocol,
+    // which the gateway speaks on the matching endpoint).
+    for id in override_providers {
+        providers.insert(
+            id.clone(),
+            serde_json::json!({ "options": gateway_options(base_url, api_key) }),
+        );
+    }
+
+    serde_json::json!({ "provider": providers })
+}
+
+/// The `options` block pointing one provider at the gateway.
+fn gateway_options(base_url: &str, api_key: Option<&str>) -> serde_json::Value {
     let mut options = serde_json::Map::new();
     options.insert(
         "baseURL".to_string(),
@@ -94,27 +141,11 @@ pub fn config_content(
             serde_json::Value::String(key.to_string()),
         );
     }
-    let mut headers = serde_json::Map::new();
-    headers.insert(
-        "x-gw-client".to_string(),
-        serde_json::Value::String("opencode".to_string()),
+    options.insert(
+        "headers".to_string(),
+        serde_json::json!({ "x-gw-client": "opencode" }),
     );
-    options.insert("headers".to_string(), serde_json::Value::Object(headers));
-
-    let mut model_entries = serde_json::Map::new();
-    for m in models {
-        model_entries.insert(m.clone(), serde_json::json!({}));
-    }
-
-    serde_json::json!({
-        "provider": {
-            "gateway": {
-                "npm": "@ai-sdk/openai-compatible",
-                "options": options,
-                "models": model_entries,
-            }
-        }
-    })
+    serde_json::Value::Object(options)
 }
 
 /// Ask the running gateway for its model list and confirm every name we are
@@ -156,16 +187,43 @@ mod tests {
 
     #[test]
     fn api_key_field_is_present_only_when_configured() {
-        let with_key = config_content("http://127.0.0.1:4000", Some("secret"), &[]);
+        let with_key = config_content("http://127.0.0.1:4000", Some("secret"), &[], &[]);
         assert_eq!(
             with_key["provider"]["gateway"]["options"]["apiKey"],
             serde_json::json!("secret")
         );
 
-        let without_key = config_content("http://127.0.0.1:4000", None, &[]);
+        let without_key = config_content("http://127.0.0.1:4000", None, &[], &[]);
         assert!(without_key["provider"]["gateway"]["options"]
             .get("apiKey")
             .is_none());
+    }
+
+    /// The bypass-closing behaviour: built-in providers named in
+    /// `overrideProviders` get their `baseURL` pointed at the gateway, but keep
+    /// their `npm` untouched (config merge preserves the native SDK, and with
+    /// it the wire protocol the gateway expects on that endpoint).
+    #[test]
+    fn override_providers_are_redirected_without_replacing_their_sdk() {
+        let overrides = vec!["openai".to_string(), "anthropic".to_string()];
+        let content = config_content("http://127.0.0.1:4000", Some("k"), &[], &overrides);
+
+        for id in ["openai", "anthropic"] {
+            assert_eq!(
+                content["provider"][id]["options"]["baseURL"], "http://127.0.0.1:4000/v1",
+                "{id} must point at the gateway"
+            );
+            assert_eq!(content["provider"][id]["options"]["apiKey"], "k");
+            assert!(
+                content["provider"][id].get("npm").is_none(),
+                "{id} must keep its native npm package"
+            );
+        }
+        // The gateway provider itself is unaffected.
+        assert_eq!(
+            content["provider"]["gateway"]["npm"],
+            "@ai-sdk/openai-compatible"
+        );
     }
 
     #[test]
@@ -174,6 +232,7 @@ mod tests {
             "http://127.0.0.1:4000",
             None,
             &["route-a".to_string(), "route-b".to_string()],
+            &[],
         );
 
         assert_eq!(

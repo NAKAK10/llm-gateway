@@ -299,8 +299,25 @@ pub struct LaunchOpencode {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
 
+    /// Built-in opencode providers whose `baseURL` is redirected to the
+    /// gateway at launch.
+    ///
+    /// opencode picks a provider from the `provider/` prefix of each model
+    /// reference, so an agent file pinning `model: openai/gpt-…` would
+    /// otherwise talk to OpenAI directly and silently bypass the gateway.
+    /// Redirecting the built-in providers keeps per-agent model choices
+    /// intact while routing every request through the gateway (the `gpt-*` /
+    /// `claude-*` wildcard routes forward the ids unchanged). Set to `[]` to
+    /// disable.
+    #[serde(default = "default_opencode_overrides")]
+    pub override_providers: Vec<String>,
+
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
+}
+
+fn default_opencode_overrides() -> Vec<String> {
+    vec!["openai".to_string(), "anthropic".to_string()]
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -440,6 +440,7 @@ fn launch_opencode() -> crate::config::LaunchOpencode {
         // selected provider. Empty `models` = every non-wildcard route.
         model: "role-default".to_string(),
         models: Vec::new(),
+        override_providers: vec!["openai".to_string(), "anthropic".to_string()],
         extra_args: Vec::new(),
     }
 }

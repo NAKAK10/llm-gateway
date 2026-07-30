@@ -61,6 +61,21 @@ llm-gateway stats           # ルートごとの消費量を表示
 ファイルには何も書き込みません。各クライアントの手動(恒久的)
 セットアップは `docs/clients/` に、日本語版は `docs/ja/clients/` にあります。
 
+## agent ごとのモデル
+
+サブエージェントが個別に指定しているモデルは、**agent ファイルを一切変更せず**
+そのまま生きたうえで、全リクエストがゲートウェイを経由します:
+
+| クライアント | agent のモデル指定元 | ゲートウェイへの経路 |
+|---|---|---|
+| Claude Code | サブエージェントの `model:` frontmatter | env リダイレクトがプロセス全体に効く。ID は `claude-*` で解決 |
+| Codex CLI | `~/.codex/agents/*.toml` の `model =` | プロバイダー指定はグローバルなので全 agent が経由。モデル名は `gpt-*` が転送 |
+| opencode | `agents/*.md` の `model: openai/…` | `launch` が `launch.opencode.overrideProviders`(既定 `openai`, `anthropic`)の組み込みプロバイダーもゲートウェイに向ける。opencode はモデル参照ごとにプロバイダーを選ぶため、これが無いと固定 agent が黙ってゲートウェイを素通りする |
+
+現時点のルーティングは**モデル名ベース**です(完全一致 → 最長 wildcard)。
+リクエスト内容から route を選ぶセマンティック分類は Phase 2 で、
+`routes[].description` がその分類コーパスになります。
+
 ## サポートしているプロバイダー
 
 以下はすべて `llm-gateway init` がそのまま雛形を生成できます。プロバイダーは
@@ -121,9 +136,13 @@ llm-gateway stats           # ルートごとの消費量を表示
     },
   },
   launch: {
+    // `model` はそのクライアントの「メイン(既定)モデル」だけを決める route 名。
+    // role route(`role-strategy` 等)でも wildcard が拾う ID でもよい。
+    // agent ごとのモデルはそのまま生きる — 下の「agent ごとのモデル」参照。
     claude:   { model: "claude-sonnet-4-6", extraArgs: [] },
     codex:    { model: "gpt-5.6", wireApi: "responses", extraArgs: [] },
-    opencode: { model: "role-default", models: [], extraArgs: [] },
+    opencode: { model: "role-default", models: [],
+                overrideProviders: ["openai", "anthropic"], extraArgs: [] },
   },
   logging: {
     dir: "./logs",            // 設定ディレクトリからの相対パス
