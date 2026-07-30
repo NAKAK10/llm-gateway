@@ -1,5 +1,7 @@
 # Gotchas
 
+[English](gotchas.md) | [日本語](ja/gotchas.md)
+
 Traps we already know about. If you hit one that isn't here, add it.
 
 ## Streaming / proxying

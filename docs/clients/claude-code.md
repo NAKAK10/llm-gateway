@@ -1,5 +1,7 @@
 # Claude Code — manual setup
 
+[English](claude-code.md) | [日本語](../ja/clients/claude-code.md)
+
 `llm-gateway launch claude` is the supported path and needs none of this.
 This page is for making the redirect *permanent* by hand. The gateway itself
 never writes this file.

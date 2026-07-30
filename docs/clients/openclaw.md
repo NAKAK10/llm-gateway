@@ -1,5 +1,7 @@
 # OpenClaw — manual setup (no `launch` support)
 
+[English](openclaw.md) | [日本語](../ja/clients/openclaw.md)
+
 OpenClaw runs as a daemon with its own scheduler, typically on a **different
 machine** than the gateway. There is no process for `launch` to start, so this
 is a manual, staged migration — and because a daily content pipeline hangs off
