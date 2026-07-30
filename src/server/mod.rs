@@ -20,11 +20,20 @@ pub mod models;
 pub mod passthrough;
 pub mod responses;
 
+mod proxy;
+
 use std::sync::Arc;
 
+use axum::routing::{get, post};
+use axum::Router;
+
 use crate::config::watch::SharedConfig;
-use crate::error::Result;
-use crate::record::Recorder;
+use crate::config::ApiKind;
+use crate::error::{Error, Result};
+use crate::record::{RecordMode, Recorder};
+use crate::{paths, upstream};
+
+pub use proxy::proxy;
 
 /// Options from the `serve` subcommand.
 pub struct ServeOptions {
@@ -39,23 +48,137 @@ pub struct AppState {
     pub config: Arc<SharedConfig>,
     pub http: reqwest::Client,
     pub recorder: Arc<Recorder>,
+    /// Resolved once at startup. Changing `server.apiKey` needs a restart —
+    /// like host and port, it is part of the listener's identity, and
+    /// re-resolving a Keychain reference per request would prompt constantly.
+    pub inbound_key: Option<String>,
 }
 
 /// Load config, bind, and serve until interrupted.
-///
-/// Refuses to start when `server.host` is not loopback and `server.api_key` is
-/// unset: a single key stands between the port and every provider credential in
-/// the config, so binding it to the network anonymously is never what someone
-/// meant to do.
 pub async fn serve(options: ServeOptions) -> Result<()> {
-    let _ = options;
-    todo!("src/server/mod.rs")
+    init_tracing();
+
+    let shared = SharedConfig::load(paths::config_file())?;
+    let config = shared.get();
+
+    let host = config.server.host.clone();
+    let port = options.port_override.unwrap_or(config.server.port);
+
+    // Validation already refuses non-loopback + no key, but validation runs
+    // against the file — re-check here so a future code path can't bypass it.
+    let inbound_key = match &config.server.api_key {
+        Some(secret) => Some(secret.resolve()?),
+        None if !config.server.is_loopback() => {
+            return Err(Error::Other(format!(
+                "refusing to bind {host} without server.apiKey: \
+                 one key would expose every configured provider to the network"
+            )));
+        }
+        None => None,
+    };
+
+    let mode = RecordMode {
+        usage: config.logging.usage,
+        debug: options.debug || config.logging.debug,
+        debug_full: options.debug_full,
+    };
+    let recorder = Recorder::start(paths::logs_dir(&config.logging.dir), mode)?;
+
+    let state = AppState {
+        config: shared.clone(),
+        http: upstream::client()?,
+        recorder,
+        inbound_key,
+    };
+
+    // Watch after the first successful load: a broken edit from here on keeps
+    // the old config serving.
+    let _watch = match crate::config::watch::spawn(shared) {
+        Ok(guard) => Some(guard),
+        Err(err) => {
+            tracing::warn!("config hot-reload disabled: {err}");
+            None
+        }
+    };
+
+    let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
+    tracing::info!("llm-gateway listening on http://{host}:{port}");
+    if mode.debug {
+        tracing::info!(
+            "trace recording is ON — prompt text is written to disk{}",
+            if mode.debug_full {
+                " (untruncated)"
+            } else {
+                " (truncated to 200 chars)"
+            }
+        );
+    }
+
+    axum::serve(listener, router(state)).await?;
+    Ok(())
+}
+
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Ignore a second call (tests may race); the first subscriber wins.
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
 /// Build the router. Split out so tests can drive it without binding a port.
-pub fn router(state: AppState) -> axum::Router {
-    let _ = state;
-    todo!("src/server/mod.rs")
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/v1/messages", post(messages::handle))
+        .route("/v1/messages/count_tokens", post(messages::count_tokens))
+        .route("/v1/chat/completions", post(chat::handle))
+        .route("/v1/responses", post(responses::handle))
+        .route("/v1/models", get(models::handle))
+        .route("/health", get(|| async { "ok" }))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+        .with_state(state)
+}
+
+/// Reject requests that lack the inbound key, when one is configured.
+///
+/// Accepts either header form because the clients differ: Claude Code sends
+/// `Authorization: Bearer …` (from `ANTHROPIC_AUTH_TOKEN`) or `x-api-key`
+/// (from `ANTHROPIC_API_KEY`), and the OpenAI-protocol clients send Bearer.
+async fn auth_middleware(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(expected) = &state.inbound_key else {
+        return next.run(request).await;
+    };
+
+    // /health stays open: liveness probes should not need a secret.
+    if request.uri().path() == "/health" {
+        return next.run(request).await;
+    }
+
+    let headers = request.headers();
+    let bearer_ok = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|token| token == expected);
+    let api_key_ok = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|token| token == expected);
+
+    if bearer_ok || api_key_ok {
+        next.run(request).await
+    } else {
+        error_response(
+            http::StatusCode::UNAUTHORIZED,
+            "invalid or missing gateway API key",
+        )
+    }
 }
 
 /// Identify the caller for logging.
@@ -70,4 +193,35 @@ pub fn client_name(headers: &http::HeaderMap) -> String {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown")
         .to_string()
+}
+
+/// A JSON error body in a shape every client tolerates.
+///
+/// Anthropic and OpenAI clients disagree on error envelopes, but both surface
+/// `error.message` — so that is the one field guaranteed to reach a human.
+pub fn error_response(status: http::StatusCode, message: &str) -> axum::response::Response {
+    let body = serde_json::json!({
+        "error": {
+            "type": "gateway_error",
+            "message": message,
+        }
+    });
+    let mut response = axum::response::Response::new(axum::body::Body::from(body.to_string()));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+/// The [`ApiKind`] an inbound endpoint speaks. Used to refuse a route whose
+/// providers speak a different protocol than the caller.
+pub fn endpoint_api(path: &str) -> Option<ApiKind> {
+    match path {
+        "/v1/messages" | "/v1/messages/count_tokens" => Some(ApiKind::AnthropicMessages),
+        "/v1/chat/completions" => Some(ApiKind::OpenaiChat),
+        "/v1/responses" => Some(ApiKind::OpenaiResponses),
+        _ => None,
+    }
 }

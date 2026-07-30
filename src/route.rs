@@ -65,8 +65,8 @@ pub struct Resolution {
 /// `claude-opus-*` can coexist with a catch-all `claude-*` without ordering
 /// tricks in the config file.
 pub fn resolve(config: &Config, requested: &str) -> Result<Resolution> {
-    let (route_name, route, kind) = find_route(config, requested)
-        .ok_or_else(|| Error::NoRoute(requested.to_string()))?;
+    let (route_name, route, kind) =
+        find_route(config, requested).ok_or_else(|| Error::NoRoute(requested.to_string()))?;
 
     let mut refs = Vec::with_capacity(1 + route.model.fallbacks.len());
     refs.push(route.model.default.as_str());
@@ -79,12 +79,12 @@ pub fn resolve(config: &Config, requested: &str) -> Result<Resolution> {
                 "route `{route_name}` has malformed model `{raw}`; expected \"<provider>/<model>\""
             ))
         })?;
-        let provider = config.provider(&parsed.provider).ok_or_else(|| {
-            Error::UnknownProvider {
+        let provider = config
+            .provider(&parsed.provider)
+            .ok_or_else(|| Error::UnknownProvider {
                 provider: parsed.provider.clone(),
                 route: route_name.to_string(),
-            }
-        })?;
+            })?;
         targets.push(build_target(parsed.expand(requested), provider));
     }
 

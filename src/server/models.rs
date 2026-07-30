@@ -15,8 +15,16 @@ use axum::response::Response;
 use crate::server::AppState;
 
 pub async fn handle(State(state): State<AppState>) -> Response {
-    let _ = state;
-    todo!("src/server/models.rs")
+    let config = state.config.get();
+    let routes = config.listable_routes();
+    let payload = body(&routes);
+
+    let mut response = Response::new(axum::body::Body::from(payload.to_string()));
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
 /// Build the response body for a set of route names.

@@ -42,6 +42,72 @@ pub fn file_name(year: i32, month: u8) -> String {
 
 /// Append one record as a single JSON line.
 pub fn append(dir: &std::path::Path, record: &UsageRecord) -> crate::error::Result<()> {
-    let _ = (dir, record);
-    todo!("src/record/usage_log.rs")
+    use std::io::Write;
+
+    std::fs::create_dir_all(dir)?;
+    let now = time::OffsetDateTime::now_utc();
+    let path = dir.join(file_name(now.year(), now.month() as u8));
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)?;
+    let line = serde_json::to_string(record)?;
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> UsageRecord {
+        UsageRecord {
+            ts: "2026-07-30T00:00:00Z".to_string(),
+            client: "claude-code".to_string(),
+            route: "claude-*".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            attempt: 1,
+            in_tok: 12,
+            out_tok: 34,
+            cache_read_tok: 5,
+            cache_write_tok: 0,
+            dur_ms: 250,
+            status: "success".to_string(),
+            stream: true,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn appended_line_round_trips_as_valid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = sample();
+        append(dir.path(), &record).unwrap();
+
+        let now = time::OffsetDateTime::now_utc();
+        let path = dir.path().join(file_name(now.year(), now.month() as u8));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let line = contents.lines().next().expect("one line was written");
+
+        let read_back: UsageRecord = serde_json::from_str(line).unwrap();
+        assert_eq!(read_back.model, record.model);
+        assert_eq!(read_back.in_tok, record.in_tok);
+        assert_eq!(read_back.out_tok, record.out_tok);
+    }
+
+    #[test]
+    fn appending_twice_produces_two_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        append(dir.path(), &sample()).unwrap();
+        append(dir.path(), &sample()).unwrap();
+
+        let now = time::OffsetDateTime::now_utc();
+        let path = dir.path().join(file_name(now.year(), now.month() as u8));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.lines().count(), 2);
+        for line in contents.lines() {
+            let _: UsageRecord = serde_json::from_str(line).unwrap();
+        }
+    }
 }

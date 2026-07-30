@@ -20,7 +20,7 @@
 //! read at all. It is not the default because that also discards permissions,
 //! hooks and model preferences — a big hammer for changing an endpoint.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::error::Result;
@@ -28,8 +28,39 @@ use crate::launch::Invocation;
 
 /// Environment variables this launcher sets, in the order they are shown.
 pub fn build(config: &Config, model: &str, isolate: bool, args: &[String]) -> Result<Invocation> {
-    let _ = (config, model, isolate, args);
-    todo!("src/launch/claude.rs")
+    let mut env = vec![("ANTHROPIC_BASE_URL".to_string(), config.server.base_url())];
+    if let Some(api_key) = &config.server.api_key {
+        env.push(("ANTHROPIC_AUTH_TOKEN".to_string(), api_key.resolve()?));
+    }
+    env.push(("ANTHROPIC_MODEL".to_string(), model.to_string()));
+    env.push((
+        "ANTHROPIC_CUSTOM_HEADERS".to_string(),
+        "x-gw-client: claude-code".to_string(),
+    ));
+    env.push((
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
+        "1".to_string(),
+    ));
+
+    let mut all_args = Vec::new();
+    if let Some(cfg) = &config.launch.claude {
+        all_args.extend(cfg.extra_args.iter().cloned());
+    }
+    if isolate {
+        all_args.push("--setting-sources".to_string());
+        all_args.push("project".to_string());
+    }
+    all_args.extend(args.iter().cloned());
+
+    let env_names: Vec<String> = env.iter().map(|(k, _)| k.clone()).collect();
+    let warnings = detect_conflicts(&env_names);
+
+    Ok(Invocation {
+        program: "claude".to_string(),
+        args: all_args,
+        env,
+        warnings,
+    })
 }
 
 /// Path of the settings file that could shadow our environment.
@@ -46,6 +77,96 @@ pub fn settings_path() -> Option<PathBuf> {
 /// Strictly read-only. Returns an empty vector when the file is missing,
 /// unreadable or has no `env` block.
 pub fn detect_conflicts(vars: &[String]) -> Vec<String> {
-    let _ = vars;
-    todo!("src/launch/claude.rs")
+    match settings_path() {
+        Some(path) => detect_conflicts_in(&path, vars),
+        None => Vec::new(),
+    }
+}
+
+/// The actual conflict scan, taking the file path explicitly so it can be
+/// exercised against a temp file in tests without touching the real
+/// `~/.claude/settings.json`.
+fn detect_conflicts_in(path: &Path, vars: &[String]) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => {
+            return vec!["~/.claude/settings.json がパースできません（不正なJSON）。\
+                 env の競合チェックをスキップしました"
+                .to_string()];
+        }
+    };
+
+    let Some(env_obj) = parsed.get("env").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+
+    env_obj
+        .keys()
+        .filter(|key| vars.iter().any(|v| v == *key))
+        .map(|key| {
+            format!(
+                "~/.claude/settings.json の env.{key} がこの起動の環境変数を上書きします\
+                 （settings の env は shell env より優先）"
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_temp(contents: &str) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        f
+    }
+
+    #[test]
+    fn missing_file_reports_no_conflicts() {
+        let path = Path::new("/definitely/does/not/exist/llm-gateway-test/settings.json");
+        let warnings = detect_conflicts_in(path, &["ANTHROPIC_BASE_URL".to_string()]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn no_env_block_reports_no_conflicts() {
+        let f = write_temp(r#"{"foo": "bar"}"#);
+        let warnings = detect_conflicts_in(f.path(), &["ANTHROPIC_BASE_URL".to_string()]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn conflicting_env_keys_are_reported() {
+        let f = write_temp(r#"{"env": {"ANTHROPIC_BASE_URL": "https://example.com"}}"#);
+        let warnings = detect_conflicts_in(
+            f.path(),
+            &[
+                "ANTHROPIC_BASE_URL".to_string(),
+                "ANTHROPIC_MODEL".to_string(),
+            ],
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("ANTHROPIC_BASE_URL"));
+    }
+
+    #[test]
+    fn non_conflicting_env_keys_are_not_reported() {
+        let f = write_temp(r#"{"env": {"SOME_OTHER_VAR": "x"}}"#);
+        let warnings = detect_conflicts_in(f.path(), &["ANTHROPIC_BASE_URL".to_string()]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn broken_json_reports_a_single_warning() {
+        let f = write_temp("{ not json");
+        let warnings = detect_conflicts_in(f.path(), &["ANTHROPIC_BASE_URL".to_string()]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("settings.json"));
+    }
 }

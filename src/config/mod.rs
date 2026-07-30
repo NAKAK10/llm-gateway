@@ -210,13 +210,17 @@ impl Description {
     }
 
     /// The description text, reading the referenced file when needed.
+    ///
+    /// Unused until semantic routing (Phase 2) embeds these as the
+    /// classification corpus; kept because it defines the contract `validate`
+    /// already checks (the referenced file must exist).
+    #[allow(dead_code)]
     pub fn text(&self) -> Result<String> {
         match self.path() {
             None => Ok(self.0.clone()),
-            Some(path) => std::fs::read_to_string(&path).map_err(|source| Error::ConfigRead {
-                path,
-                source,
-            }),
+            Some(path) => {
+                std::fs::read_to_string(&path).map_err(|source| Error::ConfigRead { path, source })
+            }
         }
     }
 }

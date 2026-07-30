@@ -10,14 +10,59 @@
 //!
 //! [`ValidationReport`]: crate::error::ValidationReport
 
-use crate::error::Result;
+use crate::config::{validate, Config, SecretRef};
+use crate::error::{Error, Result};
+use crate::launch::claude;
+use crate::paths;
 
 pub fn check() -> Result<()> {
-    todo!("src/cli/config_cmd.rs")
+    let path = paths::config_file();
+    let config = Config::read(&path)?;
+    let report = validate::validate(&config, &path);
+
+    println!("{report}");
+
+    // Read-only scan of `~/.claude/settings.json` — see `launch::claude` for
+    // why an `env` block there can silently break Claude Code's redirect.
+    let conflicts = claude::detect_conflicts(&[
+        "ANTHROPIC_BASE_URL".to_string(),
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        "ANTHROPIC_API_KEY".to_string(),
+        "ANTHROPIC_MODEL".to_string(),
+    ]);
+    for conflict in &conflicts {
+        println!("  warning: {conflict}");
+    }
+
+    if report.errors.is_empty() {
+        println!(
+            "ok: {} providers, {} routes",
+            config.providers.len(),
+            config.routes.len()
+        );
+        Ok(())
+    } else {
+        Err(Error::ConfigInvalid(report))
+    }
 }
 
 pub fn show() -> Result<()> {
-    todo!("src/cli/config_cmd.rs")
+    let mut config = Config::read(&paths::config_file())?;
+
+    for provider in config.providers.values_mut() {
+        provider.api_key = provider
+            .api_key
+            .as_ref()
+            .map(|key| SecretRef::new(key.masked()));
+    }
+    config.server.api_key = config
+        .server
+        .api_key
+        .as_ref()
+        .map(|key| SecretRef::new(key.masked()));
+
+    println!("{}", serde_json::to_string_pretty(&config)?);
+    Ok(())
 }
 
 /// Print a `.gitignore` for a directory that contains `config.json`.

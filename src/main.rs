@@ -8,21 +8,14 @@
 //!
 //! `launch` starts a client with the right environment injected, so no existing
 //! client config file is ever modified.
-
-mod cli;
-mod config;
-mod error;
-mod launch;
-mod paths;
-mod record;
-mod route;
-mod server;
-mod upstream;
-mod usage;
+//!
+//! All logic lives in the library crate (`src/lib.rs`); this file is only the
+//! clap surface, so integration tests can drive the same code over real TCP.
 
 use clap::{Args, Parser, Subcommand};
 
-use error::Result;
+use llm_gateway::error::Result;
+use llm_gateway::{cli, launch, server};
 
 #[derive(Parser)]
 #[command(

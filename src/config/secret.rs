@@ -35,6 +35,9 @@ impl SecretRef {
         Self(raw.into())
     }
 
+    /// The reference exactly as written — for tests and config round-trips,
+    /// never for display (that is what [`SecretRef::masked`] is for).
+    #[allow(dead_code)] // used from test code only, for now
     pub fn raw(&self) -> &str {
         &self.0
     }
@@ -61,10 +64,7 @@ impl SecretRef {
             SecretKind::Literal => Ok(s.to_string()),
 
             SecretKind::Env => {
-                let name = s
-                    .trim_start_matches("${")
-                    .trim_end_matches('}')
-                    .trim();
+                let name = s.trim_start_matches("${").trim_end_matches('}').trim();
                 if name.is_empty() {
                     return Err(Error::SecretUnresolved {
                         reference: s.to_string(),
@@ -143,7 +143,9 @@ fn keychain_lookup(name: &str) -> Result<String> {
     }
 
     // `security -w` emits the password followed by a newline.
-    Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -170,7 +172,9 @@ mod tests {
     fn env_references_resolve_from_the_environment() {
         // A name unlikely to collide with anything else in the test binary.
         std::env::set_var("LLM_GATEWAY_TEST_SECRET_XYZ", "value-123");
-        let got = SecretRef::new("${LLM_GATEWAY_TEST_SECRET_XYZ}").resolve().unwrap();
+        let got = SecretRef::new("${LLM_GATEWAY_TEST_SECRET_XYZ}")
+            .resolve()
+            .unwrap();
         assert_eq!(got, "value-123");
     }
 
@@ -198,7 +202,13 @@ mod tests {
 
     #[test]
     fn location_references_are_shown_verbatim() {
-        assert_eq!(SecretRef::new("${OPENAI_API_KEY}").masked(), "${OPENAI_API_KEY}");
-        assert_eq!(SecretRef::new("keychain:openai").masked(), "keychain:openai");
+        assert_eq!(
+            SecretRef::new("${OPENAI_API_KEY}").masked(),
+            "${OPENAI_API_KEY}"
+        );
+        assert_eq!(
+            SecretRef::new("keychain:openai").masked(),
+            "keychain:openai"
+        );
     }
 }

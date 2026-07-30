@@ -1,0 +1,4 @@
+/target
+# Local experiment configs — the real one lives in ~/.config/llm-gateway/
+config.json
+logs/

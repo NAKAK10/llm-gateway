@@ -101,6 +101,82 @@ pub fn file_name(year: i32, month: u8, day: u8) -> String {
 
 /// Append one record as a single JSON line.
 pub fn append(dir: &std::path::Path, record: &TraceRecord) -> crate::error::Result<()> {
-    let _ = (dir, record);
-    todo!("src/record/trace_log.rs")
+    use std::io::Write;
+
+    std::fs::create_dir_all(dir)?;
+    let now = time::OffsetDateTime::now_utc();
+    let path = dir.join(file_name(now.year(), now.month() as u8, now.day()));
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)?;
+    let line = serde_json::to_string(record)?;
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> TraceRecord {
+        TraceRecord {
+            ts: "2026-07-30T00:00:00Z".to_string(),
+            req_id: "0190f0a0-0000-7000-8000-000000000000".to_string(),
+            client: "claude-code".to_string(),
+            endpoint: "/v1/messages".to_string(),
+            requested_model: "claude-sonnet-4-6".to_string(),
+            input: TraceInput {
+                messages_n: 3,
+                last_user_text: Some("hello".to_string()),
+                tokens_est: 42,
+                tools: vec![],
+                has_image: false,
+                stream: true,
+            },
+            routing: TraceRouting {
+                mode: "explicit".to_string(),
+                matched_route: "claude-*".to_string(),
+                reason: "exact match".to_string(),
+                candidates: vec![],
+                score: None,
+                threshold: None,
+                embed_ms: None,
+            },
+            resolved: TraceResolved {
+                provider: "anthropic".to_string(),
+                model: "claude-sonnet-4-6".to_string(),
+                api: "anthropic-messages".to_string(),
+            },
+            attempts: vec![TraceAttempt {
+                n: 1,
+                target: "anthropic/claude-sonnet-4-6".to_string(),
+                result: "ok_first_byte".to_string(),
+                ms: 120,
+            }],
+            usage: Some(TraceUsage {
+                in_tok: 12,
+                out_tok: 34,
+            }),
+        }
+    }
+
+    #[test]
+    fn appended_line_round_trips_as_valid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = sample();
+        append(dir.path(), &record).unwrap();
+
+        let now = time::OffsetDateTime::now_utc();
+        let path = dir
+            .path()
+            .join(file_name(now.year(), now.month() as u8, now.day()));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let line = contents.lines().next().expect("one line was written");
+
+        let read_back: TraceRecord = serde_json::from_str(line).unwrap();
+        assert_eq!(read_back.req_id, record.req_id);
+        assert_eq!(read_back.attempts.len(), 1);
+        assert_eq!(read_back.usage.unwrap().in_tok, 12);
+    }
 }

@@ -15,13 +15,147 @@
 //! The file is created `0600` because the literal-key option puts real
 //! credentials in it.
 
+use crate::config::SecretRef;
 use crate::error::Result;
+use crate::paths;
 
 /// Permissions for `config.json`. It can hold API keys in the clear.
 pub const CONFIG_MODE: u32 = 0o600;
 
+/// Stub written to `llm/role-default.md` for the sample `role-default` route.
+const ROLE_DEFAULT_STUB: &str = "\
+# role-default
+
+Sample route description. Edit this file to describe when `role-default`
+should be picked once semantic routing lands; today it is just documentation.
+";
+
 pub fn run() -> Result<()> {
-    todo!("src/cli/init.rs")
+    let config_path = paths::config_file();
+    if config_path.exists() {
+        println!("config already exists at {}", config_path.display());
+        println!("edit it directly — `init` never overwrites an existing config.json");
+        return Ok(());
+    }
+
+    cliclack::intro("llm-gateway init")?;
+
+    let primary = cliclack::select("Which client do you use most?")
+        .item(PrimaryClient::Claude, "Claude Code", "")
+        .item(PrimaryClient::Codex, "Codex CLI", "")
+        .item(PrimaryClient::Both, "Both", "")
+        .interact()?;
+
+    let selected_providers: Vec<KnownProvider> =
+        cliclack::multiselect("Which providers do you want to configure?")
+            .item(
+                KnownProvider::Anthropic,
+                KnownProvider::Anthropic.label(),
+                KnownProvider::Anthropic.base_url(),
+            )
+            .item(
+                KnownProvider::OpenAi,
+                KnownProvider::OpenAi.label(),
+                KnownProvider::OpenAi.base_url(),
+            )
+            .item(
+                KnownProvider::OpenRouter,
+                KnownProvider::OpenRouter.label(),
+                KnownProvider::OpenRouter.base_url(),
+            )
+            .item(
+                KnownProvider::OllamaCloud,
+                KnownProvider::OllamaCloud.label(),
+                KnownProvider::OllamaCloud.base_url(),
+            )
+            .item(
+                KnownProvider::OllamaLocal,
+                KnownProvider::OllamaLocal.label(),
+                KnownProvider::OllamaLocal.base_url(),
+            )
+            .initial_values(vec![KnownProvider::Anthropic, KnownProvider::OpenRouter])
+            .interact()?;
+
+    let storage = cliclack::select("How should API keys be stored?")
+        .item(
+            KeyStorage::Literal,
+            "In config.json (chmod 600)",
+            "simplest",
+        )
+        .item(KeyStorage::Env, "Environment variable", "${VAR}")
+        .item(
+            KeyStorage::Keychain,
+            "macOS Keychain",
+            "keychain:<id>, macOS only",
+        )
+        .interact()?;
+
+    // A password left empty falls back to the `${VAR}` form for that one
+    // provider, even though the overall storage choice is Literal — typing a
+    // real key is optional, not doing so should not write an empty string.
+    let mut providers: Vec<(KnownProvider, Option<String>)> = Vec::new();
+    let mut env_fallback: Vec<KnownProvider> = Vec::new();
+    for provider in &selected_providers {
+        let literal = if storage == KeyStorage::Literal && provider.needs_key() {
+            let value = cliclack::password(format!("API key for {}", provider.label()))
+                .mask('*')
+                .allow_empty()
+                .interact()?;
+            if value.is_empty() {
+                env_fallback.push(*provider);
+                None
+            } else {
+                Some(value)
+            }
+        } else {
+            None
+        };
+        providers.push((*provider, literal));
+    }
+
+    let mut config = build_config(primary, &providers, storage);
+    for provider in &env_fallback {
+        let key = SecretRef::new(format!("${{{}}}", provider.env_var()));
+        if let Some(provider_config) = config.providers.get_mut(provider.id()) {
+            provider_config.api_key = Some(key.clone());
+        }
+        if *provider == KnownProvider::OpenRouter {
+            if let Some(provider_config) = config.providers.get_mut("openrouter-anthropic") {
+                provider_config.api_key = Some(key);
+            }
+        }
+    }
+
+    let dir = paths::config_dir();
+    let llm_dir = paths::llm_dir();
+    let logs_dir = paths::logs_dir(&config.logging.dir);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(&llm_dir)?;
+    std::fs::create_dir_all(&logs_dir)?;
+
+    let json = serde_json::to_string_pretty(&config)?;
+    let contents = format!("// llm-gateway config — do not commit this file\n{json}\n");
+    std::fs::write(&config_path, contents)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&config_path)?.permissions();
+        perms.set_mode(CONFIG_MODE);
+        std::fs::set_permissions(&config_path, perms)?;
+    }
+
+    let role_default_path = llm_dir.join("role-default.md");
+    if !role_default_path.exists() {
+        std::fs::write(&role_default_path, ROLE_DEFAULT_STUB)?;
+    }
+
+    cliclack::outro(format!(
+        "wrote {}\n\nnext steps:\n  llm-gateway config check\n  llm-gateway serve\n  llm-gateway launch claude",
+        config_path.display()
+    ))?;
+
+    Ok(())
 }
 
 /// Which client the user reaches for most. Decides which routes and `launch`
@@ -120,6 +254,252 @@ pub fn build_config(
     providers: &[(KnownProvider, Option<String>)],
     storage: KeyStorage,
 ) -> crate::config::Config {
-    let _ = (primary, providers, storage);
-    todo!("src/cli/init.rs")
+    use crate::config::{ApiKind, Config, ModelConfig, ProviderConfig, RouteConfig};
+
+    let selected: Vec<KnownProvider> = providers.iter().map(|(p, _)| *p).collect();
+    let has = |p: KnownProvider| selected.contains(&p);
+    let literal_for = |p: KnownProvider| {
+        providers
+            .iter()
+            .find(|(candidate, _)| *candidate == p)
+            .and_then(|(_, literal)| literal.clone())
+    };
+
+    let mut config = Config::default();
+
+    for (provider, literal) in providers {
+        config.providers.insert(
+            provider.id().to_string(),
+            ProviderConfig {
+                base_url: provider.base_url().to_string(),
+                api: provider.api(),
+                api_key: Some(provider_api_key(*provider, literal.clone(), storage)),
+                headers: Default::default(),
+                inject_usage: true,
+            },
+        );
+    }
+
+    // OpenRouter can also speak the Anthropic wire protocol under
+    // `openrouter/anthropic/*`; expose it under its own id so `claude-*` can
+    // fall back to it without crossing `ApiKind`s.
+    if has(KnownProvider::OpenRouter) {
+        config.providers.insert(
+            "openrouter-anthropic".to_string(),
+            ProviderConfig {
+                base_url: KnownProvider::OpenRouter.base_url().to_string(),
+                api: ApiKind::AnthropicMessages,
+                api_key: Some(provider_api_key(
+                    KnownProvider::OpenRouter,
+                    literal_for(KnownProvider::OpenRouter),
+                    storage,
+                )),
+                headers: Default::default(),
+                inject_usage: true,
+            },
+        );
+    }
+
+    if has(KnownProvider::Anthropic)
+        && matches!(primary, PrimaryClient::Claude | PrimaryClient::Both)
+    {
+        let mut fallbacks = Vec::new();
+        if has(KnownProvider::OpenRouter) {
+            fallbacks.push("openrouter-anthropic/anthropic/*".to_string());
+        }
+        config.routes.insert(
+            "claude-*".to_string(),
+            RouteConfig {
+                title: None,
+                description: None,
+                model: ModelConfig {
+                    default: "anthropic/*".to_string(),
+                    fallbacks,
+                },
+            },
+        );
+    }
+
+    if has(KnownProvider::OpenAi) && matches!(primary, PrimaryClient::Codex | PrimaryClient::Both) {
+        let mut fallbacks = Vec::new();
+        if has(KnownProvider::OpenRouter) {
+            fallbacks.push("openrouter/openai/*".to_string());
+        }
+        config.routes.insert(
+            "gpt-*".to_string(),
+            RouteConfig {
+                title: None,
+                description: None,
+                model: ModelConfig {
+                    default: "openai/*".to_string(),
+                    fallbacks,
+                },
+            },
+        );
+    }
+
+    if let Some((first, _)) = providers.first() {
+        config.routes.insert(
+            "role-default".to_string(),
+            RouteConfig {
+                title: None,
+                description: None,
+                model: ModelConfig {
+                    default: format!("{}/*", first.id()),
+                    fallbacks: Vec::new(),
+                },
+            },
+        );
+    }
+
+    match primary {
+        PrimaryClient::Claude => {
+            config.launch.claude = Some(launch_claude());
+        }
+        PrimaryClient::Codex => {
+            config.launch.codex = Some(launch_codex());
+        }
+        PrimaryClient::Both => {
+            config.launch.claude = Some(launch_claude());
+            config.launch.codex = Some(launch_codex());
+        }
+    }
+
+    config
+}
+
+fn launch_claude() -> crate::config::LaunchClaude {
+    crate::config::LaunchClaude {
+        model: "claude-sonnet-4-6".to_string(),
+        extra_args: Vec::new(),
+    }
+}
+
+fn launch_codex() -> crate::config::LaunchCodex {
+    crate::config::LaunchCodex {
+        model: "gpt-5.6".to_string(),
+        wire_api: "responses".to_string(),
+        extra_args: Vec::new(),
+    }
+}
+
+/// The `apiKey` value for one provider, given how keys should be stored.
+///
+/// Providers that [`KnownProvider::needs_key`] does not require (local
+/// endpoints) always get the literal `"local"`, regardless of `storage`.
+fn provider_api_key(
+    provider: KnownProvider,
+    literal: Option<String>,
+    storage: KeyStorage,
+) -> SecretRef {
+    if !provider.needs_key() {
+        return SecretRef::new("local");
+    }
+
+    match storage {
+        KeyStorage::Literal => SecretRef::new(literal.unwrap_or_default()),
+        KeyStorage::Env => SecretRef::new(format!("${{{}}}", provider.env_var())),
+        KeyStorage::Keychain => SecretRef::new(format!("keychain:{}", provider.id())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_route_gets_openrouter_anthropic_fallback() {
+        let config = build_config(
+            PrimaryClient::Claude,
+            &[
+                (KnownProvider::Anthropic, Some("sk-ant-test".to_string())),
+                (KnownProvider::OpenRouter, Some("sk-or-test".to_string())),
+            ],
+            KeyStorage::Literal,
+        );
+
+        assert!(config.providers.contains_key("anthropic"));
+        assert!(config.providers.contains_key("openrouter-anthropic"));
+
+        let route = config.routes.get("claude-*").expect("claude-* route");
+        assert_eq!(route.model.default, "anthropic/*");
+        assert_eq!(
+            route.model.fallbacks,
+            vec!["openrouter-anthropic/anthropic/*".to_string()]
+        );
+
+        assert!(!config.routes.contains_key("gpt-*"));
+    }
+
+    #[test]
+    fn codex_only_with_openai_has_no_fallback_without_openrouter() {
+        let config = build_config(
+            PrimaryClient::Codex,
+            &[(KnownProvider::OpenAi, Some("sk-test".to_string()))],
+            KeyStorage::Literal,
+        );
+
+        let route = config.routes.get("gpt-*").expect("gpt-* route");
+        assert_eq!(route.model.default, "openai/*");
+        assert!(route.model.fallbacks.is_empty());
+
+        assert!(!config.routes.contains_key("claude-*"));
+        assert!(!config.providers.contains_key("openrouter-anthropic"));
+    }
+
+    #[test]
+    fn unselected_provider_gets_no_route() {
+        let config = build_config(
+            PrimaryClient::Both,
+            &[(KnownProvider::OpenAi, Some("sk-test".to_string()))],
+            KeyStorage::Env,
+        );
+
+        assert!(!config.routes.contains_key("claude-*"));
+        assert!(config.routes.contains_key("gpt-*"));
+    }
+
+    #[test]
+    fn literal_storage_uses_the_given_value() {
+        let config = build_config(
+            PrimaryClient::Claude,
+            &[(KnownProvider::Anthropic, Some("sk-ant-abc".to_string()))],
+            KeyStorage::Literal,
+        );
+        let provider = config.providers.get("anthropic").unwrap();
+        assert_eq!(provider.api_key.as_ref().unwrap().0, "sk-ant-abc");
+    }
+
+    #[test]
+    fn env_storage_references_the_known_variable() {
+        let config = build_config(
+            PrimaryClient::Claude,
+            &[(KnownProvider::Anthropic, None)],
+            KeyStorage::Env,
+        );
+        let provider = config.providers.get("anthropic").unwrap();
+        assert_eq!(provider.api_key.as_ref().unwrap().0, "${ANTHROPIC_API_KEY}");
+    }
+
+    #[test]
+    fn keychain_storage_references_the_provider_id() {
+        let config = build_config(
+            PrimaryClient::Claude,
+            &[(KnownProvider::Anthropic, None)],
+            KeyStorage::Keychain,
+        );
+        let provider = config.providers.get("anthropic").unwrap();
+        assert_eq!(provider.api_key.as_ref().unwrap().0, "keychain:anthropic");
+    }
+
+    #[test]
+    fn local_provider_key_is_always_literal_local() {
+        let config = build_config(
+            PrimaryClient::Claude,
+            &[(KnownProvider::OllamaLocal, None)],
+            KeyStorage::Literal,
+        );
+        let provider = config.providers.get("ollama-local").unwrap();
+        assert_eq!(provider.api_key.as_ref().unwrap().0, "local");
+    }
 }

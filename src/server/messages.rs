@@ -8,27 +8,22 @@ use axum::extract::State;
 use axum::response::Response;
 use http::HeaderMap;
 
-use crate::server::AppState;
+use crate::server::{proxy, AppState};
 
-/// Proxy a Messages request.
 pub async fn handle(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let _ = (state, headers, body);
-    todo!("src/server/messages.rs")
+    proxy(state, headers, body, "/v1/messages").await
 }
 
-/// Proxy a token-counting request.
-///
-/// Never falls back: the answer is model-specific, so a count from a different
-/// provider would be confidently wrong rather than usefully absent.
+/// Token counting never falls back — see `proxy` for why — and never records a
+/// usage row, so a chatty client's counting does not inflate call statistics.
 pub async fn count_tokens(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let _ = (state, headers, body);
-    todo!("src/server/messages.rs")
+    proxy(state, headers, body, "/v1/messages/count_tokens").await
 }

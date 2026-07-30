@@ -9,11 +9,15 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use notify::RecursiveMode;
+use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::paths;
 
 /// A config that can be replaced while the server is running.
 pub struct SharedConfig {
@@ -24,11 +28,15 @@ pub struct SharedConfig {
 impl SharedConfig {
     /// Load once and prepare for later reloads.
     pub fn load(path: PathBuf) -> Result<Arc<Self>> {
-        let _ = path;
-        todo!("src/config/watch.rs")
+        let config = Config::load_from(&path)?;
+        Ok(Arc::new(Self {
+            current: ArcSwap::from_pointee(config),
+            path,
+        }))
     }
 
     /// Build from an already-parsed config. Used by tests.
+    #[allow(dead_code)]
     pub fn from_config(config: Config, path: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             current: ArcSwap::from_pointee(config),
@@ -41,6 +49,7 @@ impl SharedConfig {
         self.current.load_full()
     }
 
+    #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -51,7 +60,96 @@ impl SharedConfig {
     /// reload was rejected (in which case the error has already been logged and
     /// the old config is still live).
     pub fn reload(&self) -> Option<String> {
-        todo!("src/config/watch.rs")
+        let new_config = match Config::load_from(&self.path) {
+            Ok(config) => config,
+            Err(err) => {
+                tracing::error!(
+                    "config reload from {} failed, keeping previous config: {err}",
+                    self.path.display()
+                );
+                return None;
+            }
+        };
+
+        let old_config = self.current.load_full();
+        let summary = summarize_change(&old_config, &new_config);
+        self.current.store(Arc::new(new_config));
+        tracing::info!("{summary}");
+        Some(summary)
+    }
+}
+
+/// Describe what changed between two configs in one line, for the reload log.
+///
+/// Extractive rather than exhaustive: it names routes and providers that were
+/// added, removed or changed model, and falls back to a generic message when
+/// nothing it looks for moved (e.g. only `server` or `logging` changed).
+fn summarize_change(old: &Config, new: &Config) -> String {
+    let mut parts = Vec::new();
+
+    let added_routes: Vec<&str> = new
+        .routes
+        .keys()
+        .filter(|name| !old.routes.contains_key(*name))
+        .map(String::as_str)
+        .collect();
+    let removed_routes: Vec<&str> = old
+        .routes
+        .keys()
+        .filter(|name| !new.routes.contains_key(*name))
+        .map(String::as_str)
+        .collect();
+    let changed_routes: Vec<&str> = new
+        .routes
+        .iter()
+        .filter_map(|(name, route)| {
+            let old_route = old.routes.get(name)?;
+            let changed = old_route.model.default != route.model.default
+                || old_route.model.fallbacks != route.model.fallbacks;
+            changed.then_some(name.as_str())
+        })
+        .collect();
+
+    if !added_routes.is_empty() {
+        parts.push(format!("added route(s) {}", added_routes.join(", ")));
+    }
+    if !removed_routes.is_empty() {
+        parts.push(format!("removed route(s) {}", removed_routes.join(", ")));
+    }
+    if !changed_routes.is_empty() {
+        parts.push(format!(
+            "changed model for route(s) {}",
+            changed_routes.join(", ")
+        ));
+    }
+
+    let added_providers: Vec<&str> = new
+        .providers
+        .keys()
+        .filter(|id| !old.providers.contains_key(*id))
+        .map(String::as_str)
+        .collect();
+    let removed_providers: Vec<&str> = old
+        .providers
+        .keys()
+        .filter(|id| !new.providers.contains_key(*id))
+        .map(String::as_str)
+        .collect();
+
+    if !added_providers.is_empty() {
+        parts.push(format!("added provider(s) {}", added_providers.join(", ")));
+    }
+    if !removed_providers.is_empty() {
+        parts.push(format!(
+            "removed provider(s) {}",
+            removed_providers.join(", ")
+        ));
+    }
+
+    if parts.is_empty() {
+        "config reloaded".to_string()
+    } else {
+        parts.join("; ")
     }
 }
 
@@ -64,12 +162,173 @@ impl SharedConfig {
 ///
 /// Returns a guard — dropping it stops watching.
 pub fn spawn(shared: Arc<SharedConfig>) -> Result<WatchGuard> {
-    let _ = shared;
-    todo!("src/config/watch.rs")
+    let config_path = shared.path.clone();
+    let config_file_name = config_path.file_name().map(|name| name.to_owned());
+    let watch_dir = config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let llm_dir = paths::llm_dir();
+
+    let handler_shared = Arc::clone(&shared);
+    let mut debouncer = new_debouncer(
+        Duration::from_millis(300),
+        None,
+        move |result: DebounceEventResult| {
+            let events = match result {
+                Ok(events) => events,
+                Err(errors) => {
+                    for error in errors {
+                        tracing::error!("config watcher error: {error}");
+                    }
+                    return;
+                }
+            };
+
+            let relevant = events.iter().any(|event| {
+                event
+                    .paths
+                    .iter()
+                    .any(|path| is_relevant(path, config_file_name.as_deref(), &llm_dir))
+            });
+
+            if relevant {
+                handler_shared.reload();
+            }
+        },
+    )
+    .map_err(|err| Error::Other(format!("failed to start config watcher: {err}")))?;
+
+    debouncer
+        .watch(&watch_dir, RecursiveMode::NonRecursive)
+        .map_err(|err| Error::Other(format!("failed to watch {}: {err}", watch_dir.display())))?;
+
+    if paths::llm_dir().exists() {
+        debouncer
+            .watch(paths::llm_dir(), RecursiveMode::Recursive)
+            .map_err(|err| {
+                Error::Other(format!(
+                    "failed to watch {}: {err}",
+                    paths::llm_dir().display()
+                ))
+            })?;
+    }
+
+    Ok(WatchGuard {
+        inner: Box::new(debouncer),
+    })
+}
+
+/// Whether a changed path should trigger a reload: either it is the config
+/// file itself (matched by name, since the watched root is its parent
+/// directory so atomic-save renames are still caught), or it falls under
+/// `llm/`, where `description` file bodies live.
+fn is_relevant(path: &Path, config_file_name: Option<&std::ffi::OsStr>, llm_dir: &Path) -> bool {
+    if let Some(name) = config_file_name {
+        if path.file_name() == Some(name) {
+            return true;
+        }
+    }
+    path.starts_with(llm_dir)
 }
 
 /// Keeps the filesystem watcher alive.
 pub struct WatchGuard {
     #[allow(dead_code)]
     pub(crate) inner: Box<dyn std::any::Any + Send + Sync>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    const VALID_CONFIG: &str = r#"{
+        providers: {
+            anthropic: {
+                baseUrl: "https://api.anthropic.test",
+                api: "anthropic-messages",
+            },
+        },
+        routes: {
+            "role-writer": {
+                description: "a test route",
+                model: { default: "anthropic/opus-pinned" },
+            },
+        },
+    }"#;
+
+    const VALID_CONFIG_CHANGED: &str = r#"{
+        providers: {
+            anthropic: {
+                baseUrl: "https://api.anthropic.test",
+                api: "anthropic-messages",
+            },
+        },
+        routes: {
+            "role-writer": {
+                description: "a test route",
+                model: { default: "anthropic/opus-updated" },
+            },
+        },
+    }"#;
+
+    fn write_config(dir: &tempfile::TempDir, contents: &str) -> PathBuf {
+        let path = dir.path().join("config.json");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+        path
+    }
+
+    #[test]
+    fn from_config_exposes_the_given_config_and_path() {
+        let path = PathBuf::from("/nonexistent/llm-gateway-config.json");
+        let shared = SharedConfig::from_config(Config::default(), path.clone());
+
+        assert_eq!(shared.path(), path.as_path());
+        assert!(shared.get().routes.is_empty());
+    }
+
+    #[test]
+    fn load_succeeds_on_valid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, VALID_CONFIG);
+
+        let shared = SharedConfig::load(path).unwrap();
+        assert_eq!(
+            shared.get().routes["role-writer"].model.default,
+            "anthropic/opus-pinned"
+        );
+    }
+
+    #[test]
+    fn reload_keeps_old_config_when_the_new_one_is_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, VALID_CONFIG);
+        let shared = SharedConfig::load(path.clone()).unwrap();
+
+        std::fs::write(&path, b"{ this is not valid json5 ").unwrap();
+
+        assert!(shared.reload().is_none());
+        assert_eq!(
+            shared.get().routes["role-writer"].model.default,
+            "anthropic/opus-pinned"
+        );
+    }
+
+    #[test]
+    fn reload_swaps_in_a_valid_change_and_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, VALID_CONFIG);
+        let shared = SharedConfig::load(path.clone()).unwrap();
+
+        std::fs::write(&path, VALID_CONFIG_CHANGED).unwrap();
+
+        let summary = shared.reload();
+        assert!(summary.is_some(), "{summary:?}");
+        assert_eq!(
+            shared.get().routes["role-writer"].model.default,
+            "anthropic/opus-updated"
+        );
+    }
 }

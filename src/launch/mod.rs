@@ -18,9 +18,13 @@ pub mod claude;
 pub mod codex;
 pub mod opencode;
 
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 use clap::ValueEnum;
 
-use crate::error::Result;
+use crate::config::Config;
+use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Client {
@@ -34,15 +38,6 @@ impl Client {
     pub fn program(self) -> &'static str {
         match self {
             Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Opencode => "opencode",
-        }
-    }
-
-    /// Value sent in `x-gw-client`, and the key `stats --by client` groups on.
-    pub fn tag(self) -> &'static str {
-        match self {
-            Self::Claude => "claude-code",
             Self::Codex => "codex",
             Self::Opencode => "opencode",
         }
@@ -72,7 +67,34 @@ pub struct Invocation {
 impl Invocation {
     /// A shell-pasteable rendering with secrets replaced.
     pub fn redacted(&self) -> String {
-        todo!("src/launch/mod.rs")
+        let mut lines: Vec<String> = self
+            .env
+            .iter()
+            .map(|(key, value)| {
+                let shown = if SECRET_ENV.contains(&key.as_str()) {
+                    "<redacted>"
+                } else {
+                    value.as_str()
+                };
+                format!("{key}={shown} \\")
+            })
+            .collect();
+
+        let mut command = vec![self.program.clone()];
+        command.extend(self.args.iter().map(|a| quote_if_needed(a)));
+        lines.push(command.join(" "));
+
+        lines.join("\n")
+    }
+}
+
+/// Wrap in single quotes when the argument contains a space, so the printed
+/// command can be pasted back into a shell unchanged.
+fn quote_if_needed(arg: &str) -> String {
+    if arg.contains(' ') {
+        format!("'{arg}'")
+    } else {
+        arg.to_string()
     }
 }
 
@@ -81,8 +103,163 @@ impl Invocation {
 /// Checks that the gateway is actually up first. Starting a client that will
 /// fail on its first request wastes more time than a clear message here.
 pub async fn run(options: Options) -> Result<()> {
-    let _ = options;
-    todo!("src/launch/mod.rs")
+    let config = Config::load()?;
+
+    let invocation = match options.client {
+        Client::Claude => {
+            let cfg = config
+                .launch
+                .claude
+                .as_ref()
+                .ok_or_else(|| missing_launch_config(Client::Claude))?;
+            let model = options
+                .model_override
+                .clone()
+                .unwrap_or_else(|| cfg.model.clone());
+            claude::build(&config, &model, options.isolate, &options.forwarded_args)?
+        }
+        Client::Codex => {
+            let cfg = config
+                .launch
+                .codex
+                .as_ref()
+                .ok_or_else(|| missing_launch_config(Client::Codex))?;
+            let model = options
+                .model_override
+                .clone()
+                .unwrap_or_else(|| cfg.model.clone());
+            codex::build(&config, &model, options.isolate, &options.forwarded_args)?
+        }
+        Client::Opencode => {
+            let cfg = config
+                .launch
+                .opencode
+                .as_ref()
+                .ok_or_else(|| missing_launch_config(Client::Opencode))?;
+            let model = options
+                .model_override
+                .clone()
+                .unwrap_or_else(|| cfg.model.clone());
+            let models = cfg.models.clone();
+            opencode::build(
+                &config,
+                &model,
+                &models,
+                options.isolate,
+                &options.forwarded_args,
+            )?
+        }
+    };
+
+    if options.print_only {
+        for warning in &invocation.warnings {
+            println!("warning: {warning}");
+        }
+        println!("{}", invocation.redacted());
+        return Ok(());
+    }
+
+    let base_url = config.server.base_url();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+
+    let mut liveness = http.get(format!("{base_url}/v1/models"));
+    if let Some(api_key) = &config.server.api_key {
+        liveness = liveness.bearer_auth(api_key.resolve()?);
+    }
+    let reachable = liveness
+        .send()
+        .await
+        .ok()
+        .filter(|r| r.status().is_success())
+        .is_some();
+    if !reachable {
+        return Err(Error::GatewayUnreachable { url: base_url });
+    }
+
+    if let Client::Opencode = options.client {
+        // Presence was already checked above when building the invocation.
+        let cfg = config
+            .launch
+            .opencode
+            .as_ref()
+            .expect("launch.opencode presence already checked");
+        let wanted = opencode::resolved_models(&config, &cfg.models);
+        let api_key = match &config.server.api_key {
+            Some(key) => Some(key.resolve()?),
+            None => None,
+        };
+        let missing =
+            opencode::verify_models(&http, &base_url, api_key.as_deref(), &wanted).await?;
+        if !missing.is_empty() {
+            return Err(Error::Other(format!(
+                "opencode config lists model(s) the gateway does not serve: {}\n\
+                 add them to a route in config.json, or remove them from launch.opencode.models",
+                missing.join(", ")
+            )));
+        }
+    }
+
+    for warning in &invocation.warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    let program_path = find_on_path(&invocation.program)
+        .ok_or_else(|| Error::ClientNotFound(invocation.program.clone()))?;
+
+    let mut cmd = std::process::Command::new(&program_path);
+    cmd.args(&invocation.args);
+    cmd.envs(invocation.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // `exec` only returns on failure; success replaces this process.
+        Err(Error::Io(cmd.exec()))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = cmd.status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+/// An actionable error for a missing `launch.<client>` block.
+fn missing_launch_config(client: Client) -> Error {
+    let key = client.program();
+    Error::Other(format!(
+        "launch.{key} is not configured\n\
+         add launch.{key}.model to config.json (the route to use for `llm-gateway launch {key}`)"
+    ))
+}
+
+/// Look up an executable on `PATH`, the same way a shell would.
+fn find_on_path(program: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var).find_map(|dir| {
+        let candidate = dir.join(program);
+        is_executable(&candidate).then_some(candidate)
+    })
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = path.metadata() else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Environment variable names whose values must be redacted when printed.
