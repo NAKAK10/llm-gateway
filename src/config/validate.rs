@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::config::{ApiKind, Config, ModelRef, RouteConfig};
+use crate::config::{ApiKind, Config, ModelRef, RouteConfig, SemanticConfig};
 use crate::error::ValidationReport;
 
 /// Check a parsed config and return everything that is wrong with it.
@@ -219,26 +219,18 @@ fn validate_semantic<'a>(
     // Names resolved well enough to be worth an ApiKind cross-check below —
     // errors already reported above (self-reference) or below (missing,
     // wildcard) are excluded so the warning doesn't pile on top of them.
-    let mut resolved_candidates: Vec<&'a str> = Vec::new();
+    // `resolve_candidates` is the same resolution `crate::semantic::index`
+    // uses to build classification vectors; it is kept in one place so the
+    // two can never drift apart.
+    let resolved_candidates = resolve_candidates(config, route_name, semantic);
 
     if semantic.candidates.is_empty() {
         // Empty means "every other route that has a description".
-        let implicit: Vec<&'a str> = config
-            .routes
-            .iter()
-            .filter(|(name, r)| {
-                name.as_str() != route_name && !name.contains('*') && r.description.is_some()
-            })
-            .map(|(name, _)| name.as_str())
-            .collect();
-
-        if implicit.is_empty() {
+        if resolved_candidates.is_empty() {
             report.error(format!(
                 "route `{route_name}`: semantic.candidates is empty and no other route has a description; there is nothing to classify against"
             ));
         }
-
-        resolved_candidates = implicit;
     } else {
         for candidate_name in &semantic.candidates {
             if candidate_name == route_name {
@@ -265,8 +257,6 @@ fn validate_semantic<'a>(
                             "route `{route_name}`: candidate `{candidate_name}` itself has `semantic`; nested auto routes are not allowed"
                         ));
                     }
-
-                    resolved_candidates.push(name);
                 }
                 None => {
                     report.error(format!(
@@ -304,6 +294,50 @@ fn validate_semantic<'a>(
             mismatched.join(", ")
         ));
     }
+}
+
+/// Resolve which routes are eligible candidates for `route_name`'s
+/// `semantic` block: the explicit list (dropping self-reference and
+/// wildcard names), or — when the list is empty — every other non-wildcard
+/// route that has a `description`.
+///
+/// This is the one place that rule lives. `validate_semantic` uses it to
+/// decide what to warn/error about (`nothing to classify against`, ApiKind
+/// mismatches); `crate::semantic::index` uses it to decide which routes to
+/// embed as classification candidates. Keeping it in one function means a
+/// change to the rule cannot accidentally apply to only one of the two.
+///
+/// Silently drops a candidate name that does not resolve to a route or
+/// resolves to a wildcard, rather than reporting anything — reporting is
+/// `validate_semantic`'s job. A candidate with no `description` or with its
+/// own `semantic` block is still included here (those are errors that block
+/// startup elsewhere), since by the time anything else calls this on a live
+/// `Config`, `validate` has already guaranteed they cannot occur.
+pub(crate) fn resolve_candidates<'a>(
+    config: &'a Config,
+    route_name: &str,
+    semantic: &SemanticConfig,
+) -> Vec<&'a str> {
+    if semantic.candidates.is_empty() {
+        return config
+            .routes
+            .iter()
+            .filter(|(name, r)| {
+                name.as_str() != route_name && !name.contains('*') && r.description.is_some()
+            })
+            .map(|(name, _)| name.as_str())
+            .collect();
+    }
+
+    semantic
+        .candidates
+        .iter()
+        .filter(|candidate_name| candidate_name.as_str() != route_name)
+        .filter_map(|candidate_name| {
+            let (name, _) = config.routes.get_key_value(candidate_name.as_str())?;
+            (!name.contains('*')).then_some(name.as_str())
+        })
+        .collect()
 }
 
 /// Warn when the config file (which contains API keys) is readable by group
@@ -810,5 +844,67 @@ mod tests {
             "{:?}",
             report.warnings
         );
+    }
+
+    // `resolve_candidates` is the rule `crate::semantic::index` reuses to
+    // build the classification vectors, so it is worth pinning down on its
+    // own, independent of the errors/warnings `validate_semantic` derives
+    // from it.
+
+    #[test]
+    fn resolve_candidates_with_empty_list_means_every_other_described_route() {
+        let mut c = minimal_config(); // has "role-writer", described
+        c.routes
+            .insert("claude-*".into(), route("anthropic/*", &[])); // wildcard, excluded
+        let mut nodesc = route("anthropic/opus-pinned", &[]);
+        nodesc.description = None;
+        c.routes.insert("role-nodesc".into(), nodesc); // no description, excluded
+        c.routes.insert(
+            "auto".into(),
+            semantic_route("anthropic/opus-pinned", &[], 0.45),
+        );
+
+        let semantic = c.routes["auto"].semantic.clone().unwrap();
+        let resolved = resolve_candidates(&c, "auto", &semantic);
+
+        assert_eq!(resolved, vec!["role-writer"]);
+    }
+
+    #[test]
+    fn resolve_candidates_with_explicit_list_drops_self_reference_and_wildcards() {
+        let mut c = minimal_config();
+        c.routes
+            .insert("claude-*".into(), route("anthropic/*", &[]));
+        c.routes.insert(
+            "auto".into(),
+            semantic_route(
+                "anthropic/opus-pinned",
+                &["role-writer", "auto", "claude-*", "ghost"],
+                0.45,
+            ),
+        );
+
+        let semantic = c.routes["auto"].semantic.clone().unwrap();
+        let resolved = resolve_candidates(&c, "auto", &semantic);
+
+        // "auto" (self) and "claude-*" (wildcard) are dropped; "ghost" does
+        // not name a route and is dropped too. Only "role-writer" survives.
+        assert_eq!(resolved, vec!["role-writer"]);
+    }
+
+    #[test]
+    fn resolve_candidates_explicit_list_preserves_order() {
+        let mut c = minimal_config();
+        c.routes
+            .insert("role-a".into(), route("anthropic/opus-pinned", &[]));
+        c.routes.insert(
+            "auto".into(),
+            semantic_route("anthropic/opus-pinned", &["role-a", "role-writer"], 0.45),
+        );
+
+        let semantic = c.routes["auto"].semantic.clone().unwrap();
+        let resolved = resolve_candidates(&c, "auto", &semantic);
+
+        assert_eq!(resolved, vec!["role-a", "role-writer"]);
     }
 }

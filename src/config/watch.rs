@@ -8,6 +8,7 @@
 //! is harmless — in-flight requests finish against the config they started with.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,12 @@ use crate::paths;
 pub struct SharedConfig {
     pub(crate) current: ArcSwap<Config>,
     pub(crate) path: PathBuf,
+    /// Bumped each time `reload` swaps in a new config. Lets a consumer that
+    /// caches something derived from the config (the semantic routing index,
+    /// see `crate::semantic::index`) tell whether its cache is still current
+    /// without re-deriving it on every use — it compares this against the
+    /// value it last built from and only rebuilds when the two disagree.
+    generation: AtomicU64,
 }
 
 impl SharedConfig {
@@ -32,6 +39,7 @@ impl SharedConfig {
         Ok(Arc::new(Self {
             current: ArcSwap::from_pointee(config),
             path,
+            generation: AtomicU64::new(0),
         }))
     }
 
@@ -41,6 +49,7 @@ impl SharedConfig {
         Arc::new(Self {
             current: ArcSwap::from_pointee(config),
             path,
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -52,6 +61,15 @@ impl SharedConfig {
     #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Current generation counter. Starts at 0 and increases by 1 on every
+    /// config swap made by `reload` — never on the initial load, so a
+    /// consumer that builds its cache from the config passed to it at
+    /// construction time and records generation 0 stays in step without a
+    /// spurious rebuild on its first use.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 
     /// Re-read and re-validate, replacing the current config only on success.
@@ -74,6 +92,12 @@ impl SharedConfig {
         let old_config = self.current.load_full();
         let summary = summarize_change(&old_config, &new_config);
         self.current.store(Arc::new(new_config));
+        // Ordered after the config store above (both are SeqCst, and this
+        // is the only writer): a reader that observes the new generation
+        // via `generation()` is guaranteed to observe the new config too if
+        // it then calls `get()`, so nothing can be caught mid-swap holding a
+        // generation number that outruns the config it describes.
+        self.generation.fetch_add(1, Ordering::SeqCst);
         tracing::info!("{summary}");
         Some(summary)
     }
@@ -330,5 +354,37 @@ mod tests {
             shared.get().routes["role-writer"].model.default,
             "anthropic/opus-updated"
         );
+    }
+
+    #[test]
+    fn generation_starts_at_zero_and_does_not_move_on_initial_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, VALID_CONFIG);
+        let shared = SharedConfig::load(path).unwrap();
+
+        assert_eq!(shared.generation(), 0);
+    }
+
+    #[test]
+    fn generation_advances_only_on_a_successful_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, VALID_CONFIG);
+        let shared = SharedConfig::load(path.clone()).unwrap();
+        assert_eq!(shared.generation(), 0);
+
+        // A reload that fails to parse must not move the counter — a
+        // consumer must not think there is something new to rebuild from.
+        std::fs::write(&path, b"{ this is not valid json5 ").unwrap();
+        assert!(shared.reload().is_none());
+        assert_eq!(shared.generation(), 0);
+
+        // A reload that succeeds must move it, exactly once.
+        std::fs::write(&path, VALID_CONFIG_CHANGED).unwrap();
+        assert!(shared.reload().is_some());
+        assert_eq!(shared.generation(), 1);
+
+        std::fs::write(&path, VALID_CONFIG).unwrap();
+        assert!(shared.reload().is_some());
+        assert_eq!(shared.generation(), 2);
     }
 }

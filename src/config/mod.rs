@@ -222,10 +222,9 @@ impl Description {
 
     /// The description text, reading the referenced file when needed.
     ///
-    /// Unused until semantic routing (Phase 2) embeds these as the
-    /// classification corpus; kept because it defines the contract `validate`
-    /// already checks (the referenced file must exist).
-    #[allow(dead_code)]
+    /// Used by `crate::semantic::index` as the classification corpus; the
+    /// contract it relies on (the referenced file must exist) is already
+    /// checked by `validate`.
     pub fn text(&self) -> Result<String> {
         match self.path() {
             None => Ok(self.0.clone()),
