@@ -44,6 +44,8 @@ among wildcards the longest prefix wins. Wildcard routes are not listed in
 | `description` | *(none)* | Inline text, or a path when it starts with `./` `../` `/` `~/` (relative paths resolve against the config dir). Future semantic routing classifies against this — write it as "when should this route be picked". |
 | `model.default` | *(required)* | `"<provider>/<model>"`, split on the **first** `/` only — `openrouter/anthropic/claude-x` and `ollama-cloud/glm:cloud` both parse. `*` in the model part is replaced by the requested name. |
 | `model.fallbacks` | `[]` | Tried in order, only before the first response byte, only on connect failure / timeout / 408 / 429 / 5xx. Must use providers with the same `api` as the default. |
+| `semantic.candidates` | `[]` | **Phase 2 design — schema finalized, classifier not implemented yet.** Route names eligible for selection when *this* route is requested by name. Empty means "every other route that has a `description`". Candidates must have a `description` (the classification corpus); candidates whose `api` doesn't match the incoming request's protocol are excluded at match time. An explicit route name is never overridden — classification only runs for a route that itself carries `semantic`. A route name with `semantic` cannot end in `*`. |
+| `semantic.threshold` | `0.45` | **Phase 2 design.** If the top-1 cosine similarity against the candidates falls below this, `model` on this route is used instead — so a route with `semantic` still requires `model`. |
 
 ## launch.\<client\>
 

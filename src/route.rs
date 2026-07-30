@@ -150,12 +150,11 @@ mod tests {
 
     fn route(default: &str, fallbacks: &[&str]) -> RouteConfig {
         RouteConfig {
-            title: None,
-            description: None,
             model: ModelConfig {
                 default: default.to_string(),
                 fallbacks: fallbacks.iter().map(|s| s.to_string()).collect(),
             },
+            ..Default::default()
         }
     }
 

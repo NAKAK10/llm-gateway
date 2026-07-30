@@ -73,8 +73,81 @@ llm-gateway stats           # ルートごとの消費量を表示
 | opencode | `agents/*.md` の `model: openai/…` | `launch` が `launch.opencode.overrideProviders`(既定 `openai`, `anthropic`)の組み込みプロバイダーもゲートウェイに向ける。opencode はモデル参照ごとにプロバイダーを選ぶため、これが無いと固定 agent が黙ってゲートウェイを素通りする |
 
 現時点のルーティングは**モデル名ベース**です(完全一致 → 最長 wildcard)。
-リクエスト内容から route を選ぶセマンティック分類は Phase 2 で、
-`routes[].description` がその分類コーパスになります。
+リクエスト内容から route を選ぶセマンティック分類は Phase 2 です —
+設定スキーマは確定しています(下記の
+[セマンティックルーティング](#セマンティックルーティングphase-2-設計)参照)が、
+分類器そのものはまだ実装されていません。
+
+## セマンティックルーティング(Phase 2 設計)
+
+コンテンツベースルーティングの設定スキーマは確定していますが、分類器
+そのものはまだ実装されていません — 現時点のルーティングは引き続き
+「完全一致 → 最長 wildcard」です(上記「agent ごとのモデル」参照)。
+このセクションはスキーマだけを説明するもので、分類器が実装された後も
+そのまま通用するように書いてあります。
+
+`routes[].semantic` はどの route にも追加できる任意フィールドです:
+
+| フィールド | 型 | 既定 | 意味 |
+|---|---|---|---|
+| `candidates` | `string[]` | `[]` | 選択対象になる route 名。空なら「`description` を持つ他の全 route」。 |
+| `threshold` | `number` | `0.45` | リクエストと候補群との top-1 cosine 類似度がこれを下回った場合、auto route 自身の `model` が代わりに使われる。 |
+
+設計上のポイント:
+
+- **auto route 自身の `model` は、どの候補も閾値に届かなかったときの
+  行き先**です。だから `semantic` を持つ route にも、他の route と同様に
+  `model` が必要です。
+- **明示的な route 名は絶対に上書きされません。** 分類が走るのは
+  `semantic` を持つ route 自身が名前で要求されたときだけです。これは
+  既存の「明示的な route 名は常に勝ち、常に予測可能」という設計方針の
+  継続です(`src/route.rs`、`docs/roadmap.md` の Phase 2 参照)。
+- **候補には `description` が必須です** — これが分類コーパスになります
+  (長い説明は今と同じく `llm/*.md` に置けます)。
+- **リクエストのプロトコルに合わない候補は、実行時に除外されます** —
+  たとえば `/v1/chat/completions` へのリクエストが `anthropic-messages`
+  の候補に解決されることはありません。
+- **`semantic` を持つ route 名にワイルドカード(`*`)は使えません。**
+
+```json5
+routes: {
+  "auto": {
+    semantic: {
+      candidates: ["role-light", "role-deep", "role-code"],
+      threshold: 0.45,
+    },
+    // どの候補も閾値に届かなかったときの行き先
+    model: {
+      default: "ollama-local/qwen3:8b",
+      fallbacks: ["openrouter/qwen/qwen3-8b"],
+    },
+  },
+
+  "role-light": {
+    description: "短い定型作業。要約、整形、コミットメッセージ生成、命名",
+    model: {
+      default: "ollama-local/qwen3:8b",
+      fallbacks: ["groq/llama-3.3-70b-versatile"],
+    },
+  },
+
+  "role-deep": {
+    description: "./llm/role-deep.md",
+    model: {
+      default: "openrouter/anthropic/claude-opus-5",
+      fallbacks: ["openrouter/google/gemini-3-pro"],
+    },
+  },
+
+  "role-code": {
+    description: "コード生成、リファクタリング、テスト作成、バグ修正",
+    model: {
+      default: "openrouter/qwen/qwen3-coder",
+      fallbacks: ["deepseek/deepseek-coder"],
+    },
+  },
+}
+```
 
 ## サポートしているプロバイダー
 

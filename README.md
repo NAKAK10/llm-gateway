@@ -74,8 +74,80 @@ agent files** — every request flows through the gateway:
 
 Routing is by model name today: an exact route name wins, otherwise the
 longest wildcard prefix. Content-based (semantic) routing that picks a route
-from the request itself is Phase 2 — `routes[].description` is its future
-classification corpus.
+from the request itself is Phase 2 — the config schema is finalized (see
+[Semantic routing](#semantic-routing-phase-2-design) below), but the
+classifier itself is not implemented yet.
+
+## Semantic routing (Phase 2 design)
+
+The config schema for content-based routing is finalized; the classifier
+itself is not implemented yet — routing today is still exact-name-first,
+then longest-wildcard-prefix (see "Per-agent models" above). This section
+documents the schema so configs written against it keep working once the
+classifier ships.
+
+`routes[].semantic` is an optional field on any route:
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `candidates` | `string[]` | `[]` | Route names eligible for selection. Empty means "every other route that has a `description`". |
+| `threshold` | `number` | `0.45` | If the top-1 cosine similarity of the request against the candidates falls below this, the auto route's own `model` is used instead. |
+
+Design points:
+
+- **The auto route's own `model` is where requests land when no candidate
+  clears the threshold** — so a route with `semantic` still needs a `model`,
+  exactly like any other route.
+- **An explicit route name is never overridden.** Classification only runs
+  when a request names a route that itself carries `semantic`. This
+  continues the existing rule that an exact route name always wins and is
+  always predictable (see `src/route.rs`, Phase 2 in `docs/roadmap.md`).
+- **Candidates must have a `description`** — that's the classification
+  corpus (long descriptions can live in `llm/*.md`, as today).
+- **Candidates whose protocol doesn't match the incoming request are
+  excluded at match time** — e.g. a request to `/v1/chat/completions` will
+  never resolve to an `anthropic-messages` candidate.
+- **Route names with `semantic` cannot use a wildcard (`*`).**
+
+```json5
+routes: {
+  "auto": {
+    semantic: {
+      candidates: ["role-light", "role-deep", "role-code"],
+      threshold: 0.45,
+    },
+    // Where requests land when no candidate clears the threshold.
+    model: {
+      default: "ollama-local/qwen3:8b",
+      fallbacks: ["openrouter/qwen/qwen3-8b"],
+    },
+  },
+
+  "role-light": {
+    description: "Short, well-defined chores: summarizing, formatting, commit messages, naming",
+    model: {
+      default: "ollama-local/qwen3:8b",
+      fallbacks: ["groq/llama-3.3-70b-versatile"],
+    },
+  },
+
+  "role-deep": {
+    description: "./llm/role-deep.md",
+    model: {
+      default: "openrouter/anthropic/claude-opus-5",
+      fallbacks: ["openrouter/google/gemini-3-pro"],
+    },
+  },
+
+  "role-code": {
+    description: "Code generation, refactoring, test writing, bug fixes",
+    model: {
+      default: "openrouter/qwen/qwen3-coder",
+      fallbacks: ["deepseek/deepseek-coder"],
+    },
+  },
+}
+```
 
 ## Supported providers
 

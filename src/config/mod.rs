@@ -161,7 +161,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RouteConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -175,6 +175,17 @@ pub struct RouteConfig {
     pub description: Option<Description>,
 
     pub model: ModelConfig,
+
+    /// Turns this route into an "auto route": instead of forwarding to `model`
+    /// directly, the request body is classified against `candidates` and the
+    /// best match is used.
+    ///
+    /// `model` stays mandatory even here — it is not a fallback default, it is
+    /// the destination when no candidate's similarity clears `threshold`. This
+    /// is why `model` is not `Option`: every route, semantic or not, always has
+    /// somewhere to send the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<SemanticConfig>,
 }
 
 /// A `description` value: either the text itself or a path to a file holding it.
@@ -225,7 +236,7 @@ impl Description {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelConfig {
     /// `"<provider>/<model>"`, e.g. `ollama-cloud/qwen3.5:397b`.
@@ -240,6 +251,38 @@ pub struct ModelConfig {
     /// switching upstreams is impossible.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<String>,
+}
+
+/// Semantic routing for a designated auto route.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SemanticConfig {
+    /// Routes eligible for selection. Empty means "every other route that has
+    /// a description".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<String>,
+
+    /// Minimum cosine similarity the top candidate must reach. Below it, this
+    /// route's own `model` is used instead.
+    #[serde(default = "default_threshold")]
+    pub threshold: f32,
+}
+
+/// Hand-written rather than derived: a derived `Default` would give
+/// `threshold: 0.0`, which silently means "every candidate always clears the
+/// bar" — the opposite of a safe default, and different from what parsing an
+/// omitted `threshold` produces.
+impl Default for SemanticConfig {
+    fn default() -> Self {
+        Self {
+            candidates: Vec::new(),
+            threshold: default_threshold(),
+        }
+    }
+}
+
+fn default_threshold() -> f32 {
+    0.45
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
