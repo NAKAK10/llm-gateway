@@ -16,6 +16,8 @@ pub mod launch;
 pub mod paths;
 pub mod record;
 pub mod route;
+#[cfg(feature = "semantic")]
+pub mod semantic;
 pub mod server;
 pub mod upstream;
 pub mod usage;

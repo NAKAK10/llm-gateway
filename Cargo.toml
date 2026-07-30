@@ -10,6 +10,14 @@ readme = "README.md"
 keywords = ["llm", "gateway", "proxy", "anthropic", "openai"]
 categories = ["command-line-utilities", "web-programming::http-server"]
 
+[features]
+default = []
+# Semantic routing (issue #2): static embeddings via model2vec-rs, used to
+# classify a request against `routes[].description`. Off by default because
+# `model.safetensors` alone is ~500MB — opting in is a deliberate choice, not
+# something every install should pay for.
+semantic = ["dep:model2vec-rs", "dep:sha2"]
+
 [dependencies]
 arc-swap = "1.9.2"
 axum = "0.8.9"
@@ -21,11 +29,13 @@ etcetera = "0.10.0"
 futures-util = "0.3.33"
 http = "1.5.0"
 json5 = "1.3.1"
+model2vec-rs = { version = "0.2", default-features = false, features = ["local-only", "fancy-regex"], optional = true }
 notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls", "http2", "charset"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = { version = "0.10", optional = true }
 thiserror = "2.0.19"
 time = { version = "0.3.45", features = ["formatting", "macros", "local-offset"] }
 tokio = { version = "1.53.1", features = ["full"] }
