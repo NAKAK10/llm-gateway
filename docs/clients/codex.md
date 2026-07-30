@@ -1,5 +1,7 @@
 # Codex CLI — manual setup
 
+[English](codex.md) | [日本語](../ja/clients/codex.md)
+
 `llm-gateway launch codex` is the supported path and needs none of this.
 This page makes the redirect permanent by hand. The gateway never writes
 `~/.codex/config.toml`.

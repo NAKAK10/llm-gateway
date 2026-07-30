@@ -1,0 +1,94 @@
+# ハマりどころ
+
+[English](../gotchas.md) | 日本語
+
+既知の罠の一覧です。ここに載っていないものを踏んだら、追記してください。
+
+## ストリーミング / プロキシ
+
+- **アップストリームのレスポンスから `content-length`、`transfer-encoding`、
+  `content-encoding` をコピーしてはいけない。** axum がボディを再フレーム化
+  するため、古い値が残るとクライアントがハングしたり、平文を展開しようと
+  したりする。(`server/passthrough.rs` が除去している。)
+- **reqwest の gzip/brotli フィーチャーを有効にしてはいけない。** 経路の
+  途中にデコーダーが入るとチャンクが再バッファリングされ、SSE のトークン
+  ストリーミングが長い停止に化ける。代わりに `accept-encoding: identity`
+  を送っている。
+- **タイムアウトはリクエスト全体ではなく最初のバイトに掛ける。**
+  `reqwest::timeout()` は長いが正常な生成をストリーム途中で殺してしまう。
+  `connect_timeout` + ヘッダー期限(`FIRST_BYTE_TIMEOUT`)が正しい組み合わせ。
+- **ストリーム開始後のフォールバックは不可能。** 200 と最初のチャンクは
+  既に送信済み。これは物理法則であって未実装機能ではない。フォールバックの
+  ユーザー向け説明には必ず明記すること。
+- **クライアントが切断してもアップストリームのトークンは消費される。**
+  usage の記録はハンドラーの正常系ではなく、ストリームの `Drop` から行う
+  こと(`usage/tee.rs`)。
+- **ストリーミングの OpenAI-chat リクエストには `stream_options.include_usage`
+  を注入しなければならない。** さもないと usage が永遠に静かにゼロになる —
+  そしてそれは「正常に動いている」ように見える。これで壊れるプロバイダーには
+  `injectUsage: false` を設定する。
+
+## launch / クライアント
+
+- **Claude Code: `settings.json` の `env` はシェル環境より強い。** ユーザーが
+  そこに `ANTHROPIC_BASE_URL` を書いた瞬間、`launch claude` は黙って
+  リダイレクトしなくなる。検知して警告する
+  (`launch/claude.rs::detect_conflicts`)。`--isolate`
+  (`--setting-sources project`)は最終手段であってデフォルトではない。
+- **Codex: 環境変数でアップストリームをリダイレクトする方法はない。**
+  `OPENAI_BASE_URL` は存在しない。`-c model_providers.…` だけが機能し、
+  値は TOML としてパースされる → 文字列には二重引用符の埋め込みが必要。
+- **Codex: `--ignore-user-config` は `codex exec` にしかない。** TUI 実行は
+  隔離できない。この非対称性は隠さず警告している。
+- **Codex: `disable_response_storage=true` は常に付ける。** OpenRouter の
+  `/v1/responses` はステートレスで、`previous_response_id` が非 null だと
+  400 を返す — これがないと OpenRouter へのフォールバックはどの会話でも
+  2 ターン目で死ぬ。
+- **opencode: `models` のキーは `GET /v1/models` の id と完全一致でなければ
+  ならない。** 一致しないと何も表示せず、何も言わない。`launch opencode`
+  は起動前に稼働中のゲートウェイに対して検証する。
+- **opencode: `OPENCODE_CONFIG` はプロジェクト設定に負ける。** 確実に勝つのは
+  `OPENCODE_CONFIG_CONTENT` だけで、その中では `{env:VAR}`/`{file:…}` が
+  展開**されない**(anomalyco/opencode#13219)— キーがリテラルで埋め込まれる。
+  この環境変数がリダクション対象リストに入っているのはそのため。
+- **OpenClaw: プロバイダーの `models` は許可リスト。** リストにないルート名は
+  OpenClaw にとって存在しないのと同じで、エラーメッセージも役に立たない。
+  ルートを追加したら許可リストも更新すること。
+- **OpenClaw: フォールバックの二重化に注意。** OpenClaw は独自のモデル
+  フォールバックチェーンを持つ。モデルレベルのフォールバックはゲートウェイに
+  任せ、OpenClaw 側の `fallbacks` は「ゲートウェイが落ちた → 旧直結ルート」
+  という単一の脱出ハッチにとどめる。さもないとすべての失敗があらゆる場所で
+  二重にリトライされる。
+- **OpenClaw: cron 実行にはシェル環境がない。** `${VAR}` のキー参照は
+  ターミナルでは解決できても 09:01 に 401 になる。キーはデーモン自身の
+  起動環境に入れること。
+- **`localhost` は `::1` に解決されることがある。** すべての設定とドキュメントは
+  `127.0.0.1` を使う。
+
+## 設定 / セキュリティ
+
+- `config.json` はリテラルのキーを保持しうる → 作成時に `0600`、権限ドリフトは
+  警告、`config show` と `launch --print` ではマスク、`config gitignore` で
+  テンプレート出力。
+- `server.apiKey` なしのループバック以外へのバインドは起動時に拒否:
+  ポートの向こうのすべてのプロバイダー認証情報を 1 つのキーで守る。
+- `server.host`/`server.port`/`server.apiKey` はホットリロード**されない**
+  (リスナーとその識別情報はバインド時に固定)。それ以外はすべてリロードされる。
+- リロード失敗時は旧設定が生き続ける — 仕様。編集が反映されたと思い込む前に
+  stderr を確認すること。ログ行に何が変わったか書いてある。
+- ルート名に `:` と `/` は使えない(opencode のモデルキー、Codex の TOML
+  キー、URL パスを壊す)。モデルの*値*には両方使える — パースは最初の `/`
+  でのみ分割するため、`openrouter/anthropic/claude-…` も
+  `ollama-cloud/glm-5.2:cloud` も動く。
+- `--debug` はプロンプト本文を書き込む(200 文字で切り詰め; `--debug-full`
+  は切り詰めない)。業務の会話が平文で `logs/` に残る。
+
+## Rust まわり
+
+- axum 0.7+ で `StreamBody` は削除された; `Body::from_stream` を使う。
+- macOS の `notify`(FSEvents)は自分の所有でないファイルの扱いに難がある →
+  ウォッチャーは親ディレクトリを監視してファイル名でフィルタし、エディタの
+  アトミック保存対策に 300 ms のデバウンスを入れている。
+- `dirs`/`directories` は macOS で `~/Library/Application Support` を返し、
+  XDG を尊重しない。設定が `~/.config` に置かれるのは
+  `etcetera::choose_base_strategy()` を使っているため。
