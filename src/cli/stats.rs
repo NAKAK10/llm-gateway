@@ -13,6 +13,7 @@ use clap::ValueEnum;
 use crate::config::Config;
 use crate::error::Result;
 use crate::paths;
+use crate::record::retention;
 use crate::record::usage_log::UsageRecord;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -43,6 +44,8 @@ pub struct Options {
     pub since: Option<String>,
     /// `YYYY-MM-DD`, inclusive.
     pub until: Option<String>,
+    /// Show every retained record instead of defaulting to the last 7 days.
+    pub all: bool,
 }
 
 /// One aggregated row.
@@ -63,6 +66,13 @@ pub fn run(options: Options) -> Result<()> {
         .ok()
         .map(|c| paths::logs_dir(&c.logging.dir))
         .unwrap_or_else(|| PathBuf::from("./logs"));
+
+    // Shed anything past the retention window before reading, so `stats`
+    // doubles as the everyday trigger for cleanup on machines that don't run
+    // `serve` continuously.
+    if let Err(err) = retention::prune(&logs_dir) {
+        eprintln!("warning: failed to prune old logs: {err}");
+    }
 
     let mut records = Vec::new();
     let mut skipped = 0u64;
@@ -104,12 +114,32 @@ pub fn run(options: Options) -> Result<()> {
         return Ok(());
     }
 
-    let rows = aggregate(
-        &records,
-        options.by,
-        options.since.as_deref(),
-        options.until.as_deref(),
-    );
+    // With no explicit range and no `--all`, default to the last 7 days —
+    // that's what "how much did I just use" almost always means, and
+    // `--since`/`--until`/`--all` remain the escape hatch for anything else.
+    let default_since = default_since_7_days();
+    let since = if options.all {
+        None
+    } else {
+        options.since.clone().or_else(|| default_since.clone())
+    };
+    let until = if options.all {
+        None
+    } else {
+        options.until.clone()
+    };
+
+    if since.is_some() || until.is_some() {
+        let label = match (&since, &until) {
+            (Some(s), Some(u)) => format!("{s}..{u}"),
+            (Some(s), None) => format!("since {s}"),
+            (None, Some(u)) => format!("until {u}"),
+            (None, None) => unreachable!(),
+        };
+        println!("showing {label} (use --all for everything retained)");
+    }
+
+    let rows = aggregate(&records, options.by, since.as_deref(), until.as_deref());
 
     let mut table = comfy_table::Table::new();
     table.set_header(vec![
@@ -146,6 +176,50 @@ pub fn run(options: Options) -> Result<()> {
     ]);
 
     println!("{table}");
+
+    // Also show a per-model breakdown, since that's usually what people
+    // want to know ("how much did each model actually get used") and it's
+    // easy to miss when the main table is grouped by something else.
+    if options.by != GroupBy::Model {
+        let model_rows = aggregate(&records, GroupBy::Model, since.as_deref(), until.as_deref());
+
+        let mut model_table = comfy_table::Table::new();
+        model_table.set_header(vec![
+            "model".to_string(),
+            "calls".to_string(),
+            "fail".to_string(),
+            "in_tok".to_string(),
+            "out_tok".to_string(),
+        ]);
+
+        let mut model_total = Row {
+            key: "TOTAL".to_string(),
+            ..Default::default()
+        };
+        for row in &model_rows {
+            model_table.add_row(vec![
+                row.key.clone(),
+                format_count(row.calls),
+                format_count(row.failures),
+                format_count(row.in_tok),
+                format_count(row.out_tok),
+            ]);
+            model_total.calls += row.calls;
+            model_total.failures += row.failures;
+            model_total.in_tok += row.in_tok;
+            model_total.out_tok += row.out_tok;
+        }
+        model_table.add_row(vec![
+            model_total.key.clone(),
+            format_count(model_total.calls),
+            format_count(model_total.failures),
+            format_count(model_total.in_tok),
+            format_count(model_total.out_tok),
+        ]);
+
+        println!();
+        println!("{model_table}");
+    }
 
     Ok(())
 }
@@ -205,6 +279,19 @@ pub fn aggregate(
 /// The leading `YYYY-MM-DD` of an RFC 3339 timestamp.
 fn day_of(ts: &str) -> &str {
     ts.get(..10).unwrap_or(ts)
+}
+
+/// `YYYY-MM-DD` 7 days ago (inclusive of today), for the default `stats`
+/// window.
+fn default_since_7_days() -> Option<String> {
+    let today = time::OffsetDateTime::now_utc().date();
+    let since = today - time::Duration::days(6);
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        since.year(),
+        since.month() as u8,
+        since.day()
+    ))
 }
 
 /// Render with `,` every three digits, e.g. `12,345`.

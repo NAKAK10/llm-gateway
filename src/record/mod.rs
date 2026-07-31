@@ -11,6 +11,7 @@
 //! Trace records contain prompt text. User messages are truncated to
 //! [`TRUNCATE_CHARS`] unless `--debug-full` was given.
 
+pub mod retention;
 pub mod trace_log;
 pub mod usage_log;
 
@@ -75,6 +76,28 @@ impl Recorder {
                 if let Err(err) = result {
                     tracing::warn!(error = %err, "failed to write log record");
                 }
+            }
+        });
+
+        // Prune on startup, then once a day for as long as the server runs —
+        // otherwise a long-lived `serve` would only ever shed old data on the
+        // next restart.
+        let prune_dir = dir.clone();
+        tokio::spawn(async move {
+            loop {
+                match retention::prune(&prune_dir) {
+                    Ok(summary) if summary.files_deleted > 0 || summary.files_trimmed > 0 => {
+                        tracing::info!(
+                            files_deleted = summary.files_deleted,
+                            files_trimmed = summary.files_trimmed,
+                            lines_removed = summary.lines_removed,
+                            "pruned old logs"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!(error = %err, "failed to prune old logs"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
             }
         });
 

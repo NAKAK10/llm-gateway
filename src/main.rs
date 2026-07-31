@@ -124,13 +124,17 @@ struct StatsArgs {
     #[arg(long = "by", value_enum, default_value_t = cli::stats::GroupBy::Route)]
     by: cli::stats::GroupBy,
 
-    /// Inclusive lower bound, `YYYY-MM-DD`.
+    /// Inclusive lower bound, `YYYY-MM-DD`. Defaults to 7 days ago.
     #[arg(long)]
     since: Option<String>,
 
     /// Inclusive upper bound, `YYYY-MM-DD`.
     #[arg(long)]
     until: Option<String>,
+
+    /// Show every retained record (up to 28 days) instead of just the last 7 days.
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Args)]
@@ -195,6 +199,7 @@ fn run() -> Result<()> {
             by: args.by,
             since: args.since,
             until: args.until,
+            all: args.all,
         }),
 
         Command::Trace(args) => cli::trace::run(cli::trace::Options {
