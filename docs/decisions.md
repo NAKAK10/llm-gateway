@@ -2,6 +2,56 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-07-31 — Cross-protocol fallbacks: reachability moves from config validation to per-target request-time filtering
+
+`route.model.fallbacks` used to be rejected outright by `config check` unless
+every fallback's provider shared `api` with `model.default`. That blocked an
+ordinary setup: a free `openai-chat` model (an OpenRouter or local Ollama
+model, say) as the default, with a subscription-backed `anthropic-messages`
+provider (`transport: "claude-cli"`) as the fallback — so an outage or a burst
+of 5xx falls back to something with no per-token cost, as long as its
+subscription seat is free. The two `api` values never matched, so the config
+was refused before the gateway ever ran.
+
+**Built: `filter_reachable_targets` in `src/server/proxy.rs`, per attempt.**
+The old rule rejected on the wrong axis. At config-load time the gateway does
+not know which protocol a *future request's client* will speak, and the same
+route serves whichever client's request gets classified into it — there is no
+single "the" protocol relationship between `default` and `fallbacks` to
+validate once and for all. So the fixed same-`api` requirement was dropped
+from `src/config/validate.rs`, and reachability became a per-attempt,
+request-time question instead: for each target — `default` first, then
+`fallbacks` in order — a target whose `api` matches the client's is a
+passthrough; a target whose `api` differs is kept only if a translation for
+that `client → provider` direction exists (today, only
+`anthropic-messages → openai-chat`); anything else is dropped before
+`upstream::send_with_fallback` ever sees it. A route only answers `400` if
+every one of its targets gets dropped this way.
+
+Translation selection moved from once-per-route to once-per-attempt for the
+same reason: it used to be derived from the route's first target and reused
+for every subsequent one, which was only correct because every target was
+guaranteed to share a protocol. `resolved.translation` in the trace log now
+reflects whichever target actually answered, not the route's `default` — a
+fallback that crossed protocols to get there looks different in the trace
+than one that didn't, by design.
+
+**No new translation direction shipped.** This is a validation and
+target-selection change, not a translator change: `openai-chat` client →
+`anthropic-messages` provider is still untranslated, so that target is still
+dropped for such a client — just at request time instead of at `config
+check` time, with the same end result.
+
+**Rejected: keep `config check` rejecting the mismatch, just loosen which
+`api` pairs it allows.** Any such rule still assumes a route's targets have
+one "correct" protocol relationship that config alone can decide. They don't:
+whether a given `default`/`fallback` pair is fine depends on which protocol
+the request's client happens to speak, and nothing stops the same route from
+serving both an Anthropic Messages client and an OpenAI Chat client over its
+lifetime. Static config validation cannot express "valid for this caller,
+invalid for that one" — only a per-request, per-target check can, which is
+why the check moved rather than being merely relaxed.
+
 ## 2026-07-31 — Ambiguous turns keep their route via history walk-back, not a sticky cache
 
 Classifying only the last user message left agentic conversations falling to

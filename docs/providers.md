@@ -32,9 +32,12 @@ and the endpoint answered.
 
 The `api` value decides which endpoints can reach a provider — with one
 crossing: an `anthropic-messages` client (Claude Code) can reach any
-`openai-chat` provider here, because that direction is translated. See
-[Cross-protocol routing](../README.md#cross-protocol-routing) for what such a
-route gives up.
+`openai-chat` provider here, because that direction is translated. This holds
+per target, so a route's `default` and `fallbacks` can mix providers with
+different `api` values freely; a target the client's protocol cannot reach is
+simply skipped at request time. See [Cross-protocol
+routing](../README.md#cross-protocol-routing) for what such an attempt gives
+up.
 
 `baseUrl` rules (see `docs/config-reference.md`): no trailing slash;
 `anthropic-messages` providers give the host root (the gateway appends
@@ -76,7 +79,7 @@ openai: {
 
 Codex speaks the Responses API by default. Register a second id with
 `api: "openai-chat"` if you also want it as a chat-completions fallback
-target for other routes (fallbacks may not cross protocols).
+target for other routes.
 
 ### OpenRouter
 
@@ -88,8 +91,9 @@ openrouter: {
   headers: { "X-Title": "llm-gateway" },   // optional attribution
 },
 // Same upstream, same account, Anthropic wire protocol instead of
-// openai-chat — lets an Anthropic-speaking route fall back to it without
-// crossing ApiKinds.
+// openai-chat — gives an Anthropic-speaking route a same-protocol fallback
+// target with no translation involved, as an alternative to a cross-protocol
+// fallback at the `openai-chat` id above.
 // Note the root: `/api`, not `/api/v1` — the gateway appends `/v1/messages`
 // itself, and reusing the `openai-chat` id's baseUrl here would double up to
 // `/api/v1/v1/messages`.
@@ -101,11 +105,14 @@ openrouter: {
 ```
 
 Two ids for one account looks redundant at a glance; it exists because a
-provider entry couples one upstream to exactly one wire protocol (`api`) —
-by design, so that `route.model.fallbacks` never has to cross protocols
-mid-request (see `src/config/mod.rs`). Whether OpenRouter itself takes an
+provider entry still couples one upstream to exactly one wire protocol
+(`api`) — see `src/config/mod.rs`. Whether OpenRouter itself takes an
 `openai-chat` or an `anthropic-messages` request depends on which path you
-POST to, not on the credential, so the same key is simply registered twice.
+POST to, not on the credential, so the same key is simply registered twice to
+expose both. A route's `fallbacks` are no longer required to share a protocol
+with the `default` (see `docs/decisions.md`), but registering
+`openrouter-anthropic` still buys you something a cross-protocol fallback to
+the `openai-chat` id can't: a same-protocol, translation-free passthrough.
 `init` only adds `openrouter-anthropic` when you pick OpenRouter as a
 fallback for Claude Code.
 

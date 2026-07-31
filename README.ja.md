@@ -164,28 +164,46 @@ routes: {
 
 Claude Code は Anthropic Messages しか話しませんが、安価あるいはローカルな
 プロバイダーのほとんどは OpenAI Chat しか話しません。そこで一方向だけを
-変換します:
+変換します — そしてこの判定は **route 単位ではなくターゲット単位**で行われます:
+1 つの route の `default` と各 `fallbacks` はそれぞれ別のプロトコルを話して
+よく、各試行はクライアントが送ってきたものに基づいて個別に変換またはパス
+スルーされます。
 
-| クライアントが話す | プロバイダーが話す | 結果 |
+| クライアントが話す | ターゲットが話す | 結果 |
 |---|---|---|
 | `anthropic-messages` | `openai-chat` | 変換される — Claude Code から Ollama、Groq、DeepSeek、Gemini、Mistral、Together、Sakana AI、PLaMo に到達できる |
 | 両側が同じ | — | 従来どおりバイト単位の無加工転送 |
-| それ以外の組み合わせ | — | 従来どおり説明付きの `400` |
+| それ以外の組み合わせ | — | そのターゲットはリクエスト送信前にスキップされる。route 内の全ターゲットがこの理由で到達不能な場合に限り `400` |
+
+到達可能性がターゲットごとに判定されるため、1 つの route の中で default と
+fallback に異なるプロトコルを自由に混在させられます — 例えば、無料の
+`openai-chat` モデルを default にして、サブスクリプションの
+`anthropic-messages` プロバイダーを fallback にする、といった構成です:
 
 ```json5
 providers: {
   "ollama-local": { baseUrl: "http://127.0.0.1:11434/v1", api: "openai-chat" },
+  "anthropic-subscription": { api: "anthropic-messages", transport: "claude-cli" },
 },
 routes: {
   // 分類がこの route に当てはまると判断したときに使われる。
   "role-cheap": {
     description: "短い定型作業: 要約、整形、コミットメッセージ生成",
-    model: { default: "ollama-local/qwen3:8b" },
+    model: {
+      default: "ollama-local/qwen3:8b",
+      fallbacks: ["anthropic-subscription/claude-sonnet-4-6"],
+    },
   },
 }
 ```
 
-変換されたルートで失われるもの:
+逆方向 — `openai-chat` のクライアントが `anthropic-messages` のターゲットに
+到達しようとする場合 — の変換はまだ実装されていないため、そのターゲットは
+`fallbacks` のどこに置かれていても、そのようなクライアントに対しては常に
+スキップされます(`docs/roadmap.md` 参照)。
+
+変換された*試行*(route の `default` とは限らず、実際にリクエストを処理する
+ターゲット)で失われるもの:
 
 - **プロンプトキャッシュ、`thinking` ブロック、citation、Anthropic の
   サーバーサイドツール**(`web_search`、`bash`、`text_editor`)は破棄されます
@@ -199,6 +217,8 @@ routes: {
   バイト単位で同一ではありません。`llm-gateway trace` はこれらの
   リクエストに `xlat=anthropic-messages->openai-chat` を付けます —
   出力がおかしいと感じたら、まずこのフィールドを確認してください。
+  フォールバックが発火した場合、`resolved.translation` は route の
+  `default` ではなく、実際に応答したターゲットの変換を反映します。
 - 使用量集計には**影響しません**: トークン数は変換前のアップストリームの
   バイト列から読み取ります。
 
@@ -346,7 +366,7 @@ routes: {
       description: "OpenAI 系モデルによる汎用アシスタント作業、コーディング、ツール利用。",
       model: {
         default: "openai/*",                  // 最初の `/` でのみ分割される
-        fallbacks: ["openrouter/openai/*"],   // default と同じプロトコルのみ; 最初のバイト受信前に試行
+        fallbacks: ["openrouter/openai/*"],   // プロトコルをまたいでもよい; 最初のバイト受信前に試行
       },
     },
   },
@@ -375,11 +395,11 @@ launch: {
 |---|---|
 | `server.apiKey` | 起動時に一度だけ解決されるため、変更には再起動が必要。`host` がループバック以外の場合は必須 — この 1 つのキーがすべてのプロバイダー認証情報を守る。 |
 | `providers.<id>.apiKey` | リクエスト試行のたびに解決されるため、環境変数 / Keychain / `command:` のローテーションが即時反映される。 |
-| `providers.<id>.api` | フォールバックはプロトコルをまたげない。`config check` が検証する。 |
+| `providers.<id>.api` | route の `default` と `fallbacks` はそれぞれ異なる `api` でもよい。クライアントのプロトコルから到達できるかは `config check` ではなく、リクエスト時に試行ごとに判定される。 |
 | `routes.default` | 必須。どの route も分類閾値を超えないときの予約済み catch-all であり、同時に通常候補としても採点される。 |
 | `routes.<name>.description` | ワイルドカードではない route では必須。インライン文字列、または `./` / `../` / `/` / `~/` のパス。これ自体が分類コーパス。 |
 | `routes.<name>.model.default` | `"<provider>/<model>"`。最初の `/` でのみ分割される。 |
-| `routes.<name>.model.fallbacks` | default と同じプロトコルのみ。最初のレスポンスバイト前に順番に試される。 |
+| `routes.<name>.model.fallbacks` | default と異なる `api` でもよい。最初のレスポンスバイト前に順番に試され、クライアントのプロトコルから到達できないターゲットはスキップされる([クロスプロトコルルーティング](#クロスプロトコルルーティング)参照)。 |
 | `launch` | オプションの上級者用 escape hatch のみ: Claude/Codex/opencode の extra args、Codex の `wireApi`、opencode の `models` / `overrideProviders`。 |
 | `logging.debug` | `--debug` はユーザーテキストを 200 文字に切り詰め、`--debug-full` は全文を残す。プロンプトが平文でディスクに残るため、意図的に有効化すること。 |
 | `logging.logging` | デフォルトは無効。`true` にすると `serve` のコンソール診断ログ(どの route / provider が選ばれたか、embeddingモデルの準備、フォールバック各試行の結果)が stderr に出力される。明示的な `RUST_LOG` はこれより優先される。 |
@@ -423,9 +443,12 @@ llm-gateway update [--check]
 フォールバックは接続失敗・ヘッダータイムアウト・408・429・5xx で発動します —
 **最初のレスポンスバイトを受け取る前**に限られます。ストリーミングが
 始まったレスポンスは確定であり、生成途中の失敗でプロバイダーを切り替える
-ことはできません。フォールバックは同一プロトコル間のみ。Anthropic
-プロトコルでベンダーをまたぐ冗長化をしたい場合は、OpenRouter の Anthropic
-互換エンドポイントにフォールバックを向けてください。
+ことはできません。フォールバックは default と異なるプロトコルを話しても
+構いません([クロスプロトコルルーティング](#クロスプロトコルルーティング)
+参照)— クライアントのプロトコルから到達できないターゲットは、試行される
+のではなくスキップされます。変換を一切挟まずに Anthropic プロトコルで
+ベンダーをまたぐ冗長化をしたい場合は、OpenRouter の Anthropic 互換
+エンドポイントにフォールバックを向けてください。
 
 ## クライアントの手動セットアップ
 
