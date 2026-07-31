@@ -56,7 +56,7 @@ name はクライアントが `model` として送るものです。`:` と `/` 
 | フィールド | デフォルト | 補足 |
 |---|---|---|
 | `title` | *(なし)* | 表示用。 |
-| `description` | *(ワイルドカードではない route では必須)* | インラインテキスト、または `./` `../` `/` `~/` で始まる場合はパス(相対パスは設定ディレクトリ基準)。これ自体が分類コーパスであり、各リクエストの最後の user message はすべての非ワイルドカード route の `description` と比較される。「この route がいつ勝つべきか」を書くこと。 |
+| `description` | *(ワイルドカードではない route では必須)* | インラインテキスト、または `./` `../` `/` `~/` で始まる場合はパス(相対パスは設定ディレクトリ基準)。これ自体が分類コーパスであり、各リクエストの最新の user テキスト(閾値未満なら履歴を遡る — 「分類の挙動」参照)はすべての非ワイルドカード route の `description` と比較される。「この route がいつ勝つべきか」を書くこと。 |
 | `model.default` | *(必須)* | `"<provider>/<model>"`。**最初の** `/` でのみ分割される — `openrouter/anthropic/claude-x` も `ollama-cloud/glm:cloud` もパースできる。モデル部の `*` が展開されるのは、ワイルドカード route が実際に解決されたときだけ。 |
 | `model.fallbacks` | `[]` | 順番に試行。最初のレスポンスバイトより前、かつ接続失敗 / タイムアウト / 408 / 429 / 5xx のときのみ。default と同じ `api` のプロバイダーであること。 |
 
@@ -83,6 +83,14 @@ name はクライアントが `model` として送るものです。`:` と `/` 
   クライアント側の UX と、trace ログの `requested_model` だけ。
 - 類似度は static な `model2vec-rs` 埋め込みと固定 cosine 閾値 `0.45`
   (`src/semantic/index.rs`)を使う。route ごとの閾値設定はない。
+- 最初に分類されるのは最新の user テキストで、マッチすればそれで決まる —
+  本当の話題転換は常に即座に勝つ。閾値未満のとき、または最後の user message
+  がテキストを持たないとき(エージェント的な `tool_result` ターン)は、
+  過去の user テキストを最大 8 件まで遡り、閾値を超える直近のものを採用する。
+  これにより曖昧なターンをまたいでも会話は route を維持する。この遡りは
+  ステートレスで、毎回リクエスト自身のメッセージ履歴から再計算されるため、
+  同じリクエストはゲートウェイの再起動や設定リロードに関係なく常に同じ
+  分類になる。
 
 ## launch.<client> (任意の上級者向けキー)
 
@@ -117,8 +125,13 @@ last_user_text?, tokens_est, tools, has_image, stream}, routing{mode,
 matched_route, reason, …セマンティック時はスコアも}, resolved{provider, model, api, translation?},
 attempts[{n, target, result, ms}], usage?{in_tok, out_tok}`
 
-`routing.mode` は分類が走ったとき `semantic`、走れなかったとき
-`no_classifier` で、その場合は `default` にフォールバックしたことを意味します。
+`routing.mode` は、最新の user テキストで route が決まったとき(マッチ、
+または閾値未満のフォールバック)は `semantic`、最新のテキストが閾値未満で
+過去の user テキストがマッチしたときは `semantic_history`(どこまで遡ったかは
+`reason` に書かれる)、分類できる user テキストがそもそも無かったときは
+`no_text`、分類自体が走れなかったときは `no_classifier` です。`semantic` の
+マッチと `semantic_history` 以外はすべて `default` にフォールバックしたことを
+意味します。
 
 `resolved.translation` はリクエストがプロトコルをまたいだ場合にのみ存在し
 (例: `"anthropic-messages->openai-chat"`)、存在しなければレスポンスが

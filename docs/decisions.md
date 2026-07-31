@@ -2,6 +2,52 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-07-31 — Ambiguous turns keep their route via history walk-back, not a sticky cache
+
+Classifying only the last user message left agentic conversations falling to
+`default` on most turns, for two distinct reasons. First, an agentic client's
+newest user message is usually a bare `tool_result` with no text block at all,
+so `classification_text` returned `None` and the request fell back before the
+classifier even ran — misrecorded as `no_classifier` in the trace, though the
+classifier was fine. Second, a short human turn ("continue", "yes, do that")
+scores below the threshold on its own even though the conversation's task has
+not changed. Either way, one ambiguous turn dropped the rest of the
+conversation onto whatever `default` costs.
+
+**Rejected: a per-conversation sticky cache** (key = hash of the first user
+message, value = last route that cleared the threshold, in-memory, TTL'd).
+It re-creates state the request already carries: every request arrives with
+its full message history, so "the route this conversation last confirmed" is
+recomputable from the request alone. The cache also brought real failure
+modes for nothing — the key dies on context compaction (Claude Code rewrites
+the first message into a summary), common openers ("hi") alias unrelated
+sessions onto each other, a config hot-reload can leave the cache pointing at
+a route name that no longer resolves (a client-visible 404), and a restart,
+TTL expiry, or second gateway instance silently loses stickiness. Worst,
+routing decisions would stop being reproducible from the trace log alone.
+
+**Built: history walk-back in `classify_request`** (`src/server/proxy.rs`).
+`classification_texts` extracts every user message's text, newest first,
+skipping textless ones (`tool_result` turns, image-only messages, blank
+strings). The newest text is classified first — so a genuine topic change
+still wins immediately — and on a below-threshold score the walk tries
+earlier texts, taking the first that clears the bar, bounded by
+`HISTORY_WALK_LIMIT` (8; each embed is sub-millisecond, so the bound is a
+pathology cap, not a budget). Same request, same config ⇒ same route, on any
+gateway process at any time, with nothing to invalidate on hot-reload.
+
+The trace vocabulary grew to keep the decision explainable:
+`routing.mode = "semantic_history"` when an earlier text matched (the
+`reason` says how far back), and `"no_text"` when the request had nothing to
+classify — previously misreported as `no_classifier`. `SemanticAttempt`'s
+three booleans became one `SemanticOutcome` enum because five modes were
+being packed into `classified`/`matched`/`manual` combinations that could
+express impossible states.
+
+Out of scope, deliberately: what a route switch *loses* mid-conversation
+(provider-specific state like prompt caches and thinking blocks) is a
+translate/adapter concern, not a routing one, and is unchanged here.
+
 ## 2026-07-31 — route/fallback outcomes get their own console lines, `logging.logging` stays opt-in
 
 The previous entry below made `serve`'s console diagnostics opt-in behind

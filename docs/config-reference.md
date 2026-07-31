@@ -56,7 +56,7 @@ including the reserved `default` route.
 | field | default | notes |
 |---|---|---|
 | `title` | *(none)* | Display only. |
-| `description` | *(required on non-wildcard routes)* | Inline text, or a path when it starts with `./` `../` `/` `~/` (relative paths resolve against the config dir). This is the classification corpus: every request's last user message is embedded and compared against every non-wildcard route's `description`. Write it as "when should this route win?" |
+| `description` | *(required on non-wildcard routes)* | Inline text, or a path when it starts with `./` `../` `/` `~/` (relative paths resolve against the config dir). This is the classification corpus: every request's newest user text (walking back through history when the newest scores below the threshold — see "Classification behavior") is embedded and compared against every non-wildcard route's `description`. Write it as "when should this route win?" |
 | `model.default` | *(required)* | `"<provider>/<model>"`, split on the **first** `/` only — `openrouter/anthropic/claude-x` and `ollama-cloud/glm:cloud` both parse. `*` in the model part expands only when a wildcard route is actually resolved. |
 | `model.fallbacks` | `[]` | Tried in order, only before the first response byte, only on connect failure / timeout / 408 / 429 / 5xx. Must use providers with the same `api` as the default. |
 
@@ -85,6 +85,14 @@ If classification cannot run at all — for example a build without the default
   kept only for client-side UX and trace logs' `requested_model` field.
 - Similarity uses static `model2vec-rs` embeddings with a fixed cosine
   threshold `0.45` (`src/semantic/index.rs`). There is no per-route threshold.
+- The newest user text is classified first; a match routes the request and a
+  genuine topic change always wins immediately. When it scores below the
+  threshold — or the newest user message has no text at all (an agentic
+  `tool_result` turn) — classification walks back through up to 8 earlier user
+  texts and takes the most recent one that clears the bar, so a conversation
+  keeps its route across ambiguous turns. The walk is stateless: it reruns from
+  the request's own message history every time, so the same request always
+  classifies the same way regardless of gateway restarts or config reloads.
 
 ## launch.<client> (optional advanced key)
 
@@ -119,8 +127,13 @@ last_user_text?, tokens_est, tools, has_image, stream}, routing{mode,
 matched_route, reason, …scores when semantic}, resolved{provider, model, api, translation?},
 attempts[{n, target, result, ms}], usage?{in_tok, out_tok}`
 
-`routing.mode` is `semantic` when classification ran and `no_classifier` when
-it could not, in which case the request fell back to `default`.
+`routing.mode` is `semantic` when the newest user text decided the route
+(match or below-threshold fallback), `semantic_history` when the newest text
+scored below the threshold and an earlier user text matched instead (the
+`reason` says how far back), `no_text` when the request carried no classifiable
+user text at all, and `no_classifier` when classification could not run. Every
+mode except `semantic`'s match and `semantic_history` means the request fell
+back to `default`.
 
 `resolved.translation` is present only when the request crossed protocols
 (e.g. `"anthropic-messages->openai-chat"`); its absence means the response was
