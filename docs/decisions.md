@@ -2,6 +2,37 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-07-31 — `codex exec` too, rendered as `openai-chat`, with the verification gap recorded
+
+The same reasoning as the entry below, applied to a ChatGPT plan:
+`transport: "codex-cli"` runs `codex exec --json`. Two decisions differ.
+
+**It renders `openai-chat`, not the CLI's own shape.** Codex's events are not any
+published wire format, so the gateway has to pick a protocol to present, and chat
+completions is the one the most clients can reach — including Claude Code, through
+the translation that already exists. One synthesizer, every client.
+
+**Streaming is honest rather than simulated.** Codex emits *item-level* events: an
+`agent_message` arrives complete. So a streaming request gets a well-formed
+`openai-chat` stream that all arrives at once, and the text is deliberately *not*
+chopped into fake deltas. A synthetic token stream would look better and tell the
+client a lie about when the model produced what.
+
+Tool denial differs too, because the tools differ: `claude -p` takes
+`--allowedTools ""`, while Codex gets `--sandbox read-only` in an empty scratch
+directory, which is the narrowest posture it offers.
+`--dangerously-bypass-approvals-and-sandbox` is never passed.
+
+**What could not be verified, and this matters:** a *successful* generation. The
+ChatGPT account on the machine at hand refuses every model id tried — `gpt-5`,
+`gpt-5.1`, `gpt-5-codex`, `gpt-5.1-codex`, and the user's own configured
+`gpt-5.6-sol` — with "not supported when using Codex with a ChatGPT account".
+Verified instead: the whole path up to and including that refusal, arriving at the
+client as a clean `openai-chat` error carrying the CLI's own sentence. The success
+path rests on the event shapes observed live plus unit fixtures, so the first
+person with a working plan should re-check it. That is why the route scaffolded by
+`init` uses `default` (no `-m` at all) rather than a model id guessed from here.
+
 ## 2026-07-31 — Subscriptions are served by running the official client, not by holding its credential
 
 A Claude Pro/Max plan authenticates Claude Code. It is not an API key, and the

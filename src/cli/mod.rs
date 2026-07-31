@@ -5,3 +5,4 @@ pub mod init;
 pub mod providers;
 pub mod stats;
 pub mod trace;
+pub mod update;

@@ -92,20 +92,20 @@ async fn probe(client: &reqwest::Client, id: String, provider: ProviderConfig) -
     // A `claude-cli` provider has nothing to connect to. The equivalent question
     // is "is the binary there?", and answering it here keeps the table's
     // promise: every configured provider gets a verdict.
-    if provider.transport == crate::config::Transport::ClaudeCli {
-        let available = crate::agent::is_available();
+    if provider.transport.is_agent_cli() {
+        let available = crate::agent::is_available_for(provider.transport);
         return (
             Probe {
                 id,
-                base_url: format!("{} (local process)", crate::agent::claude_cli::PROGRAM),
+                base_url: format!("{} (local process)", agent_program(provider.transport)),
                 // The CLI holds its own login; there is no reference for us to
                 // resolve, so "resolved" means "the tool is installed".
                 key_resolved: available,
                 status: available.then_some(200),
                 error: (!available).then(|| {
                     format!(
-                        "`{}` not found on PATH — install Claude Code and run it once to log in",
-                        crate::agent::claude_cli::PROGRAM
+                        "`{}` not found on PATH — install it and log in once",
+                        agent_program(provider.transport)
                     )
                 }),
                 elapsed_ms: start.elapsed().as_millis() as u64,
@@ -161,4 +161,12 @@ async fn probe(client: &reqwest::Client, id: String, provider: ProviderConfig) -
     };
 
     (probe, provider.api)
+}
+
+/// The binary an agent transport runs, for the probe's messages.
+fn agent_program(transport: crate::config::Transport) -> &'static str {
+    match transport {
+        crate::config::Transport::CodexCli => crate::agent::codex_cli::PROGRAM,
+        _ => crate::agent::claude_cli::PROGRAM,
+    }
 }

@@ -52,6 +52,7 @@ llm-gateway init            # 対話形式; ~/.config/llm-gateway/config.json �
 llm-gateway serve           # 127.0.0.1:4000 でゲートウェイを起動
 llm-gateway launch claude   # Claude Code をゲートウェイ経由で起動
 llm-gateway stats           # ルートごとの消費量を表示
+llm-gateway update          # 最新リリースへ更新
 ```
 
 ## サポートしているクライアント
@@ -347,7 +348,16 @@ llm-gateway config check|show|gitignore
 llm-gateway stats [--by route|client|provider|model|day] [--since D] [--until D]
 llm-gateway trace [--tail] [--route R] [--client C]
 llm-gateway providers
+llm-gateway update [--check]
 ```
+
+`update` は GitHub に最新リリースを問い合わせ、このビルドが古ければ
+インストール方法に応じたアップグレードを実行します — Homebrew なら
+`brew upgrade`、`cargo install` なら `cargo install --force`(`semantic`
+feature は維持)。自分のバイナリを上書きすることはありません: それをすると
+パッケージマネージャーが古いバージョンがまだあると思い込むためです。手で
+配置したバイナリの場合はリリースのリンクを表示します。`--check` は何も
+変更せず報告だけします。
 
 ## フォールバックがやること(と、やらないこと)
 

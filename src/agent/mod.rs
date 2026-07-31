@@ -22,6 +22,7 @@
 //! process-backed upstream cannot carry (the caller's tools, above all).
 
 pub mod claude_cli;
+pub mod codex_cli;
 
 use std::process::Stdio;
 
@@ -48,6 +49,19 @@ pub struct Spawned {
 /// response with an Anthropic error body, because by then the request has an
 /// upstream and the client deserves the reason rather than a gateway error.
 pub async fn spawn(
+    target: &Target,
+    payload: &serde_json::Value,
+    streaming: bool,
+) -> Result<Spawned> {
+    match target.transport {
+        crate::config::Transport::CodexCli => spawn_codex(target, payload, streaming).await,
+        // `Http` cannot reach here: `upstream` only calls this for an agent
+        // transport.
+        _ => spawn_claude(target, payload, streaming).await,
+    }
+}
+
+async fn spawn_claude(
     target: &Target,
     payload: &serde_json::Value,
     streaming: bool,
@@ -102,6 +116,97 @@ pub async fn spawn(
         })
     } else {
         buffered_body(child, model).await
+    }
+}
+
+/// Run one request against `codex exec`.
+///
+/// Buffered rather than streamed, because Codex's events are item-level: the
+/// assistant message arrives complete, so there is nothing to forward
+/// incrementally. A streaming request still gets a well-formed `openai-chat`
+/// stream — it simply all arrives at once. See [`codex_cli`].
+async fn spawn_codex(
+    target: &Target,
+    payload: &serde_json::Value,
+    streaming: bool,
+) -> Result<Spawned> {
+    let cwd = scratch_dir()?;
+    let args = codex_cli::args(&target.model_ref.model, &cwd, &target.agent_args);
+    let prompt = codex_cli::prompt(payload);
+
+    let mut command = tokio::process::Command::new(codex_cli::PROGRAM);
+    command
+        .args(&args)
+        .current_dir(&cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    for name in codex_cli::STRIPPED_ENV {
+        command.env_remove(name);
+    }
+
+    let mut child = command.spawn().map_err(|source| {
+        Error::Other(format!(
+            "could not start `{}` for provider `{}`: {source}. \
+             A `codex-cli` provider needs the Codex CLI installed and logged in.",
+            codex_cli::PROGRAM,
+            target.model_ref.provider,
+        ))
+    })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(prompt.as_bytes()).await;
+        drop(stdin);
+    }
+
+    let output = child.wait_with_output().await?;
+    let model = target.model_ref.model.clone();
+
+    match codex_cli::result_from_jsonl(&output.stdout) {
+        Ok((text, usage)) => {
+            let (headers, bytes) = if streaming {
+                (
+                    sse_headers(),
+                    Bytes::from(codex_cli::chat_stream(&text, usage, &model)),
+                )
+            } else {
+                (
+                    json_headers(),
+                    Bytes::from(codex_cli::chat_completion(&text, usage, &model).to_string()),
+                )
+            };
+            Ok(Spawned {
+                status: http::StatusCode::OK,
+                headers,
+                body: Box::pin(futures_util::stream::once(async move { Ok(bytes) })),
+            })
+        }
+        Err(failure) => {
+            // When the CLI said what went wrong, that sentence is the whole
+            // story — "this model is not supported when using Codex with a
+            // ChatGPT account" tells a user exactly what to change, and
+            // appending stderr to it only adds progress noise.
+            let message = match failure {
+                codex_cli::Failure::Reported(reason) => reason,
+                codex_cli::Failure::Silent => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    if stderr.is_empty() {
+                        "codex produced no assistant message".to_string()
+                    } else {
+                        format!(
+                            "codex produced no assistant message: {}",
+                            stderr.chars().take(300).collect::<String>()
+                        )
+                    }
+                }
+            };
+            let bytes = Bytes::from(codex_cli::chat_error(&message).to_string());
+            Ok(Spawned {
+                status: http::StatusCode::BAD_GATEWAY,
+                headers: json_headers(),
+                body: Box::pin(futures_util::stream::once(async move { Ok(bytes) })),
+            })
+        }
     }
 }
 
@@ -235,8 +340,12 @@ async fn buffered_body(child: tokio::process::Child, model: String) -> Result<Sp
 /// Whether the CLI this transport needs is installed. Used by
 /// `llm-gateway providers`, which has no request to send but can still answer
 /// "would this provider work at all?".
-pub fn is_available() -> bool {
-    std::process::Command::new(claude_cli::PROGRAM)
+pub fn is_available_for(transport: crate::config::Transport) -> bool {
+    let program = match transport {
+        crate::config::Transport::CodexCli => codex_cli::PROGRAM,
+        _ => claude_cli::PROGRAM,
+    };
+    std::process::Command::new(program)
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())

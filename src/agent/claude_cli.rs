@@ -86,15 +86,17 @@ pub const PROGRAM: &str = "claude";
 /// `opus`) and full ids, so `claude-cli/sonnet` and
 /// `claude-cli/claude-sonnet-4-6` both work without a mapping table here.
 pub fn args(model: &str, system: Option<&str>, streaming: bool, extra: &[String]) -> Vec<String> {
-    let mut args = vec![
-        "-p".to_string(),
+    let mut args = vec!["-p".to_string()];
+    if !super::codex_cli::is_cli_default(model) {
+        args.push("--model".to_string());
+        args.push(model.to_string());
+    }
+    args.extend([
         // `stream-json` is the only format that reports usage and stop_reason;
         // `--verbose` is required alongside it for `-p`.
         "--output-format".to_string(),
         "stream-json".to_string(),
         "--verbose".to_string(),
-        "--model".to_string(),
-        model.to_string(),
         // See the module docs: these four turn a Claude Code session into a
         // text generator that cannot loop back into this gateway.
         "--allowedTools".to_string(),
@@ -102,7 +104,7 @@ pub fn args(model: &str, system: Option<&str>, streaming: bool, extra: &[String]
         "--setting-sources".to_string(),
         "project".to_string(),
         "--strict-mcp-config".to_string(),
-    ];
+    ]);
 
     if let Some(system) = system.map(str::trim).filter(|s| !s.is_empty()) {
         // Replaces Claude Code's own agent preamble rather than appending to it

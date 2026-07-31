@@ -138,7 +138,7 @@ differ; same-protocol traffic never enters this code path.
   request (human turn vs tool loop); a gateway-wide constant would be wrong half
   the time.
 
-## Agent CLI transport (`claude-cli`)
+## Agent CLI transports (`claude-cli`, `codex-cli`)
 
 - **The child must not be able to call the gateway.** `~/.claude/settings.json`'s
   `env` block can set `ANTHROPIC_BASE_URL`, and an inherited environment can too;
@@ -162,6 +162,21 @@ differ; same-protocol traffic never enters this code path.
   and `--include-partial-messages` is what turns the output into real Anthropic
   stream events. Without the latter you get one complete message and no
   streaming.
+- **`codex-cli` strips `OPENAI_API_KEY` as well.** With it set, `codex` bills an
+  API account for what the user asked to run on their subscription — the exact
+  opposite of the point, and invisible until the invoice.
+- **Codex's events are item-level, not token-level.** An `agent_message` arrives
+  complete, so there is nothing to stream incrementally; the gateway synthesizes a
+  well-formed `openai-chat` stream that all arrives at once. Do not "fix" this by
+  chunking the text — a fake token stream is worse than an honest late one.
+- **Codex nests upstream errors as JSON inside its own `message`.** The useful
+  sentence is `error.message` of the inner object; forwarding the envelope shows
+  the user a wall of escaped quotes instead of "this model is not supported when
+  using Codex with a ChatGPT account".
+- **A plan can refuse every model you try.** Verified: a ChatGPT account rejected
+  `gpt-5`, `gpt-5.1`, `gpt-5-codex`, `gpt-5.1-codex` and the user's own configured
+  default. `codex-cli` routes therefore scaffold `default` (no `-m` flag at all),
+  and a rejection surfaces as the CLI's own message rather than a gateway error.
 - **`count_tokens` must never spawn.** There is no way to count tokens with the
   CLI short of running a whole generation, so a `claude-cli` target takes the
   local-estimate path instead (`estimated_locally` in the trace log). Wiring it

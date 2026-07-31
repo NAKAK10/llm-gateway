@@ -51,6 +51,7 @@ llm-gateway init            # interactive; writes ~/.config/llm-gateway/config.j
 llm-gateway serve           # start the gateway on 127.0.0.1:4000
 llm-gateway launch claude   # start Claude Code through the gateway
 llm-gateway stats           # what was spent, per route
+llm-gateway update          # upgrade to the latest release
 ```
 
 ## Supported clients
@@ -203,17 +204,37 @@ Full list of what is and is not carried across: `docs/gotchas.md`.
 ## Subscription-backed providers
 
 A subscription is not an API key. A Claude Pro/Max plan authenticates *Claude
-Code*, and no credential the gateway could hold would let it speak to Anthropic
-on that plan's behalf. So for that one case the gateway does not hold a
-credential — it runs the official client, which already has the login:
+Code* and a ChatGPT plan authenticates *Codex*; no credential the gateway could
+hold would let it speak to either provider on those plans' behalf. So for those
+cases the gateway does not hold a credential — it runs the official client, which
+already has the login. `llm-gateway init` asks which you want:
+
+```
+Anthropic: how do you pay for it?
+  API key                    per-token billing; full API features
+  Subscription (via `claude`)  no key; generation only — your tools are not passed through
+```
+
+| transport | runs | renders as | verified |
+|---|---|---|---|
+| `claude-cli` | `claude -p` | `anthropic-messages` | yes — streaming, tools-denied, end to end |
+| `codex-cli` | `codex exec` | `openai-chat` | plumbing and error paths only; see below |
+
+Choosing a subscription does not remove the API-key provider — a plan is good for
+generation and a key is good for anything needing tools, so a config can hold
+both and routes pick per request.
 
 ```json5
 providers: {
   // No baseUrl, no apiKey: the CLI authenticates itself.
-  "claude-subscription": { api: "anthropic-messages", transport: "claude-cli" },
+  "anthropic-subscription": { api: "anthropic-messages", transport: "claude-cli" },
+  "openai-subscription": { api: "openai-chat", transport: "codex-cli" },
 },
 routes: {
-  "role-sub": { model: { default: "claude-subscription/sonnet" } },
+  "role-sub": { model: { default: "anthropic-subscription/sonnet" } },
+  // `default` means "whatever the CLI is configured to use" — which models a
+  // ChatGPT plan allows is not knowable from here.
+  "role-codex": { model: { default: "openai-subscription/default" } },
 }
 ```
 
@@ -229,6 +250,9 @@ The limits are the CLI's, and they are real:
 - **One prompt.** A `messages` array is flattened into a labelled transcript.
 - **~5s of process startup per call**, and `temperature` / `top_p` /
   `stop_sequences` / `max_tokens` are dropped — the CLI has no equivalents.
+- **`codex-cli` cannot stream token by token.** Codex's events are item-level, so
+  the answer arrives complete; the gateway still emits a well-formed stream, it
+  just arrives at once. `claude-cli` streams properly.
 - Requests count against your **subscription's** limits, not an API balance.
 
 What does survive: real streaming (the CLI emits Anthropic stream events, which
@@ -334,7 +358,16 @@ llm-gateway config check|show|gitignore
 llm-gateway stats [--by route|client|provider|model|day] [--since D] [--until D]
 llm-gateway trace [--tail] [--route R] [--client C]
 llm-gateway providers
+llm-gateway update [--check]
 ```
+
+`update` asks GitHub for the latest release and, if this build is behind, runs
+the upgrade that matches how it was installed — `brew upgrade` for a Homebrew
+install, `cargo install --force` (keeping the `semantic` feature) for a
+`cargo install` one. It never overwrites its own binary: that would leave a
+package manager believing the old version is still there. For a hand-placed
+binary it prints the release link instead. `--check` reports without changing
+anything.
 
 ## What fallback does (and does not) do
 
