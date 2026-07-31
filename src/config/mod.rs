@@ -462,18 +462,6 @@ impl ModelRef {
             model: model.to_string(),
         })
     }
-
-    /// Substitute `*` in the model part with the model the client asked for.
-    ///
-    /// This is what lets `claude-*` → `anthropic/*` forward
-    /// `claude-sonnet-4-6` untouched, so client-side model names never have to
-    /// be rewritten and stay correct as vendors publish new ids.
-    pub fn expand(&self, requested: &str) -> Self {
-        Self {
-            provider: self.provider.clone(),
-            model: self.model.replace('*', requested),
-        }
-    }
 }
 
 impl std::fmt::Display for ModelRef {

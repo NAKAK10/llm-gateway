@@ -63,11 +63,11 @@ providers: {
 routes: {
   "role-sub": {
     description: "ローカルの Claude CLI を通して自分の Claude サブスクリプションで処理すべき依頼。生成専用で、呼び出し元のツールは渡されない。",
-    model: { default: "claude-subscription/sonnet" },
+    model: { default: "claude-subscription/claude-sonnet-5" },
   },
   "default": {
     description: "他の route に明確に当てはまらないリクエストの受け皿。",
-    model: { default: "anthropic/*" },
+    model: { default: "anthropic/claude-sonnet-4-6" },
   },
 }
 ```
@@ -88,7 +88,7 @@ routes: {
 — ツール、マルチターン、API 定義どおりのストリーミング込みで — API
 アクセスを売っているプロバイダーから買うことになります:
 
-- **OpenRouter** — `openrouter-anthropic/anthropic/*`。Anthropic のワイヤー
+- **OpenRouter** — `openrouter-anthropic/anthropic/<model>`。Anthropic のワイヤー
   プロトコルなので変換なし。
 - **GitHub Copilot** — 公式の API を持つサブスクリプションなので、Copilot の
   プランはゲートウェイのトラフィックを実際に処理できます。`docs/ja/providers.md`
@@ -118,7 +118,7 @@ providers: {
 routes: {
   "default": {
     description: "他の route に明確に当てはまらないリクエストの受け皿。",
-    model: { default: "anthropic/*" },
+    model: { default: "anthropic/claude-sonnet-4-6" },
   },
   "role-cheap": {
     description: "短い定型作業: 要約、整形、コミットメッセージ生成",

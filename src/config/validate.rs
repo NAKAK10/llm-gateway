@@ -196,6 +196,15 @@ fn resolve_target<'a>(
         }
     };
 
+    if model_ref.model.contains('*') {
+        report.error(format!(
+            "route `{route_name}`: {role} model `{raw}` contains a wildcard `*`; routing is \
+             decided purely by content classification now, so a wildcard model can no longer be \
+             resolved to anything meaningful — use an explicit \"<provider>/<model>\" instead"
+        ));
+        return None;
+    }
+
     match config.providers.get_key_value(model_ref.provider.as_str()) {
         Some((id, provider)) => {
             used_providers.insert(id.as_str());
@@ -422,12 +431,28 @@ mod tests {
     #[test]
     fn wildcard_route_name_is_allowed_without_a_description() {
         let mut c = minimal_config();
-        let mut wildcard = route("anthropic/*", &[]);
+        let mut wildcard = route("anthropic/sonnet-pinned", &[]);
         wildcard.description = None;
         c.routes.insert("claude-*".into(), wildcard);
 
         let report = validate(&c, &nonexistent_path());
         assert!(report.is_ok(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn wildcard_model_is_rejected() {
+        let mut c = minimal_config();
+        let mut wildcard = route("anthropic/*", &[]);
+        wildcard.description = None;
+        c.routes.insert("claude-*".into(), wildcard);
+
+        let report = validate(&c, &nonexistent_path());
+        assert!(!report.is_ok());
+        assert!(
+            report.errors.iter().any(|e| e.contains("wildcard")),
+            "{:?}",
+            report.errors
+        );
     }
 
     /// A `claude-cli` provider needs neither of the two fields every other

@@ -2,6 +2,51 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-07-31 — Model wildcards abolished; `init` stops scaffolding a dead subscription route
+
+`stats`'s per-model table started showing route names (`role-anthropic`,
+`default`) instead of real model ids. Tracing it back turned up a second,
+unrelated bug in the same area, both fixed here.
+
+**Bug: a route's `*` model wildcard silently sent the route name upstream as
+the model.** `ModelRef::expand(requested)` (`src/config/mod.rs`) substituted
+`*` in a route's model with whatever `requested` was — a holdover from when
+routing matched the client's requested model string by prefix. Since "Always
+classify" (the entry above this one) made `requested` always the *matched
+route name* instead, a route configured as `anthropic/*` sent the literal
+string `"role-anthropic"` upstream as the model on every request — a
+guaranteed failure, and the reason `stats` showed route names where a model
+belonged. `ModelRef::expand` is now gone, `route::resolve` uses the parsed
+model as-is, and `src/config/validate.rs` rejects any route model containing
+`*` outright: routing is decided purely by content classification now, so
+there is nothing left for a `*` to stand in for. Route-*name* wildcards
+(`claude-*` → prefix matching) are unrelated and still work exactly as
+before.
+
+**Bug: choosing "Subscription" for a provider in `init` scaffolded a second,
+always-broken route anyway.** `build_config_with_auth` used to write the
+plain API-key provider and `role-<id>` route for *every* selected provider,
+even one whose credential the user just said was a subscription — with no
+key to put in it, that route's `apiKey` was always empty and every request
+through it always failed. `init` now skips the plain provider and route
+entirely when Subscription is chosen for that provider; add it back by hand
+later if a route that needs tools (which the subscription transport does not
+forward) turns out to be wanted alongside it.
+
+**The wizard now asks for an explicit model per route, and `init.rs`'s
+auto-fallback wildcards are gone.** Each selected non-subscription provider's
+`role-<id>` route needs a real `<provider>/<model>` now; the wizard prompts
+for one, pre-filled with `KnownProvider::default_model()`'s suggestion.
+`init`'s auto-added cross-provider fallbacks
+(`openrouter-anthropic/anthropic/*`, `openrouter/openai/*`) used the same
+mechanism and are dropped rather than replaced — guessing a matching model on
+a different provider was never reliable, and a fallback is now something a
+user opts into by hand. `KnownProvider::subscription_model()` for Anthropic
+changed from the alias `"sonnet"` to the full id `"claude-sonnet-5"`: the
+natural-looking next guess, `"sonnet-5"`, is not a valid alias and resolves to
+`model_not_found` — confirmed by direct `claude -p` invocation before landing
+this.
+
 ## 2026-07-31 — `init` asks before it regenerates, instead of just refusing
 
 Running `init` over an existing `config.json` used to print "edit it directly"
