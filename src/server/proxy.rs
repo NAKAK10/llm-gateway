@@ -47,6 +47,20 @@ use crate::semantic::index::CLASSIFICATION_THRESHOLD;
 #[cfg(not(feature = "semantic"))]
 const CLASSIFICATION_THRESHOLD: f32 = 0.45;
 
+/// How many of the request's user texts (newest first) classification tries
+/// before falling back to the reserved `default` route.
+///
+/// Agentic clients routinely send turns whose newest user message is a
+/// `tool_result` with no text, or a short reply ("continue", "yes") that
+/// scores below the threshold on its own. The conversation history that
+/// arrives with every request already holds the instruction such a turn is
+/// continuing, so classification walks back to the most recent user text
+/// that clears the threshold instead of keeping per-conversation state in
+/// the gateway. The bound exists only to cap work on pathological inputs;
+/// each embed is sub-millisecond, so eight is generous, not tight.
+#[cfg_attr(not(feature = "semantic"), allow(dead_code))]
+const HISTORY_WALK_LIMIT: usize = 8;
+
 /// Whether classification should run for this request.
 ///
 /// Defaults to `true` (the historical always-classify behaviour) so a
@@ -110,12 +124,10 @@ pub async fn proxy(
     } else {
         SemanticAttempt {
             resolve_as: requested_model.clone(),
-            classified: false,
-            matched: false,
+            outcome: SemanticOutcome::Manual,
             candidates: Vec::new(),
             score: None,
             embed_ms: 0,
-            manual: true,
         }
     };
     let resolve_target = semantic_attempt.resolve_as.as_str();
@@ -527,78 +539,115 @@ fn trace_record(
 /// [`trace_record`] needs to fill in [`TraceRouting`].
 ///
 /// `resolve_as` is what actually went into `route::resolve`: the winning
-/// candidate's route name, or the reserved `default` route
-/// (`crate::config::DEFAULT_ROUTE`) when nothing cleared the threshold or
-/// classification did not run at all.
+/// candidate's route name, the reserved `default` route
+/// (`crate::config::DEFAULT_ROUTE`) when nothing matched, or the model name
+/// the client sent when classification was skipped on purpose
+/// ([`SemanticOutcome::Manual`]).
 struct SemanticAttempt {
     resolve_as: String,
-    /// Whether the classifier actually ran (embedding model loaded, text
-    /// extracted) — as opposed to being unavailable, in which case
-    /// `resolve_as` is `default` unconditionally and there is nothing to
-    /// show a trace reader beyond "no classifier".
-    classified: bool,
-    matched: bool,
+    outcome: SemanticOutcome,
+    /// The scored candidate list of the embed that decided the outcome: the
+    /// matching text's on a match, the newest text's on a
+    /// below-threshold fallback (to show how close the closest came).
     candidates: Vec<TraceCandidate>,
     score: Option<f32>,
+    /// Total embedding time across every text the history walk tried.
     embed_ms: u64,
-    /// `true` when classification was skipped on purpose because the
-    /// request carried `x-gw-auto-route: 0` — as opposed to `!classified`,
-    /// which means classification was attempted (or would have been) but
-    /// unavailable. `resolve_as` is the model name the client sent, not
-    /// `default`.
-    manual: bool,
+}
+
+/// Why `resolve_as` ended up being what it is — one variant per
+/// `routing.mode` value the trace log can report.
+///
+/// The `allow(dead_code)`: a `--no-default-features` build never constructs
+/// the classifier-driven variants, but `routing_from` must still describe
+/// them — the enum is the trace vocabulary, not just what one build emits.
+#[cfg_attr(not(feature = "semantic"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticOutcome {
+    /// The request carried `x-gw-auto-route: 0`: classification skipped on
+    /// purpose, `resolve_as` is the model name the client sent.
+    Manual,
+    /// No classifier was available (unloaded embedding model, or a build
+    /// without the `semantic` feature): `resolve_as` is `default`
+    /// unconditionally.
+    NoClassifier,
+    /// A classifier was available but the request carried no user text to
+    /// classify anywhere in its history — e.g. every user message is a
+    /// bare `tool_result`. Distinct from [`SemanticOutcome::NoClassifier`]
+    /// so the trace does not blame a missing classifier for a textless
+    /// request.
+    NoText,
+    /// A user text cleared the threshold. `texts_back` is how far the
+    /// history walk went to find it: `0` is the newest user text (the
+    /// everyday case, `routing.mode = "semantic"`), `n > 0` means the
+    /// newest `n` texts scored below the threshold and an earlier one
+    /// matched (`routing.mode = "semantic_history"`).
+    Matched { texts_back: usize },
+    /// User texts existed but none of the `texts_tried` newest ones cleared
+    /// the threshold: fall back to `default`.
+    BelowThreshold { texts_tried: usize },
 }
 
 /// Build the `routing` block of a trace record.
 fn routing_from(resolution: &route::Resolution, attempt: SemanticAttempt) -> TraceRouting {
-    if attempt.manual {
-        return TraceRouting {
-            mode: "manual".to_string(),
-            matched_route: resolution.route_name.clone(),
-            reason: "x-gw-auto-route: 0; classification skipped, routed by the model name \
-                     the client sent"
+    let (mode, reason) = match attempt.outcome {
+        SemanticOutcome::Manual => (
+            "manual",
+            "x-gw-auto-route: 0; classification skipped, routed by the model name \
+             the client sent"
                 .to_string(),
-            candidates: Vec::new(),
-            score: None,
-            threshold: None,
-            embed_ms: None,
-        };
-    }
-
-    if !attempt.classified {
-        return TraceRouting {
-            mode: "no_classifier".to_string(),
-            matched_route: resolution.route_name.clone(),
-            reason: format!(
+        ),
+        SemanticOutcome::NoClassifier => (
+            "no_classifier",
+            format!(
                 "no classifier available; falling back to the reserved `{}` route",
                 crate::config::DEFAULT_ROUTE
             ),
-            candidates: Vec::new(),
-            score: None,
-            threshold: None,
-            embed_ms: None,
-        };
-    }
-
-    let reason = if attempt.matched {
-        "semantic classification matched a candidate".to_string()
-    } else {
-        format!(
-            "semantic classification: best candidate did not clear threshold {:.2}; \
-             falling back to the reserved `{}` route",
-            CLASSIFICATION_THRESHOLD,
-            crate::config::DEFAULT_ROUTE
-        )
+        ),
+        SemanticOutcome::NoText => (
+            "no_text",
+            format!(
+                "the request carries no classifiable user text; falling back to the \
+                 reserved `{}` route",
+                crate::config::DEFAULT_ROUTE
+            ),
+        ),
+        SemanticOutcome::Matched { texts_back: 0 } => (
+            "semantic",
+            "semantic classification matched a candidate".to_string(),
+        ),
+        SemanticOutcome::Matched { texts_back } => (
+            "semantic_history",
+            format!(
+                "the newest user text did not clear threshold {CLASSIFICATION_THRESHOLD:.2}; \
+                 the user text {texts_back} message{} back matched",
+                if texts_back == 1 { "" } else { "s" },
+            ),
+        ),
+        SemanticOutcome::BelowThreshold { texts_tried } => (
+            "semantic",
+            format!(
+                "semantic classification: none of the newest {texts_tried} user text{} \
+                 cleared threshold {CLASSIFICATION_THRESHOLD:.2}; falling back to the \
+                 reserved `{}` route",
+                if texts_tried == 1 { "" } else { "s" },
+                crate::config::DEFAULT_ROUTE,
+            ),
+        ),
     };
 
+    let ran = matches!(
+        attempt.outcome,
+        SemanticOutcome::Matched { .. } | SemanticOutcome::BelowThreshold { .. }
+    );
     TraceRouting {
-        mode: "semantic".to_string(),
+        mode: mode.to_string(),
         matched_route: resolution.route_name.clone(),
         reason,
         candidates: attempt.candidates,
         score: attempt.score,
-        threshold: Some(CLASSIFICATION_THRESHOLD),
-        embed_ms: Some(attempt.embed_ms),
+        threshold: ran.then_some(CLASSIFICATION_THRESHOLD),
+        embed_ms: ran.then_some(attempt.embed_ms),
     }
 }
 
@@ -606,10 +655,16 @@ fn routing_from(resolution: &route::Resolution, attempt: SemanticAttempt) -> Tra
 ///
 /// Always attempted, regardless of what model name the client sent — the
 /// requested model name plays no part in route selection anymore.
-/// `classified` is `false` (and `resolve_as` is the reserved `default`
-/// route) only when the classifier was not loaded (should not happen on a
-/// normally started server — see `crate::server::prepare_classifier`) or the
-/// request's last user message could not be extracted at all.
+///
+/// The newest user text is tried first, so a genuine topic change always
+/// wins immediately. When it scores below the threshold — or the newest
+/// user message carries no text at all, the normal state of an agentic
+/// turn whose last message is a `tool_result` — the walk continues to
+/// earlier user texts (bounded by [`HISTORY_WALK_LIMIT`]) and takes the
+/// first that clears the bar. The conversation history that arrives with
+/// every request is the only state this needs: the same request always
+/// classifies the same way, no matter which gateway process sees it or
+/// when.
 #[cfg(feature = "semantic")]
 fn classify_request(
     state: &AppState,
@@ -617,81 +672,106 @@ fn classify_request(
     payload: &serde_json::Value,
     expected_api: ApiKind,
 ) -> SemanticAttempt {
-    let fallback = || SemanticAttempt {
+    let fallback = |outcome: SemanticOutcome| SemanticAttempt {
         resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
-        classified: false,
-        matched: false,
+        outcome,
         candidates: Vec::new(),
         score: None,
         embed_ms: 0,
-        manual: false,
     };
 
+    // Texts before classifier: a textless request falls back no matter
+    // what, and "no user text" is the more precise reason to record for it.
+    let texts = classification_texts(expected_api, payload);
+    if texts.is_empty() {
+        return fallback(SemanticOutcome::NoText);
+    }
     let Some(classifier) = state.classifier.as_ref() else {
-        return fallback();
-    };
-    let Some(text) = classification_text(expected_api, payload) else {
-        return fallback();
+        return fallback(SemanticOutcome::NoClassifier);
     };
 
-    let verdict = classifier.classify(&text, expected_api);
+    let as_trace = |candidates: &[(String, f32)]| -> Vec<TraceCandidate> {
+        candidates
+            .iter()
+            .map(|(route, score)| TraceCandidate {
+                route: route.clone(),
+                score: *score,
+            })
+            .collect()
+    };
 
-    let candidates: Vec<TraceCandidate> = verdict
-        .candidates
-        .iter()
-        .map(|(route, score)| TraceCandidate {
-            route: route.clone(),
-            score: *score,
-        })
-        .collect();
-    // The top candidate's score regardless of whether it cleared the
-    // threshold — useful in the trace log even on a fallback, to show how
-    // close the closest candidate came.
-    let score = verdict.candidates.first().map(|(_, score)| *score);
+    let mut embed_ms_total = 0;
+    // The newest text's verdict, kept for the fallback trace record: on a
+    // below-threshold fallback the newest text's candidate list is the one
+    // that shows how close the closest candidate came.
+    let mut newest_verdict = None;
+    let texts_tried = texts.len().min(HISTORY_WALK_LIMIT);
 
-    match verdict.matched {
-        Some((route, matched_score)) => {
+    for (texts_back, text) in texts.iter().take(HISTORY_WALK_LIMIT).enumerate() {
+        let verdict = classifier.classify(text, expected_api);
+        embed_ms_total += verdict.embed_ms;
+
+        if let Some((route, matched_score)) = verdict.matched.clone() {
             // Console visibility for "did the embedding classifier actually
             // run, and what did it pick" — gated behind `logging.logging`
             // (on by default) via the console filter in `server::init_tracing`.
-            tracing::info!(
-                route = %route,
-                score = matched_score,
-                embed_ms = verdict.embed_ms,
-                "classified request to route `{route}` (score {matched_score:.3}, embed {}ms)",
-                verdict.embed_ms,
-            );
-            SemanticAttempt {
+            if texts_back == 0 {
+                tracing::info!(
+                    route = %route,
+                    score = matched_score,
+                    embed_ms = embed_ms_total,
+                    "classified request to route `{route}` (score {matched_score:.3}, embed {}ms)",
+                    embed_ms_total,
+                );
+            } else {
+                tracing::info!(
+                    route = %route,
+                    score = matched_score,
+                    texts_back = texts_back,
+                    embed_ms = embed_ms_total,
+                    "classified request to route `{route}` from the user text {texts_back} \
+                     message{} back (score {matched_score:.3}, embed {}ms)",
+                    if texts_back == 1 { "" } else { "s" },
+                    embed_ms_total,
+                );
+            }
+            let score = verdict.candidates.first().map(|(_, score)| *score);
+            return SemanticAttempt {
                 resolve_as: route,
-                classified: true,
-                matched: true,
-                candidates,
+                outcome: SemanticOutcome::Matched { texts_back },
+                candidates: as_trace(&verdict.candidates),
                 score,
-                embed_ms: verdict.embed_ms,
-                manual: false,
-            }
+                embed_ms: embed_ms_total,
+            };
         }
-        None => {
-            tracing::info!(
-                route = %crate::config::DEFAULT_ROUTE,
-                score = score,
-                embed_ms = verdict.embed_ms,
-                "no route cleared the classification threshold (closest score {}), \
-                 falling back to `{}` (embed {}ms)",
-                score.map(|s| format!("{s:.3}")).unwrap_or_else(|| "n/a".to_string()),
-                crate::config::DEFAULT_ROUTE,
-                verdict.embed_ms,
-            );
-            SemanticAttempt {
-                resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
-                classified: true,
-                matched: false,
-                candidates,
-                score,
-                embed_ms: verdict.embed_ms,
-                manual: false,
-            }
+        if texts_back == 0 {
+            newest_verdict = Some(verdict);
         }
+    }
+
+    let newest = newest_verdict.expect("texts is non-empty, so the newest text was classified");
+    // The newest text's top score regardless of whether it cleared the
+    // threshold — useful in the trace log even on a fallback, to show how
+    // close the closest candidate came.
+    let score = newest.candidates.first().map(|(_, score)| *score);
+    tracing::info!(
+        route = %crate::config::DEFAULT_ROUTE,
+        score = score,
+        texts_tried = texts_tried,
+        embed_ms = embed_ms_total,
+        "none of the newest {texts_tried} user text{} cleared the classification threshold \
+         (closest score {} on the newest), falling back to `{}` (embed {}ms)",
+        if texts_tried == 1 { "" } else { "s" },
+        score.map(|s| format!("{s:.3}")).unwrap_or_else(|| "n/a".to_string()),
+        crate::config::DEFAULT_ROUTE,
+        embed_ms_total,
+    );
+    SemanticAttempt {
+        resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
+        outcome: SemanticOutcome::BelowThreshold { texts_tried },
+        candidates: as_trace(&newest.candidates),
+        score,
+        embed_ms: embed_ms_total,
     }
 }
 
@@ -704,26 +784,40 @@ fn classify_request(
 ) -> SemanticAttempt {
     SemanticAttempt {
         resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
-        classified: false,
-        matched: false,
+        outcome: SemanticOutcome::NoClassifier,
         candidates: Vec::new(),
         score: None,
         embed_ms: 0,
-        manual: false,
     }
 }
 
-/// The last user message's text, untruncated — used for semantic
-/// classification. `Embedder::embed` does its own bounding (800 chars / 64
+/// Every user message's text, newest first, untruncated — the candidate
+/// texts for semantic classification.
+///
+/// A user message with no text — an Anthropic `tool_result` turn, an
+/// image-only message — contributes nothing rather than an empty entry, so
+/// the history walk only ever spends its bounded attempts on text that can
+/// actually score. `Embedder::embed` does its own bounding (800 chars / 64
 /// tokens), so the 200-character truncation `extract_input` applies for the
 /// trace log must not leak into what gets classified.
 #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
-fn classification_text(api: ApiKind, payload: &serde_json::Value) -> Option<String> {
+fn classification_texts(api: ApiKind, payload: &serde_json::Value) -> Vec<String> {
     let messages = match api {
         ApiKind::OpenaiResponses => payload.get("input"),
         _ => payload.get("messages"),
     };
-    last_user_text(api, messages)
+    match messages {
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => vec![s.clone()],
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .rev()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .filter_map(|m| m.get("content"))
+            .filter_map(|content| content_text(api, content))
+            .filter(|text| !text.trim().is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn now_rfc3339() -> String {
@@ -908,20 +1002,55 @@ mod tests {
     }
 
     #[test]
-    fn classification_text_is_not_truncated_unlike_the_trace_log_version() {
+    fn classification_texts_are_not_truncated_unlike_the_trace_log_version() {
         // `Embedder::embed` does its own bounding (800 chars); the 200-char
         // truncation `extract_input` applies for the trace log must not
         // leak into what actually gets classified.
         let long = "a".repeat(300);
         let payload = json!({ "messages": [{"role": "user", "content": long.clone()}] });
-        let text = classification_text(ApiKind::AnthropicMessages, &payload).unwrap();
-        assert_eq!(text, long);
+        let texts = classification_texts(ApiKind::AnthropicMessages, &payload);
+        assert_eq!(texts, vec![long]);
     }
 
     #[test]
-    fn classification_text_is_none_without_a_user_message() {
+    fn classification_texts_are_empty_without_a_user_message() {
         let payload = json!({});
-        assert!(classification_text(ApiKind::OpenaiChat, &payload).is_none());
+        assert!(classification_texts(ApiKind::OpenaiChat, &payload).is_empty());
+    }
+
+    #[test]
+    fn classification_texts_are_newest_first() {
+        let payload = json!({ "messages": [
+            {"role": "user", "content": "write the parser"},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "now test it"},
+        ]});
+        let texts = classification_texts(ApiKind::AnthropicMessages, &payload);
+        assert_eq!(texts, vec!["now test it", "write the parser"]);
+    }
+
+    #[test]
+    fn classification_texts_skip_textless_user_messages() {
+        // The everyday agentic turn: the newest user message is a bare
+        // `tool_result` with no text block at all. It must contribute
+        // nothing, leaving the last real instruction as the newest text.
+        let payload = json!({ "messages": [
+            {"role": "user", "content": "この関数のテストを書いて"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]},
+        ]});
+        let texts = classification_texts(ApiKind::AnthropicMessages, &payload);
+        assert_eq!(texts, vec!["この関数のテストを書いて"]);
+    }
+
+    #[test]
+    fn classification_texts_skip_blank_texts() {
+        let payload = json!({ "messages": [
+            {"role": "user", "content": "real instruction"},
+            {"role": "user", "content": "   "},
+        ]});
+        let texts = classification_texts(ApiKind::AnthropicMessages, &payload);
+        assert_eq!(texts, vec!["real instruction"]);
     }
 
     fn resolution(route_name: &str, kind: route::MatchKind) -> route::Resolution {
@@ -937,12 +1066,10 @@ mod tests {
         let res = resolution(crate::config::DEFAULT_ROUTE, route::MatchKind::Exact);
         let attempt = SemanticAttempt {
             resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
-            classified: false,
-            matched: false,
+            outcome: SemanticOutcome::NoClassifier,
             candidates: Vec::new(),
             score: None,
             embed_ms: 0,
-            manual: false,
         };
         let routing = routing_from(&res, attempt);
 
@@ -955,12 +1082,34 @@ mod tests {
     }
 
     #[test]
+    fn routing_from_reports_no_text_distinct_from_no_classifier() {
+        let res = resolution(crate::config::DEFAULT_ROUTE, route::MatchKind::Exact);
+        let attempt = SemanticAttempt {
+            resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
+            outcome: SemanticOutcome::NoText,
+            candidates: Vec::new(),
+            score: None,
+            embed_ms: 0,
+        };
+        let routing = routing_from(&res, attempt);
+
+        assert_eq!(routing.mode, "no_text");
+        assert_eq!(routing.matched_route, crate::config::DEFAULT_ROUTE);
+        assert!(
+            !routing.reason.contains("no classifier"),
+            "a textless request must not be blamed on a missing classifier: {}",
+            routing.reason
+        );
+        assert!(routing.threshold.is_none());
+        assert!(routing.embed_ms.is_none());
+    }
+
+    #[test]
     fn routing_from_reports_a_semantic_match() {
         let res = resolution("role-writer", route::MatchKind::Exact);
         let attempt = SemanticAttempt {
             resolve_as: "role-writer".to_string(),
-            classified: true,
-            matched: true,
+            outcome: SemanticOutcome::Matched { texts_back: 0 },
             candidates: vec![
                 TraceCandidate {
                     route: "role-writer".to_string(),
@@ -973,7 +1122,6 @@ mod tests {
             ],
             score: Some(0.8),
             embed_ms: 2,
-            manual: false,
         };
 
         let routing = routing_from(&res, attempt);
@@ -988,19 +1136,44 @@ mod tests {
     }
 
     #[test]
+    fn routing_from_reports_a_history_match_with_its_distance() {
+        let res = resolution("role-tester", route::MatchKind::Exact);
+        let attempt = SemanticAttempt {
+            resolve_as: "role-tester".to_string(),
+            outcome: SemanticOutcome::Matched { texts_back: 2 },
+            candidates: vec![TraceCandidate {
+                route: "role-tester".to_string(),
+                score: 0.7,
+            }],
+            score: Some(0.7),
+            embed_ms: 3,
+        };
+
+        let routing = routing_from(&res, attempt);
+
+        assert_eq!(routing.mode, "semantic_history");
+        assert_eq!(routing.matched_route, "role-tester");
+        assert_eq!(routing.threshold, Some(CLASSIFICATION_THRESHOLD));
+        assert_eq!(routing.embed_ms, Some(3));
+        assert!(
+            routing.reason.contains("2 messages back"),
+            "reason should say how far the walk went: {}",
+            routing.reason
+        );
+    }
+
+    #[test]
     fn routing_from_explains_a_fallback_below_threshold() {
         let res = resolution(crate::config::DEFAULT_ROUTE, route::MatchKind::Exact);
         let attempt = SemanticAttempt {
             resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
-            classified: true,
-            matched: false,
+            outcome: SemanticOutcome::BelowThreshold { texts_tried: 3 },
             candidates: vec![TraceCandidate {
                 route: "role-writer".to_string(),
                 score: 0.2,
             }],
             score: Some(0.2),
             embed_ms: 1,
-            manual: false,
         };
 
         let routing = routing_from(&res, attempt);
@@ -1015,6 +1188,11 @@ mod tests {
             "reason should mention the threshold: {}",
             routing.reason
         );
+        assert!(
+            routing.reason.contains("3 user texts"),
+            "reason should say how many texts were tried: {}",
+            routing.reason
+        );
     }
 
     #[test]
@@ -1022,12 +1200,10 @@ mod tests {
         let res = resolution("gpt-5-codex", route::MatchKind::Exact);
         let attempt = SemanticAttempt {
             resolve_as: "gpt-5-codex".to_string(),
-            classified: false,
-            matched: false,
+            outcome: SemanticOutcome::Manual,
             candidates: Vec::new(),
             score: None,
             embed_ms: 0,
-            manual: true,
         };
 
         let routing = routing_from(&res, attempt);
@@ -1146,7 +1322,25 @@ mod tests {
         let payload = json!({ "messages": [{"role": "user", "content": "hello"}] });
 
         let attempt = classify_request(&state, &config, &payload, ApiKind::AnthropicMessages);
-        assert!(!attempt.classified);
+        assert_eq!(attempt.outcome, SemanticOutcome::NoClassifier);
+        assert_eq!(attempt.resolve_as, crate::config::DEFAULT_ROUTE);
+    }
+
+    #[cfg(feature = "semantic")]
+    #[tokio::test]
+    async fn classify_request_reports_no_text_for_a_textless_request() {
+        // The classifier being absent and the request being textless are
+        // different fallbacks; a textless request short-circuits before the
+        // classifier is even consulted, so this is observable without a
+        // loaded model.
+        let (_dir, state) = test_state(classifiable_config());
+        let config = state.config.get();
+        let payload = json!({ "messages": [
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]},
+        ]});
+
+        let attempt = classify_request(&state, &config, &payload, ApiKind::AnthropicMessages);
+        assert_eq!(attempt.outcome, SemanticOutcome::NoText);
         assert_eq!(attempt.resolve_as, crate::config::DEFAULT_ROUTE);
     }
 
@@ -1158,7 +1352,7 @@ mod tests {
         let payload = json!({ "messages": [{"role": "user", "content": "hello"}] });
 
         let attempt = classify_request(&state, &config, &payload, ApiKind::AnthropicMessages);
-        assert!(!attempt.classified);
+        assert_eq!(attempt.outcome, SemanticOutcome::NoClassifier);
         assert_eq!(attempt.resolve_as, crate::config::DEFAULT_ROUTE);
     }
 }

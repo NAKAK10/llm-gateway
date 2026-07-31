@@ -95,10 +95,20 @@ client needs to stay happy.
 ## Content-classified routing
 
 Classification is now always on. For every inbound request, the gateway embeds
-the **last user message**, compares it against every non-wildcard route's
+the **newest user text**, compares it against every non-wildcard route's
 `description` with static `model2vec-rs` embeddings, and picks the top match if
-it clears the fixed cosine threshold **0.45**. If nothing clears the bar — or
-classification cannot run at all — the reserved `default` route is used.
+it clears the fixed cosine threshold **0.45**.
+
+When the newest user text does not clear the bar — or the newest user message
+carries no text at all, which is the normal state of an agentic turn whose last
+message is a `tool_result` — the gateway **walks back through earlier user
+texts** (up to 8) and takes the most recent one that clears the threshold. A
+conversation keeps its route across "continue"-style turns and tool-result
+turns without the gateway holding any per-conversation state: the history that
+arrives with every request is the state. A genuine topic change still wins
+immediately, because the newest text is always tried first. If nothing in the
+walk clears the bar — or classification cannot run at all — the reserved
+`default` route is used.
 
 Important consequences:
 

@@ -126,9 +126,12 @@ routes: {
 }
 ```
 
-Then just use Claude Code normally. When the last user message looks like a
+Then just use Claude Code normally. When the newest user text looks like a
 better match for `role-cheap` than for the other routes, classification sends it
-there. Claude's `/model` UI does **not** force this route.
+there — and an ambiguous follow-up turn ("continue", a bare tool result) keeps
+the route of the last instruction that classified confidently, because
+classification walks back through the conversation's own history. Claude's
+`/model` UI does **not** force this route.
 
 What you give up on such a route is listed in the README
 ([Cross-protocol routing](../../README.md#cross-protocol-routing)); the short

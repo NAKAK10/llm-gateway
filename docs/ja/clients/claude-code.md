@@ -127,9 +127,11 @@ routes: {
 }
 ```
 
-あとは Claude Code を普通に使うだけです。最後の user message が他の route
-より `role-cheap` によく合うと分類されたとき、その route に送られます。
-Claude の `/model` UI でこの route を**強制**することはできません。
+あとは Claude Code を普通に使うだけです。最新の user テキストが他の route
+より `role-cheap` によく合うと分類されたとき、その route に送られます —
+そして曖昧なフォローアップのターン(「続けて」、素の tool result)は、
+分類が会話自身の履歴を遡るため、最後に自信を持って分類された指示の route を
+維持します。Claude の `/model` UI でこの route を**強制**することはできません。
 
 このような route で諦めることになるものは README にまとまっています
 ([クロスプロトコルルーティング](../../../README.ja.md#クロスプロトコルルーティング))。
