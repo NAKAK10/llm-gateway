@@ -6,12 +6,15 @@
 //! needs, and stops. Everything after that is hand-edited; the wizard is a
 //! starting point, not a settings UI.
 //!
-//! Two rules it does not break:
+//! One rule it does not break:
 //!
 //! - **It never touches a client's config file.** Redirecting a client is
 //!   `launch`'s job, at launch time.
-//! - **It never overwrites an existing `config.json`.** It shows what it would
-//!   have written and exits.
+//!
+//! Running it again on top of an existing `config.json` asks first — regenerating
+//! replaces every provider, route and key currently in the file. A "yes" is
+//! preceded by a `config.json.bak` copy of what was there, so a wrong answer is
+//! still recoverable.
 //!
 //! The file is created `0600` because the literal-key option puts real
 //! credentials in it.
@@ -22,6 +25,23 @@ use crate::paths;
 
 /// Permissions for `config.json`. It can hold API keys in the clear.
 pub const CONFIG_MODE: u32 = 0o600;
+
+/// Where to copy an existing `config.json` before regenerating it.
+///
+/// Timestamped (to the second) rather than a fixed `.bak` name, so running
+/// `init` over an existing config more than once never silently discards an
+/// earlier backup — each confirmed regeneration keeps its own copy.
+fn backup_path_for(config_path: &std::path::Path) -> std::path::PathBuf {
+    let stamp = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown-time".to_string())
+        .replace(':', "-");
+    let file_name = config_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config.json");
+    config_path.with_file_name(format!("{file_name}.{stamp}.bak"))
+}
 
 /// Download and verify the embedding model classification needs, so a fresh
 /// install already has it before the first request ever arrives — rather
@@ -53,13 +73,32 @@ async fn ensure_classification_model() -> Result<()> {
 
 pub async fn run() -> Result<()> {
     let config_path = paths::config_file();
-    if config_path.exists() {
-        println!("config already exists at {}", config_path.display());
-        println!("edit it directly — `init` never overwrites an existing config.json");
-        return Ok(());
-    }
-
     cliclack::intro("llm-gateway init")?;
+
+    if config_path.exists() {
+        cliclack::log::warning(format!(
+            "a config already exists at {}",
+            config_path.display()
+        ))?;
+        let regenerate = cliclack::confirm(
+            "regenerate it? every provider, route and key currently in the file will be replaced",
+        )
+        .initial_value(false)
+        .interact()?;
+        if !regenerate {
+            cliclack::outro("kept the existing config.json — edit it directly instead")?;
+            return Ok(());
+        }
+
+        // A wrong "yes" should still be recoverable — back up what was there
+        // before anything gets overwritten.
+        let backup_path = backup_path_for(&config_path);
+        std::fs::copy(&config_path, &backup_path)?;
+        cliclack::log::info(format!(
+            "backed up the previous config to {}",
+            backup_path.display()
+        ))?;
+    }
 
     let clients: Vec<Client> = cliclack::multiselect("Which clients do you use?")
         .item(Client::Claude, "Claude Code", "")

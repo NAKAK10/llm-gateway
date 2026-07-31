@@ -2,6 +2,22 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-07-31 — `init` asks before it regenerates, instead of just refusing
+
+Running `init` over an existing `config.json` used to print "edit it directly"
+and exit — safe, but unhelpful the moment someone actually wants a clean
+restart (a new schema, a botched hand-edit, starting over). The owner asked
+for a real choice instead of a wall.
+
+**It confirms, then backs up, then proceeds.** `cli::init::run` now shows a
+`cliclack::confirm` spelling out the consequence — "every provider, route and
+key currently in the file will be replaced" — before touching anything.
+Answering no leaves the file untouched and exits, same as before. Answering
+yes copies the existing file to `config.json.<rfc3339-timestamp>.bak` next to
+it (see `backup_path_for`) and only then runs the normal wizard. The timestamp,
+not a fixed `.bak` name, is deliberate: confirming a regeneration twice in a
+row must not silently discard the first backup.
+
 ## 2026-07-31 — Always classify; remove route-selection theatrics from the config
 
 The old split brain — "exact/wildcard routing is the real thing, semantic
