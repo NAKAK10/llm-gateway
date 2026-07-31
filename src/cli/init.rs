@@ -176,6 +176,11 @@ async fn fetch_models(provider: KnownProvider, key: Option<&str>) -> Result<Vec<
     Ok(ids)
 }
 
+/// How many model choices to show at once before the selection prompt turns
+/// into a scrollable list. Providers such as OpenRouter can list hundreds of
+/// models, so this keeps the prompt within a typical terminal height.
+const MODEL_SELECT_MAX_ROWS: usize = 10;
+
 /// Ask which model backs one role's route, presenting a fetched model list as
 /// a single-choice (radio) prompt when the wizard could reach the provider's
 /// `/models` endpoint, and falling back to a free-text prompt — pre-filled
@@ -193,7 +198,14 @@ async fn choose_model(
     match fetch_models(provider, key).await {
         Ok(models) => {
             let default = provider.default_model().to_string();
-            let mut select = cliclack::select(prompt);
+            // Providers like OpenRouter can list hundreds of models, which
+            // would otherwise blow past the terminal height and make the
+            // prompt unusable. `max_rows` turns the list into a scrollable
+            // area, and `filter_mode` lets the user type to narrow it down
+            // instead of scrolling through everything by hand.
+            let mut select = cliclack::select(prompt)
+                .filter_mode()
+                .max_rows(MODEL_SELECT_MAX_ROWS);
             for model in &models {
                 select = select.item(model.clone(), model.clone(), "");
             }
