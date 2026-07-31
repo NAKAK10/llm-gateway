@@ -1,11 +1,15 @@
 //! `llm-gateway init` — write a first config.
 //!
-//! Asks which clients and providers to use, which agent *role* (manager,
-//! architect, explorer, ...) each configured provider/model should serve,
-//! and how to store keys; writes a `config.json` with one classifiable route
-//! per assigned role plus the reserved `default` route, downloads the
-//! embedding model classification needs, and stops. Everything after that is
+//! Asks which providers to use, which agent *role* (manager, architect,
+//! explorer, ...) each configured provider/model should serve, and how to
+//! store keys; writes a `config.json` with one classifiable route per
+//! assigned role plus the reserved `default` route, downloads the embedding
+//! model classification needs, and stops. Everything after that is
 //! hand-edited; the wizard is a starting point, not a settings UI.
+//!
+//! It does not ask which client(s) — Claude Code, Codex CLI, opencode — are
+//! in use: all three are supported unconditionally, and `launch` lets a user
+//! switch between them at any time without touching `config.json`.
 //!
 //! Routes are named after the *role* a request is doing (`role-architect`,
 //! `role-reviewer`, ...), not the provider serving it — see [`AgentRole`].
@@ -239,12 +243,10 @@ pub async fn run() -> Result<()> {
         ))?;
     }
 
-    let clients: Vec<Client> = cliclack::multiselect("Which clients do you use?")
-        .item(Client::Claude, "Claude Code", "")
-        .item(Client::Codex, "Codex CLI", "")
-        .item(Client::Opencode, "opencode", "")
-        .initial_values(vec![Client::Claude])
-        .interact()?;
+    // Not asked: every client the wizard knows about is supported
+    // unconditionally, and `launch` lets a user switch between them at any
+    // time — there is nothing a selection here would change.
+    let clients: Vec<Client> = Client::ALL.to_vec();
 
     let mut provider_select = cliclack::multiselect("Which providers do you want to configure?");
     for provider in KnownProvider::ALL {
@@ -450,11 +452,15 @@ pub async fn run() -> Result<()> {
         std::fs::set_permissions(&config_path, perms)?;
     }
 
-    let first_launch = clients.first().copied().unwrap_or(Client::Claude);
+    let launch_examples = Client::ALL
+        .iter()
+        .map(|client| format!("  llm-gateway launch {}", client.launch_name()))
+        .collect::<Vec<_>>()
+        .join("\n");
     cliclack::outro(format!(
-        "wrote {}\n\nnext steps:\n  llm-gateway config check\n  llm-gateway serve\n  llm-gateway launch {}",
+        "wrote {}\n\nnext steps:\n  llm-gateway config check\n  llm-gateway serve\n{launch_examples}\n\n\
+         switch clients whenever you like — none of them need a config change.",
         config_path.display(),
-        first_launch.launch_name(),
     ))?;
 
     Ok(())
@@ -469,6 +475,11 @@ pub enum Client {
 }
 
 impl Client {
+    /// Every client the wizard knows about, in the order `launch` was
+    /// documented for — all three are always supported, regardless of what
+    /// the user actually runs.
+    pub const ALL: [Client; 3] = [Self::Claude, Self::Codex, Self::Opencode];
+
     /// Name accepted by `llm-gateway launch <name>`.
     pub fn launch_name(self) -> &'static str {
         match self {
