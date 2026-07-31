@@ -1,9 +1,13 @@
 # Roadmap
 
-## Now (MVP) — single endpoint + fallback + accounting
+## Now (MVP) — single endpoint + always-on classification + fallback + accounting
 
 - [x] 3 wire protocols in, byte-identical passthrough out
-- [x] route resolution (exact → longest wildcard), `*` expansion
+- [x] content-based routing on every request: embed the last user message,
+      score it against every non-wildcard route description, threshold 0.45,
+      reserved `default` route on miss
+- [x] `semantic` as a default cargo feature; `--no-default-features` as the
+      small build that always routes to `default`
 - [x] fallback before first byte, same-protocol only
 - [x] usage observation without touching the response (`tee`)
 - [x] `usage-*.jsonl` / `trace-*.jsonl` + `stats` / `trace` CLIs
@@ -26,18 +30,16 @@
   secondary sources say `chat` was removed 2026-02. The gateway serves both
   endpoints and `launch.codex.wireApi` switches, so measurement decides.
 
-## Phase 2 — semantic routing (shipped)
+## Phase 2 — classification (shipped)
 
-Pick a route from the *content* of the request when the client asks for a
-designated auto route (never overriding an explicit route name). Behind the
-`semantic` cargo feature, which the distributed binary enables.
-
-- [x] embed `routes[].description` (that's why long ones live in `llm/*.md`) and
-  the request's last user text; cosine top-1 over a threshold wins
+- [x] every non-wildcard route participates as a candidate; the reserved
+      `default` route is required and can also win classification outright
 - [x] engine: `model2vec-rs` + `potion-multilingual-128M` (static, no ONNX, 101
-  languages, distilled from BGE-M3); upgrade path: `fastembed` `BGEM3`
-- [x] trace `routing.mode = "semantic"` with per-candidate scores — the schema
-  already has the fields (`candidates`, `score`, `threshold`, `embed_ms`)
+      languages, distilled from BGE-M3); upgrade path: `fastembed` `BGEM3`
+- [x] `init` downloads the model up front instead of treating classification as
+      an opt-in extra
+- [x] trace `routing.mode = "semantic"` / `"no_classifier"` with per-candidate
+      scores, threshold, and embedding time
 
 ## Phase 3 — cross-protocol translation
 

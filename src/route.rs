@@ -1,9 +1,12 @@
-//! Turning the `model` a client asked for into an ordered list of upstreams.
+//! Turning a route name into an ordered list of upstreams.
 //!
-//! Resolution is intentionally boring: exact route name first, then the
-//! longest-prefix wildcard. Nothing inspects the request body — that is what
-//! semantic routing will add later, and keeping it out for now means an
-//! explicit route name always wins and is always predictable.
+//! Resolution itself stays boring: exact route name first, then the
+//! longest-prefix wildcard. What changed is *which* route name gets resolved
+//! — `crate::server::proxy::classify_request` always decides that first, by
+//! classifying the request's content against every route's `description`;
+//! the model name the client sent plays no part in it. `resolve` here just
+//! turns whatever name classification (or the `default` fallback) picked
+//! into a concrete `Target`.
 
 use crate::config::{ApiKind, Config, ModelRef, ProviderConfig, SecretRef};
 use crate::error::{Error, Result};

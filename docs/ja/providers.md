@@ -56,9 +56,11 @@ anthropic: {
 },
 ```
 
-ワイルドカードルート `claude-*`(`model: { default: "anthropic/*" }`)は
-Claude Code が要求した id をそのまま転送するため、Anthropic の新しい
-モデル id が出ても設定変更は不要です。
+`init` は現在、`role-anthropic` のような分類可能な route を実のある
+`description` と `model: { default: "anthropic/*" }` 付きで生成します。
+Anthropic 自身のモデル id は右辺でそのまま通るので、新しい id が出ても
+設定変更は不要です — ただし route *選択* を決めるのは、もはや `claude-*`
+ワイルドカードではなく、その `description` に対する分類です。
 
 ### OpenAI
 
@@ -84,14 +86,27 @@ openrouter: {
   apiKey: "${OPENROUTER_API_KEY}",
   headers: { "X-Title": "llm-gateway" },   // 任意のアトリビューション
 },
-// 同じアップストリームを Anthropic プロトコルで — `claude-*` が ApiKind を
-// またがずにフォールバックできるようにする:
+// 同じアップストリーム・同じアカウントを Anthropic プロトコルで —
+// Anthropic を話す route が ApiKind をまたがずにフォールバックできるようにする。
+// ルートに注意: `/api/v1` ではなく `/api`。`/v1/messages` はゲートウェイが
+// 自分で付け足すので、openai-chat 側の baseUrl をそのまま流用すると
+// `/api/v1/v1/messages` のように二重になってしまう。
 "openrouter-anthropic": {
-  baseUrl: "https://openrouter.ai/api/v1",
+  baseUrl: "https://openrouter.ai/api",
   api: "anthropic-messages",
   apiKey: "${OPENROUTER_API_KEY}",
 },
 ```
+
+一見、同じアカウントに 2 つの id があるのは冗長に見える。これは設計上の
+制約による: 1 つのプロバイダーエントリは 1 つのアップストリームを
+ちょうど 1 つのワイヤープロトコル(`api`)に結びつける — `route.model.fallbacks`
+がリクエストの途中でプロトコルをまたぐことが決してないようにするためだ
+(`src/config/mod.rs` 参照)。OpenRouter が `openai-chat` と
+`anthropic-messages` のどちらを受け付けるかは認証情報ではなく POST 先の
+パスで決まるので、同じキーを単純に 2 回登録している。`init` は Claude Code
+のフォールバックとして OpenRouter を選んだ場合にのみ `openrouter-anthropic`
+を追加する。
 
 モデル id は `/` を含みます(`anthropic/claude-sonnet-4.6`)。ルートの
 ターゲットは*最初の* `/` でのみ分割されるため、
@@ -235,7 +250,7 @@ Sakana AI の Fugu は OpenAI 互換 API の背後にあるオーケストレー
 [console.sakana.ai](https://console.sakana.ai) で取得できます。コンソールの
 ダッシュボードにアカウントごとのベース URL が表示されるため、上記と異なる
 場合はそちらを優先してください。Fugu は Anthropic 互換の Messages
-エンドポイントも公開しているので、`claude-*` ルートのフォールバック先に
+エンドポイントも公開しているので、Anthropic を話す route のフォールバック先に
 したい場合は `api: "anthropic-messages"` で別のプロバイダー id を
 登録してください。
 

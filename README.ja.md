@@ -6,10 +6,11 @@
 
 `llm-gateway` はクライアントが必要とする 3 つのワイヤープロトコル —
 Anthropic Messages(`/v1/messages`)、OpenAI Chat(`/v1/chat/completions`)、
-OpenAI Responses(`/v1/responses`)— を話し、リクエストの `model`
-フィールドだけを書き換えて、レスポンスは**バイト単位で無加工のまま**
-ストリーミングで返します。モデル選択、フォールバック、コスト集計、
-監査可能なルーティング記録は、すべてひとつの設定ファイルに集約されます。
+OpenAI Responses(`/v1/responses`)— を話し、受信したすべてのリクエストを
+route の `description` に対して分類し、上流に送る `model` フィールドだけを
+書き換えて、レスポンスは**バイト単位で無加工のまま**ストリーミングで返します。
+コンテンツベースのルーティング、フォールバック、コスト集計、監査可能な
+ルーティング記録は、すべてひとつの設定ファイルに集約されます。
 
 唯一の意図的な例外が[クロスプロトコルルーティング](#クロスプロトコルルーティング)です。
 クライアントとプロバイダーのプロトコルが異なる場合に限り、リクエストと
@@ -48,12 +49,16 @@ GitHub Releases に `v{version}` を公開、
 ## クイックスタート
 
 ```sh
-llm-gateway init            # 対話形式; ~/.config/llm-gateway/config.json を書き出す (chmod 600)
+llm-gateway init            # 対話形式; 埋め込みモデルをダウンロードしてから ~/.config/llm-gateway/config.json を書き出す (chmod 600)
 llm-gateway serve           # 127.0.0.1:4000 でゲートウェイを起動
 llm-gateway launch claude   # Claude Code をゲートウェイ経由で起動
 llm-gateway stats           # ルートごとの消費量を表示
 llm-gateway update          # 最新リリースへ更新
 ```
+
+**破壊的な設定変更:** 旧スキーマからの移行処理はありません。
+`~/.config/llm-gateway/config.json`(または `~/.config/llm-gateway/` 全体)を
+削除して、`llm-gateway init` をやり直してください。
 
 ## サポートしているクライアント
 
@@ -68,94 +73,70 @@ llm-gateway update          # 最新リリースへ更新
 ファイルには何も書き込みません。各クライアントの手動(恒久的)
 セットアップは `docs/clients/` に、日本語版は `docs/ja/clients/` にあります。
 
-## agent ごとのモデル
+## agent ごとのモデル文字列
 
 サブエージェントが個別に指定しているモデルは、**agent ファイルを一切変更せず**
-そのまま生きたうえで、全リクエストがゲートウェイを経由します:
+そのまま生きたうえで、全リクエストがゲートウェイを経由します。変わったのは、
+その文字列が route を選ばなくなったことです。クライアントが成立するための
+見かけ上の値として残るだけです。
 
-| クライアント | agent のモデル指定元 | ゲートウェイへの経路 |
+| クライアント | クライアント側でモデル文字列を持つ場所 | 今の意味 |
 |---|---|---|
-| Claude Code | サブエージェントの `model:` frontmatter | env リダイレクトがプロセス全体に効く。ID は `claude-*` で解決 |
-| Codex CLI | `~/.codex/agents/*.toml` の `model =` | プロバイダー指定はグローバルなので全 agent が経由。モデル名は `gpt-*` が転送 |
-| opencode | `agents/*.md` の `model: openai/…` | `launch` が `launch.opencode.overrideProviders`(既定 `openai`, `anthropic`)の組み込みプロバイダーもゲートウェイに向ける。opencode はモデル参照ごとにプロバイダーを選ぶため、これが無いと固定 agent が黙ってゲートウェイを素通りする |
+| Claude Code | サブエージェントの `model:` frontmatter、または Claude 自身の `/model` UI | 文字列は送信・記録されるが、route 選択には使われない |
+| Codex CLI | `~/.codex/agents/*.toml` の `model =` | Codex はモデル名を必要とするが、ゲートウェイは内容分類で route を選ぶ |
+| opencode | `agents/*.md` の `model: openai/…` | `launch` は組み込みプロバイダーも引き続き上書きし、固定 agent がゲートウェイを素通りしないようにする |
 
-既定のルーティングは**モデル名ベース**です(完全一致 → 最長 wildcard)。
-リクエスト内容から route を選ぶセマンティック分類は、`semantic` を持つ
-route でのみ動きます — 下記の
-[セマンティックルーティング](#セマンティックルーティング)を参照してください。
+## コンテンツ分類ルーティング
 
-## セマンティックルーティング
+分類は常時オンです。受信したすべてのリクエストについて、ゲートウェイは
+**最後の user message** を埋め込み、ワイルドカードではない各 route の
+`description` と static な `model2vec-rs` 埋め込みで比較し、固定 cosine
+閾値 **0.45** を超えた最上位候補を選びます。どれも閾値に届かなければ、または
+分類自体が走らなければ、予約済みの `default` route が使われます。
 
-コンテンツベースルーティングは、`model` 名ではなくリクエストの**内容**から
-route を選びます。動くのは `semantic` ブロックを持つ route のときだけで、
-それ以外は従来どおり「完全一致 → 最長 wildcard」です。
+重要な帰結:
 
-**`semantic` cargo feature 付きのビルドが必要です** — Homebrew 版には
-入っていますが、`--features semantic` なしの `cargo install` には入りません。
-埋め込みモデルが ~500MB あるため、ビルド時オプトインにしています。feature
-無しのバイナリは起動時に警告を出し、該当 route をそのまま自身の `model` に
-転送するので、設定はどちらでも有効です。モデルは `semantic` 付き route が
-ある状態で最初に `serve` したときにダウンロードされ、そのような route が
-存在するときだけメモリに読み込まれます。
-
-`routes[].semantic` はどの route にも追加できる任意フィールドです:
-
-| フィールド | 型 | 既定 | 意味 |
-|---|---|---|---|
-| `candidates` | `string[]` | `[]` | 選択対象になる route 名。空なら「`description` を持つ他の全 route」。 |
-| `threshold` | `number` | `0.45` | リクエストと候補群との top-1 cosine 類似度がこれを下回った場合、auto route 自身の `model` が代わりに使われる。 |
-
-設計上のポイント:
-
-- **auto route 自身の `model` は、どの候補も閾値に届かなかったときの
-  行き先**です。だから `semantic` を持つ route にも、他の route と同様に
-  `model` が必要です。
-- **明示的な route 名は絶対に上書きされません。** 分類が走るのは
-  `semantic` を持つ route 自身が名前で要求されたときだけです。これは
-  既存の「明示的な route 名は常に勝ち、常に予測可能」という設計方針の
-  継続です(`src/route.rs`、`docs/roadmap.md` の Phase 2 参照)。
-- **候補には `description` が必須です** — これが分類コーパスになります
-  (長い説明は今と同じく `llm/*.md` に置けます)。
-- **リクエストが届き得ない候補は、実行時に除外されます** —
-  `/v1/chat/completions` へのリクエストが `anthropic-messages` の候補に
-  解決されることは決してありません。その方向への変換が存在しないからです。
-  一方 Claude Code からのリクエストは `openai-chat` の候補を選べます —
-  その方向は変換されるからです
-  ([クロスプロトコルルーティング](#クロスプロトコルルーティング)参照)。
-- **`semantic` を持つ route 名にワイルドカード(`*`)は使えません。**
+- **クライアントが送る `model` では route は決まりません。** 残るのは
+  クライアント自身の UI と、trace ログの `requested_model` だけです。
+- **通常ビルドでは常に分類が入ります。** `semantic` は既定の cargo
+  feature なので、Homebrew と素の `cargo install` は同じ挙動です。
+- **`cargo install --no-default-features` が opt-out です。** その小さい
+  ビルドは分類を完全に省き、常に `default` に流します。
+- **`llm-gateway init` は常に埋め込みモデル**(およそ 500 MB)をダウンロードして
+  から `config.json` を書きます。
+- **ワイルドカードではない route には必ず実のある `description` が要ります。**
+  その文章がそのまま分類コーパスなので、ボイラープレートしか書かなければ
+  ボイラープレートなルーティングになります。
+- **ワイルドカード route 名は、今や手書き設定向けの上級者用 escape hatch です。**
+  `init` は生成せず、`GET /v1/models` にも載らず、分類器も採点しません。
 
 ```json5
 routes: {
-  "auto": {
-    semantic: {
-      candidates: ["role-light", "role-deep", "role-code"],
-      threshold: 0.45,
-    },
-    // どの候補も閾値に届かなかったときの行き先
+  "default": {
+    description: "他の route に明確に当てはまらないリクエストの受け皿。",
     model: {
-      default: "ollama-local/qwen3:8b",
-      fallbacks: ["openrouter/qwen/qwen3-8b"],
+      default: "anthropic/*",
     },
   },
 
-  "role-light": {
-    description: "短い定型作業。要約、整形、コミットメッセージ生成、命名",
+  "role-anthropic": {
+    description: "慎重な段階的思考と完全なツール対応を必要とする、複雑な推論・コーディング・マルチステップな agent 的タスク。",
+    model: {
+      default: "anthropic/*",
+      fallbacks: ["openrouter-anthropic/anthropic/*"],
+    },
+  },
+
+  "role-cheap": {
+    description: "要約、整形、コミットメッセージのような、低コストでレイテンシ重視の短い作業。",
     model: {
       default: "ollama-local/qwen3:8b",
       fallbacks: ["groq/llama-3.3-70b-versatile"],
     },
   },
 
-  "role-deep": {
-    description: "./llm/role-deep.md",
-    model: {
-      default: "openrouter/anthropic/claude-opus-5",
-      fallbacks: ["openrouter/google/gemini-3-pro"],
-    },
-  },
-
   "role-code": {
-    description: "コード生成、リファクタリング、テスト作成、バグ修正",
+    description: "コード生成、リファクタリング、テスト作成、バグ修正。",
     model: {
       default: "openrouter/qwen/qwen3-coder",
       fallbacks: ["deepseek/deepseek-coder"],
@@ -181,8 +162,11 @@ providers: {
   "ollama-local": { baseUrl: "http://127.0.0.1:11434/v1", api: "openai-chat" },
 },
 routes: {
-  // Claude Code から: llm-gateway launch claude --model role-cheap
-  "role-cheap": { model: { default: "ollama-local/qwen3:8b" } },
+  // 分類がこの route に当てはまると判断したときに使われる。
+  "role-cheap": {
+    description: "短い定型作業: 要約、整形、コミットメッセージ生成",
+    model: { default: "ollama-local/qwen3:8b" },
+  },
 }
 ```
 
@@ -237,10 +221,20 @@ providers: {
   "openai-subscription": { api: "openai-chat", transport: "codex-cli" },
 },
 routes: {
-  "role-sub": { model: { default: "anthropic-subscription/sonnet" } },
-  // `default` は「CLI が設定されている通りのもの」を意味する — ChatGPT
-  // プランがどのモデルを許すかは、ここからは分からない。
-  "role-codex": { model: { default: "openai-subscription/default" } },
+  "default": {
+    description: "他の route に明確に当てはまらないリクエストの受け皿。",
+    model: { default: "anthropic/*" },
+  },
+  "role-sub": {
+    description: "プロバイダー CLI 経由でローカルの Claude サブスクリプションに流すべき依頼。生成専用で、呼び出し元のツールは渡されない。",
+    model: { default: "anthropic-subscription/sonnet" },
+  },
+  // model 文字列中の `default` は「CLI が設定されている通りのもの」を意味する
+  // — ChatGPT プランがどのモデルを許すかは、ここからは分からない。
+  "role-codex": {
+    description: "Codex CLI 経由でローカルの ChatGPT サブスクリプションに流すべき依頼。",
+    model: { default: "openai-subscription/default" },
+  },
 }
 ```
 
@@ -307,6 +301,9 @@ routes: {
 末尾カンマが使えます。変更はホットリロードされ、壊れた編集をしても直前の
 設定で稼働し続け、エラーがログに出ます。
 
+日常的なスキーマは **4 つのトップレベルキー** だけです:
+`server`、`providers`、`routes`、`logging`。
+
 ```json5
 {
   server: {
@@ -318,48 +315,56 @@ routes: {
     "<id>": {
       baseUrl: "https://openrouter.ai/api/v1",
       api: "openai-chat",     // openai-chat | openai-responses | anthropic-messages
-      apiKey: "sk-…",         // リテラル | "${ENV_VAR}" | "keychain:<name>"
-      headers: { "X-Title": "llm-gateway" },   // 任意の追加ヘッダー
-      injectUsage: true,      // ストリーミング chat に stream_options.include_usage を付与
+      apiKey: "sk-…",         // リテラル | "${ENV_VAR}" | "keychain:<name>" | "command:<cmd>"
+      headers: { "X-Title": "llm-gateway" },
+      injectUsage: true,
     },
   },
   routes: {
-    "<name>": {               // クライアントが `model` に入れる名前; `:` と `/` は禁止
-      title: "…",
-      description: "テキスト、または ./llm/file.md",   // 将来のセマンティックルーティング用コーパス
+    "default": {
+      description: "他の route に明確に当てはまらないリクエストの受け皿。",
       model: {
-        default: "<provider>/<model>",        // 最初の `/` でのみ分割される
-        fallbacks: ["<provider>/<model>"],    // default と同じプロトコルのみ; 最初のバイト受信前に試行
+        default: "<provider>/<model>",
       },
     },
-    "claude-*": {             // ワイルドカード: `*` はリクエストされたモデル名に展開
-      model: { default: "anthropic/*" },
+    "role-openai": {
+      description: "OpenAI 系モデルによる汎用アシスタント作業、コーディング、ツール利用。",
+      model: {
+        default: "openai/*",                  // 最初の `/` でのみ分割される
+        fallbacks: ["openrouter/openai/*"],   // default と同じプロトコルのみ; 最初のバイト受信前に試行
+      },
     },
   },
-  launch: {
-    // `model` はそのクライアントの「メイン(既定)モデル」だけを決める route 名。
-    // role route(`role-strategy` 等)でも wildcard が拾う ID でもよい。
-    // agent ごとのモデルはそのまま生きる — 下の「agent ごとのモデル」参照。
-    claude:   { model: "claude-sonnet-4-6", extraArgs: [] },
-    codex:    { model: "gpt-5.6", wireApi: "responses", extraArgs: [] },
-    opencode: { model: "role-default", models: [],
-                overrideProviders: ["openai", "anthropic"], extraArgs: [] },
-  },
   logging: {
-    dir: "./logs",            // 設定ディレクトリからの相対パス
-    usage: true,              // usage-YYYY-MM.jsonl — 1 リクエスト 1 行
+    dir: "./logs",
+    usage: true,
     debug: false,             // trace-YYYY-MM-DD.jsonl — プロンプト本文が記録される!
   },
+}
+```
+
+任意の上級者向けキーとして `launch` もあります。`init` はもう書き出さず、
+大半の設定では不要ですが、クライアントごとの launcher 調整を手書きしたい
+場合だけ追加します。
+
+```json5
+launch: {
+  claude:   { extraArgs: [] },
+  codex:    { wireApi: "responses", extraArgs: [] },
+  opencode: { models: [], overrideProviders: ["openai", "anthropic"], extraArgs: [] },
 }
 ```
 
 | フィールド | 補足 |
 |---|---|
 | `server.apiKey` | 起動時に一度だけ解決されるため、変更には再起動が必要。`host` がループバック以外の場合は必須 — この 1 つのキーがすべてのプロバイダー認証情報を守る。 |
-| `providers.<id>.apiKey` | リクエスト試行のたびに解決されるため、環境変数 / Keychain のローテーションが即時反映される。 |
+| `providers.<id>.apiKey` | リクエスト試行のたびに解決されるため、環境変数 / Keychain / `command:` のローテーションが即時反映される。 |
 | `providers.<id>.api` | フォールバックはプロトコルをまたげない。`config check` が検証する。 |
-| `routes.<name>` | 完全一致がワイルドカードに勝ち、ワイルドカード同士では最長プレフィックスが勝つ。 |
-| `description` | `./` `../` `/` `~/` で始まる場合はファイルパスとして扱われる。 |
+| `routes.default` | 必須。どの route も分類閾値を超えないときの予約済み catch-all であり、同時に通常候補としても採点される。 |
+| `routes.<name>.description` | ワイルドカードではない route では必須。インライン文字列、または `./` / `../` / `/` / `~/` のパス。これ自体が分類コーパス。 |
+| `routes.<name>.model.default` | `"<provider>/<model>"`。最初の `/` でのみ分割される。 |
+| `routes.<name>.model.fallbacks` | default と同じプロトコルのみ。最初のレスポンスバイト前に順番に試される。 |
+| `launch` | オプションの上級者用 escape hatch のみ: Claude/Codex/opencode の extra args、Codex の `wireApi`、opencode の `models` / `overrideProviders`。 |
 | `logging.debug` | `--debug` はユーザーテキストを 200 文字に切り詰め、`--debug-full` は全文を残す。プロンプトが平文でディスクに残るため、意図的に有効化すること。 |
 
 ## コマンド
@@ -367,7 +372,7 @@ routes: {
 ```
 llm-gateway serve [--debug] [--debug-full] [--port N]
 llm-gateway init
-llm-gateway launch <claude|codex|opencode> [--model R] [--isolate] [--print] [-- ARGS]
+llm-gateway launch <claude|codex|opencode> [--isolate] [--print] [-- ARGS]
 llm-gateway config check|show|gitignore
 llm-gateway stats [--by route|client|provider|model|day] [--since D] [--until D]
 llm-gateway trace [--tail] [--route R] [--client C]
@@ -377,11 +382,10 @@ llm-gateway update [--check]
 
 `update` は GitHub に最新リリースを問い合わせ、このビルドが古ければ
 インストール方法に応じたアップグレードを実行します — Homebrew なら
-`brew upgrade`、`cargo install` なら `cargo install --force`(`semantic`
-feature は維持)。自分のバイナリを上書きすることはありません: それをすると
-パッケージマネージャーが古いバージョンがまだあると思い込むためです。手で
-配置したバイナリの場合はリリースのリンクを表示します。`--check` は何も
-変更せず報告だけします。
+`brew upgrade`、`cargo install` なら `cargo install --force`。自分の
+バイナリを上書きすることはありません: それをするとパッケージマネージャーが
+古いバージョンがまだあると思い込むためです。手で配置したバイナリの場合は
+リリースのリンクを表示します。`--check` は何も変更せず報告だけします。
 
 ## フォールバックがやること(と、やらないこと)
 

@@ -53,9 +53,11 @@ anthropic: {
 },
 ```
 
-The `claude-*` wildcard route (`model: { default: "anthropic/*" }`) forwards
-whatever id Claude Code asks for, so new Anthropic model ids need no config
-change.
+`init` now scaffolds a classifiable route such as `role-anthropic` with a real
+`description` and `model: { default: "anthropic/*" }`. Anthropic's own model ids
+still pass through on the right-hand side, so new ids need no config change —
+but route *selection* is now done by classification against that description,
+not by a `claude-*` wildcard being the normal path.
 
 ### OpenAI
 
@@ -80,14 +82,27 @@ openrouter: {
   apiKey: "${OPENROUTER_API_KEY}",
   headers: { "X-Title": "llm-gateway" },   // optional attribution
 },
-// Same upstream, Anthropic wire protocol — lets `claude-*` fall back to it
-// without crossing ApiKinds:
+// Same upstream, same account, Anthropic wire protocol instead of
+// openai-chat — lets an Anthropic-speaking route fall back to it without
+// crossing ApiKinds.
+// Note the root: `/api`, not `/api/v1` — the gateway appends `/v1/messages`
+// itself, and reusing the `openai-chat` id's baseUrl here would double up to
+// `/api/v1/v1/messages`.
 "openrouter-anthropic": {
-  baseUrl: "https://openrouter.ai/api/v1",
+  baseUrl: "https://openrouter.ai/api",
   api: "anthropic-messages",
   apiKey: "${OPENROUTER_API_KEY}",
 },
 ```
+
+Two ids for one account looks redundant at a glance; it exists because a
+provider entry couples one upstream to exactly one wire protocol (`api`) —
+by design, so that `route.model.fallbacks` never has to cross protocols
+mid-request (see `src/config/mod.rs`). Whether OpenRouter itself takes an
+`openai-chat` or an `anthropic-messages` request depends on which path you
+POST to, not on the credential, so the same key is simply registered twice.
+`init` only adds `openrouter-anthropic` when you pick OpenRouter as a
+fallback for Claude Code.
 
 Model ids contain a `/` (`anthropic/claude-sonnet-4.6`); route targets split
 on the *first* `/` only, so `openrouter/anthropic/claude-sonnet-4.6` parses
@@ -233,7 +248,7 @@ models `fugu` and `fugu-ultra`. Get a key at
 the base URL for your account, so prefer that value if it differs from the
 one above. Fugu also exposes an Anthropic-compatible Messages endpoint —
 register a second provider id with `api: "anthropic-messages"` if you want it
-as a fallback for `claude-*` routes.
+as a fallback for an Anthropic-speaking route.
 
 ```json5
 routes: {

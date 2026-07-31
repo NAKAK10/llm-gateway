@@ -23,15 +23,17 @@
         "headers": { "x-gw-client": "opencode" }
       },
       "models": {
-        "role-default": {}
+        "default": {}
       }
     }
   }
 }
 ```
 
-あとは `-m gateway/role-default` で選択するか、`agents/*.md` ファイルで
-エージェントごとに設定します(`model: gateway/role-default`)。
+あとは `-m gateway/default` で選択するか、`agents/*.md` ファイルで
+エージェントごとに設定します(`model: gateway/default`)。クライアントは依然
+として何らかの model id を必要としますが、ゲートウェイはその選択で route を
+決めず、設定された各 route の `description` に対して内容分類します。
 
 補足:
 
@@ -50,7 +52,7 @@
 ## 動作確認
 
 ```sh
-opencode run -m gateway/role-default "ping"
+opencode run -m gateway/default "ping"
 llm-gateway stats --by client     # opencode の行が出ること
 ```
 

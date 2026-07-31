@@ -1,9 +1,10 @@
 //! `llm-gateway init` — write a first config.
 //!
 //! Asks three questions (clients, providers, how to store keys), writes a
-//! minimal `config.json` plus matching `llm/*.md` description stubs, and stops.
-//! Everything after that is hand-edited; the wizard is a starting point, not a
-//! settings UI.
+//! `config.json` with one classifiable route per selected provider plus the
+//! reserved `default` route, downloads the embedding model classification
+//! needs, and stops. Everything after that is hand-edited; the wizard is a
+//! starting point, not a settings UI.
 //!
 //! Two rules it does not break:
 //!
@@ -22,15 +23,35 @@ use crate::paths;
 /// Permissions for `config.json`. It can hold API keys in the clear.
 pub const CONFIG_MODE: u32 = 0o600;
 
-/// Stub written to `llm/role-default.md` for the sample `role-default` route.
-const ROLE_DEFAULT_STUB: &str = "\
-# role-default
+/// Download and verify the embedding model classification needs, so a fresh
+/// install already has it before the first request ever arrives — rather
+/// than surprising whoever sends that request with a ~500MB download.
+///
+/// A no-op message in a build without the `semantic` feature: there is no
+/// model to fetch, and every request will resolve to the reserved `default`
+/// route without classification (see `crate::server::prepare_classifier`).
+#[cfg(feature = "semantic")]
+async fn ensure_classification_model() -> Result<()> {
+    cliclack::log::info(
+        "downloading the classification model (potion-multilingual-128M, ~500MB) if not already \
+         cached — this is what lets every request be routed by content...",
+    )?;
+    let http = crate::upstream::client()?;
+    crate::semantic::model_file::ensure(&http).await?;
+    cliclack::log::info("classification model ready")?;
+    Ok(())
+}
 
-Sample route description. Edit this file to describe when `role-default`
-should be picked once semantic routing lands; today it is just documentation.
-";
+#[cfg(not(feature = "semantic"))]
+async fn ensure_classification_model() -> Result<()> {
+    cliclack::log::warning(
+        "this build does not have the `semantic` feature enabled; every request will be routed \
+         to the reserved `default` route without content-based classification",
+    )?;
+    Ok(())
+}
 
-pub fn run() -> Result<()> {
+pub async fn run() -> Result<()> {
     let config_path = paths::config_file();
     if config_path.exists() {
         println!("config already exists at {}", config_path.display());
@@ -170,7 +191,7 @@ pub fn run() -> Result<()> {
         cliclack::log::info(format!(
             "{}: `{}` route added, run by `{}` on your subscription — no key needed",
             provider.label(),
-            "role-subscription",
+            provider.subscription_route(),
             provider.subscription_cli().unwrap_or("its CLI"),
         ))?;
     }
@@ -182,6 +203,8 @@ pub fn run() -> Result<()> {
     std::fs::create_dir_all(&llm_dir)?;
     std::fs::create_dir_all(&logs_dir)?;
 
+    ensure_classification_model().await?;
+
     let json = serde_json::to_string_pretty(&config)?;
     let contents = format!("// llm-gateway config — do not commit this file\n{json}\n");
     std::fs::write(&config_path, contents)?;
@@ -192,11 +215,6 @@ pub fn run() -> Result<()> {
         let mut perms = std::fs::metadata(&config_path)?.permissions();
         perms.set_mode(CONFIG_MODE);
         std::fs::set_permissions(&config_path, perms)?;
-    }
-
-    let role_default_path = llm_dir.join("role-default.md");
-    if !role_default_path.exists() {
-        std::fs::write(&role_default_path, ROLE_DEFAULT_STUB)?;
     }
 
     let first_launch = clients.first().copied().unwrap_or(Client::Claude);
@@ -407,6 +425,52 @@ impl KnownProvider {
             _ => None,
         }
     }
+
+    /// Classification text for the route this provider is scaffolded with.
+    ///
+    /// Every request is classified against every route's description now (see
+    /// `crate::semantic::index`), so this needs to say something a request's
+    /// own wording could plausibly match — not just restate the provider's
+    /// name. Deliberately generic: it is a starting point the user is
+    /// expected to edit once they know their own usage pattern, not a
+    /// finished taxonomy.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Anthropic => {
+                "Complex reasoning, coding, and multi-step agentic tasks that need careful \
+                 step-by-step thinking and full tool support."
+            }
+            Self::OpenAi => {
+                "General-purpose assistant tasks, coding, and tool use via OpenAI's models."
+            }
+            Self::OpenRouter => {
+                "Wide catalog of open and third-party models; use for specific model requests \
+                 or as a fallback when a primary provider is unavailable."
+            }
+            Self::GithubCopilot => {
+                "Coding assistance and pair-programming tasks via GitHub Copilot's models."
+            }
+            Self::Gemini => "Multimodal tasks and long-context questions via Google Gemini.",
+            Self::Xai => {
+                "Questions about current events and real-time information via xAI's Grok models."
+            }
+            Self::Mistral => "Lightweight, general-purpose tasks via Mistral's models.",
+            Self::DeepSeek => "Cost-efficient reasoning and coding tasks via DeepSeek's models.",
+            Self::Groq => {
+                "Latency-sensitive, simple tasks that benefit from Groq's fast inference."
+            }
+            Self::TogetherAi => "Open-source models hosted via Together AI.",
+            Self::SakanaAi => "Experimental or research-oriented tasks via Sakana AI's models.",
+            Self::Plamo => {
+                "Japanese-language tasks and general assistance via Preferred Networks' PLaMo."
+            }
+            Self::OllamaCloud => "General-purpose tasks via Ollama Cloud's hosted open models.",
+            Self::OllamaLocal => {
+                "Private, offline inference where no data should leave this machine, via a \
+                 locally running Ollama."
+            }
+        }
+    }
 }
 
 /// Whether `name` is an executable on `PATH`.
@@ -458,6 +522,18 @@ impl KnownProvider {
         format!("{}-subscription", self.id())
     }
 
+    /// Route name for this provider's own classifiable route.
+    pub fn route_name(self) -> String {
+        format!("role-{}", self.id())
+    }
+
+    /// Route name for the subscription choice. Namespaced by provider id so
+    /// selecting both Anthropic and OpenAI subscriptions scaffolds two routes
+    /// instead of the second silently overwriting the first.
+    pub fn subscription_route(self) -> String {
+        format!("role-{}-subscription", self.id())
+    }
+
     /// A model reference the subscription CLI accepts, for the scaffolded route.
     pub fn subscription_model(self) -> &'static str {
         match self {
@@ -506,12 +582,13 @@ pub fn build_config(
 /// rather than a key.
 ///
 /// A subscription choice adds a *second* provider id (`<id>-subscription`) with
-/// an agent-CLI transport, and a `role-subscription` route pointing at it. It
+/// an agent-CLI transport, and a `role-<id>-subscription` route pointing at
+/// it. It
 /// does not remove the API-key provider: the two are good at different things —
 /// a plan for generation, a key for anything that needs tools — and a config
 /// that holds both lets a route choose per request.
 pub fn build_config_with_auth(
-    clients: &[Client],
+    _clients: &[Client],
     providers: &[(KnownProvider, Option<String>)],
     storage: KeyStorage,
     subscriptions: &[KnownProvider],
@@ -549,13 +626,19 @@ pub fn build_config_with_auth(
     }
 
     // OpenRouter can also speak the Anthropic wire protocol under
-    // `openrouter/anthropic/*`; expose it under its own id so `claude-*` can
-    // fall back to it without crossing `ApiKind`s.
+    // `openrouter/anthropic/*`; expose it under its own id so Anthropic's
+    // classifiable route can fall back to it without crossing `ApiKind`s.
+    //
+    // Its Anthropic-compatible root is `/api`, not `/api/v1` — unlike the
+    // `openai-chat` id, which needs the `/v1` prefix because the gateway
+    // appends `/chat/completions` rather than a version-free path. Reusing
+    // `KnownProvider::OpenRouter.base_url()` here would double up to
+    // `/api/v1/v1/messages`.
     if has(KnownProvider::OpenRouter) {
         config.providers.insert(
             "openrouter-anthropic".to_string(),
             ProviderConfig {
-                base_url: KnownProvider::OpenRouter.base_url().to_string(),
+                base_url: "https://openrouter.ai/api".to_string(),
                 api: ApiKind::AnthropicMessages,
                 api_key: Some(provider_api_key(
                     KnownProvider::OpenRouter,
@@ -570,44 +653,59 @@ pub fn build_config_with_auth(
         );
     }
 
-    if has(KnownProvider::Anthropic) && clients.contains(&Client::Claude) {
-        let mut fallbacks = Vec::new();
-        if has(KnownProvider::OpenRouter) {
-            fallbacks.push("openrouter-anthropic/anthropic/*".to_string());
-        }
+    for provider in providers.iter().map(|(p, _)| *p) {
         config.routes.insert(
-            "claude-*".to_string(),
+            provider.route_name(),
             RouteConfig {
+                description: Some(crate::config::Description(
+                    provider.description().to_string(),
+                )),
                 model: ModelConfig {
-                    default: "anthropic/*".to_string(),
-                    fallbacks,
+                    default: format!("{}/*", provider.id()),
+                    fallbacks: Vec::new(),
                 },
                 ..Default::default()
             },
         );
     }
 
-    if has(KnownProvider::OpenAi) && clients.contains(&Client::Codex) {
-        let mut fallbacks = Vec::new();
-        if has(KnownProvider::OpenRouter) {
-            fallbacks.push("openrouter/openai/*".to_string());
+    if has(KnownProvider::Anthropic) && has(KnownProvider::OpenRouter) {
+        // Both share the same `ApiKind`, so OpenRouter can serve as a
+        // fallback on Anthropic's own classifiable route without crossing
+        // protocols.
+        if let Some(route) = config
+            .routes
+            .get_mut(&KnownProvider::Anthropic.route_name())
+        {
+            route
+                .model
+                .fallbacks
+                .push("openrouter-anthropic/anthropic/*".to_string());
         }
-        config.routes.insert(
-            "gpt-*".to_string(),
-            RouteConfig {
-                model: ModelConfig {
-                    default: "openai/*".to_string(),
-                    fallbacks,
-                },
-                ..Default::default()
-            },
-        );
     }
 
+    if has(KnownProvider::OpenAi) && has(KnownProvider::OpenRouter) {
+        if let Some(route) = config.routes.get_mut(&KnownProvider::OpenAi.route_name()) {
+            route
+                .model
+                .fallbacks
+                .push("openrouter/openai/*".to_string());
+        }
+    }
+
+    // The reserved catch-all for whatever does not clear the classification
+    // threshold on any other route — points at the first selected provider,
+    // which is as good a default as any and always exists once at least one
+    // provider was chosen.
     if let Some((first, _)) = providers.first() {
         config.routes.insert(
-            "role-default".to_string(),
+            crate::config::DEFAULT_ROUTE.to_string(),
             RouteConfig {
+                description: Some(crate::config::Description(
+                    "Fallback for requests that do not clearly match any other route's \
+                     description."
+                        .to_string(),
+                )),
                 model: ModelConfig {
                     default: format!("{}/*", first.id()),
                     fallbacks: Vec::new(),
@@ -640,7 +738,7 @@ pub fn build_config_with_auth(
             },
         );
         config.routes.insert(
-            "role-subscription".to_string(),
+            provider.subscription_route(),
             RouteConfig {
                 description: Some(crate::config::Description(
                     "Runs on a subscription via the provider's own CLI. Generation only — \
@@ -656,41 +754,14 @@ pub fn build_config_with_auth(
         );
     }
 
-    for client in clients {
-        match client {
-            Client::Claude => config.launch.claude = Some(launch_claude()),
-            Client::Codex => config.launch.codex = Some(launch_codex()),
-            Client::Opencode => config.launch.opencode = Some(launch_opencode()),
-        }
-    }
+    // `launch.<client>` is deliberately left unset: every field it could
+    // hold has a built-in default (see `crate::launch::run`), so writing it
+    // here would only add noise to a config.json that should read as
+    // `server` + `providers` + `routes` + `logging`. A user who wants
+    // Codex's `wireApi: "chat"`, opencode's `overrideProviders`, or extra
+    // launcher CLI args adds `launch` back by hand.
 
     config
-}
-
-fn launch_claude() -> crate::config::LaunchClaude {
-    crate::config::LaunchClaude {
-        model: "claude-sonnet-4-6".to_string(),
-        extra_args: Vec::new(),
-    }
-}
-
-fn launch_codex() -> crate::config::LaunchCodex {
-    crate::config::LaunchCodex {
-        model: "gpt-5.6".to_string(),
-        wire_api: "responses".to_string(),
-        extra_args: Vec::new(),
-    }
-}
-
-fn launch_opencode() -> crate::config::LaunchOpencode {
-    crate::config::LaunchOpencode {
-        // `role-default` always exists — the wizard writes it for the first
-        // selected provider. Empty `models` = every non-wildcard route.
-        model: "role-default".to_string(),
-        models: Vec::new(),
-        override_providers: vec!["openai".to_string(), "anthropic".to_string()],
-        extra_args: Vec::new(),
-    }
 }
 
 /// The `apiKey` value for one provider, given how keys should be stored.
@@ -740,7 +811,10 @@ mod tests {
         assert!(provider.base_url.is_empty());
         assert!(provider.api_key.is_none());
 
-        let route = config.routes.get("role-subscription").expect("route");
+        let route = config
+            .routes
+            .get("role-anthropic-subscription")
+            .expect("route");
         assert_eq!(route.model.default, "anthropic-subscription/sonnet");
         assert!(route.description.is_some(), "the route explains its limits");
     }
@@ -759,6 +833,67 @@ mod tests {
         assert!(config.providers.contains_key("anthropic-subscription"));
     }
 
+    /// Choosing subscriptions for both Anthropic and OpenAI used to collide:
+    /// both wrote to the fixed route name `role-subscription`, so the second
+    /// silently overwrote the first. Each now gets its own `role-<id>-subscription`.
+    #[test]
+    fn two_subscriptions_scaffold_two_routes_instead_of_colliding() {
+        let config = build_config_with_auth(
+            &[Client::Claude, Client::Codex],
+            &[
+                (KnownProvider::Anthropic, None),
+                (KnownProvider::OpenAi, None),
+            ],
+            KeyStorage::Keychain,
+            &[KnownProvider::Anthropic, KnownProvider::OpenAi],
+        );
+        assert_eq!(
+            config.routes["role-anthropic-subscription"].model.default,
+            "anthropic-subscription/sonnet"
+        );
+        assert_eq!(
+            config.routes["role-openai-subscription"].model.default,
+            "openai-subscription/default"
+        );
+    }
+
+    /// OpenRouter's Anthropic-compatible root is `/api`, not `/api/v1` — the
+    /// gateway appends `/v1/messages` itself. Reusing the `openai-chat` id's
+    /// base URL here used to double up to `/api/v1/v1/messages`.
+    #[test]
+    fn openrouter_anthropic_base_url_has_no_doubled_v1() {
+        let config = build_config(
+            &[Client::Claude],
+            &[(KnownProvider::OpenRouter, None)],
+            KeyStorage::Keychain,
+        );
+        let provider = &config.providers["openrouter-anthropic"];
+        assert_eq!(provider.base_url, "https://openrouter.ai/api");
+        assert_eq!(
+            crate::upstream::endpoint_url(
+                &crate::route::Target {
+                    transport: provider.transport,
+                    agent_args: provider.agent_args.clone(),
+                    model_ref: crate::config::ModelRef {
+                        provider: "openrouter-anthropic".into(),
+                        model: "anthropic/claude-sonnet-4.6".into(),
+                    },
+                    api: provider.api,
+                    base_url: provider.base_url.clone(),
+                    api_key: None,
+                    headers: provider
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                    inject_usage: provider.inject_usage,
+                },
+                false
+            ),
+            "https://openrouter.ai/api/v1/messages"
+        );
+    }
+
     #[test]
     fn a_codex_subscription_route_defers_the_model_to_the_cli() {
         // Which models a ChatGPT plan allows is not knowable from here.
@@ -773,7 +908,7 @@ mod tests {
         // Codex renders as openai-chat, which is what the most clients reach.
         assert_eq!(provider.api, crate::config::ApiKind::OpenaiChat);
         assert_eq!(
-            config.routes["role-subscription"].model.default,
+            config.routes["role-openai-subscription"].model.default,
             "openai-subscription/default"
         );
     }
@@ -877,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_route_gets_openrouter_anthropic_fallback() {
+    fn anthropic_route_gets_openrouter_anthropic_fallback() {
         let config = build_config(
             &[Client::Claude],
             &[
@@ -890,14 +1025,17 @@ mod tests {
         assert!(config.providers.contains_key("anthropic"));
         assert!(config.providers.contains_key("openrouter-anthropic"));
 
-        let route = config.routes.get("claude-*").expect("claude-* route");
+        let route = config
+            .routes
+            .get("role-anthropic")
+            .expect("role-anthropic route");
         assert_eq!(route.model.default, "anthropic/*");
         assert_eq!(
             route.model.fallbacks,
             vec!["openrouter-anthropic/anthropic/*".to_string()]
         );
 
-        assert!(!config.routes.contains_key("gpt-*"));
+        assert!(!config.routes.contains_key("role-openai"));
     }
 
     #[test]
@@ -908,11 +1046,11 @@ mod tests {
             KeyStorage::Literal,
         );
 
-        let route = config.routes.get("gpt-*").expect("gpt-* route");
+        let route = config.routes.get("role-openai").expect("role-openai route");
         assert_eq!(route.model.default, "openai/*");
         assert!(route.model.fallbacks.is_empty());
 
-        assert!(!config.routes.contains_key("claude-*"));
+        assert!(!config.routes.contains_key("role-anthropic"));
         assert!(!config.providers.contains_key("openrouter-anthropic"));
     }
 
@@ -924,8 +1062,44 @@ mod tests {
             KeyStorage::Env,
         );
 
-        assert!(!config.routes.contains_key("claude-*"));
-        assert!(config.routes.contains_key("gpt-*"));
+        assert!(!config.routes.contains_key("role-anthropic"));
+        assert!(config.routes.contains_key("role-openai"));
+    }
+
+    #[test]
+    fn a_default_route_is_always_scaffolded_when_a_provider_is_selected() {
+        let config = build_config(
+            &[Client::Claude],
+            &[(KnownProvider::Anthropic, Some("sk-ant-test".to_string()))],
+            KeyStorage::Literal,
+        );
+
+        let route = config
+            .routes
+            .get(crate::config::DEFAULT_ROUTE)
+            .expect("default route");
+        assert_eq!(route.model.default, "anthropic/*");
+        assert!(route.description.is_some());
+    }
+
+    #[test]
+    fn every_selected_provider_gets_a_description_for_classification() {
+        let config = build_config(
+            &[Client::Claude],
+            &[
+                (KnownProvider::Anthropic, Some("sk-ant-test".to_string())),
+                (KnownProvider::OpenRouter, Some("sk-or-test".to_string())),
+            ],
+            KeyStorage::Literal,
+        );
+
+        for name in ["role-anthropic", "role-openrouter"] {
+            let route = config.routes.get(name).unwrap_or_else(|| panic!("{name}"));
+            assert!(
+                route.description.is_some(),
+                "{name} needs a description to be a classification candidate"
+            );
+        }
     }
 
     #[test]

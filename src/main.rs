@@ -90,10 +90,6 @@ struct LaunchArgs {
     #[arg(value_enum)]
     client: launch::Client,
 
-    /// Override the route from `launch.<client>.model`.
-    #[arg(long)]
-    model: Option<String>,
-
     /// Also stop the client from reading its own user-level settings.
     ///
     /// Off by default: for Claude Code this would also discard permissions and
@@ -176,13 +172,15 @@ fn run() -> Result<()> {
             }))
         }
 
-        Command::Init => cli::init::run(),
+        Command::Init => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(cli::init::run())
+        }
 
         Command::Launch(args) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(launch::run(launch::Options {
                 client: args.client,
-                model_override: args.model,
                 isolate: args.isolate,
                 print_only: args.print,
                 forwarded_args: args.args,

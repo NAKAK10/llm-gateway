@@ -21,13 +21,16 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-Keep your existing `"model"` setting — the gateway's `claude-*` wildcard route
-forwards whatever id Claude Code resolves, including the small model used for
-background requests, so nothing breaks when Anthropic ships new ids.
+Keep whatever Claude-side `model` setting you already have if you like, but do
+not mistake it for routing control anymore. Claude still wants a model string;
+`llm-gateway` ignores that string when choosing a route and classifies every
+request by content against route descriptions instead. `llm-gateway launch
+claude` therefore feeds the fixed literal `default` to `ANTHROPIC_MODEL`, and
+Claude's own `/model` picker is cosmetic as far as gateway routing is concerned.
 
 Notes:
 
-- `ANTHROPIC_AUTH_TOKEN` gets `Bearer ` prepended automatically. Do **not**
+- `ANTHROPIC_AUTH_TOKEN` automatically becomes the HTTP bearer token. Do **not**
   also set `ANTHROPIC_API_KEY` — pick one, or you will spend an afternoon
   discovering which header won.
 - Values in the settings `env` block **override your shell environment**. That
@@ -43,8 +46,8 @@ Then you have three modes, and the choice is per launch:
 | you run | who authenticates | what you get |
 |---|---|---|
 | `claude` | Claude Code, with your subscription login | Anthropic's models on your plan. The gateway is not involved, so no routing, no fallback, no accounting. |
-| `llm-gateway launch claude` | the gateway, with provider credentials | every configured provider, routing, fallback, cost accounting |
-| the same, with a `claude-cli` route | **the local `claude` binary**, with your subscription login | your plan *through* the gateway — routing and accounting included, minus what a CLI cannot carry |
+| `llm-gateway launch claude` | the gateway, with provider credentials | every configured provider, classification, fallback, cost accounting |
+| the same, with a `claude-cli` provider in config | **the local `claude` binary**, with your subscription login | your plan *through* the gateway — classification and accounting included, minus what a CLI cannot carry |
 
 The third one is the answer to "I want my subscription, but I also want the
 gateway". A Claude Pro/Max plan is a credential for Claude Code, not an API key,
@@ -57,39 +60,45 @@ providers: {
   "claude-subscription": { api: "anthropic-messages", transport: "claude-cli" },
 },
 routes: {
-  "role-sub": { model: { default: "claude-subscription/sonnet" } },
+  "role-sub": {
+    description: "Requests that should run on my Claude subscription through the local Claude CLI. Generation only — caller tools are not passed through.",
+    model: { default: "claude-subscription/sonnet" },
+  },
+  "default": {
+    description: "Fallback for requests that do not clearly match any other route.",
+    model: { default: "anthropic/*" },
+  },
 }
 ```
 
-```sh
-llm-gateway launch claude --model role-sub
-```
+The old launch-time route override is gone. If you want this route to win for a
+certain class of requests, give it a description that genuinely distinguishes
+those requests. Classification decides; the client-side model picker does not.
 
 What that route cannot do is run **your** tools: `claude -p` has Claude Code's
 own tools, not the ones in the request, and the gateway denies all of them
 (`--allowedTools ""`) so a provider call cannot touch your files. So it is a
-generation upstream, not an agent loop — good for a `role-*` route that writes
-or summarises, wrong for the route your editor session runs on. `docs/gotchas.md`
-lists the rest (multi-turn flattening, ~5s process startup per call, sampling
-parameters dropped).
+generation upstream, not an agent loop. `docs/gotchas.md` lists the rest
+(multi-turn flattening, ~5s process startup per call, sampling parameters
+dropped).
 
 To reach **Claude models through the gateway with full API fidelity** instead —
 tools, multi-turn, streaming exactly as the API defines it — buy them from a
 provider that sells API access:
 
 - **OpenRouter** — `openrouter-anthropic/anthropic/*`, the Anthropic wire
-  protocol, so no translation (`init` scaffolds this as the `claude-*` route's
-  fallback).
+  protocol, so no translation.
 - **GitHub Copilot** — a subscription with an official API, so a Copilot plan
   does serve gateway traffic. See `docs/providers.md`; the models must be
   enabled in your Copilot settings.
 
-Leaving the Anthropic key empty during `init` is fine, and degrades predictably:
-the reference stays as `${ANTHROPIC_API_KEY}`, and a target whose credential
-does not resolve is **skipped in favour of the next fallback** rather than
-failing the request (`key_unresolved` shows up in `llm-gateway trace`). With the
-config `init` writes for Anthropic + OpenRouter, that means Claude Code traffic
-lands on OpenRouter until you set the variable.
+Leaving the Anthropic key empty during `init` is fine, and degrades
+predictably: the reference stays as `${ANTHROPIC_API_KEY}`, and a target whose
+credential does not resolve is **skipped in favour of the next fallback**
+rather than failing the request (`key_unresolved` shows up in
+`llm-gateway trace`). With the config `init` writes for Anthropic + OpenRouter,
+that means Anthropic-flavoured traffic lands on OpenRouter until you set the
+variable.
 
 ## Routing Claude Code to a non-Anthropic provider
 
@@ -98,14 +107,18 @@ Claude Code only speaks Anthropic Messages, but the gateway translates
 as a destination — Ollama (local or cloud), Groq, DeepSeek, Gemini, Mistral,
 Together, Sakana AI, PLaMo.
 
-Add a route with a plain name (route names may not contain `:` or `/`, so the
-provider's own model id stays on the right-hand side):
+Add a normal route with a real description (route names may not contain `:` or
+`/`, so the provider's own model id stays on the right-hand side):
 
 ```json5
 providers: {
   "ollama-local": { baseUrl: "http://127.0.0.1:11434/v1", api: "openai-chat" },
 },
 routes: {
+  "default": {
+    description: "Fallback for requests that do not clearly match any other route.",
+    model: { default: "anthropic/*" },
+  },
   "role-cheap": {
     description: "Short chores: summarizing, formatting, commit messages",
     model: { default: "ollama-local/qwen3:8b" },
@@ -113,14 +126,9 @@ routes: {
 }
 ```
 
-Then pick it, either per session:
-
-```sh
-llm-gateway launch claude --model role-cheap
-```
-
-or from inside Claude Code with `/model role-cheap` — the name has to match the
-route exactly.
+Then just use Claude Code normally. When the last user message looks like a
+better match for `role-cheap` than for the other routes, classification sends it
+there. Claude's `/model` UI does **not** force this route.
 
 What you give up on such a route is listed in the README
 ([Cross-protocol routing](../../README.md#cross-protocol-routing)); the short

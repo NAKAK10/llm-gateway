@@ -37,6 +37,16 @@ use crate::translate::Translation;
 use crate::upstream::{self, Attempt};
 use crate::usage::tee::{self, StreamOutcome};
 
+/// The classification match threshold, mirrored here so it is available
+/// (for trace-log text and tests) even in a `--no-default-features` build
+/// that never compiles `crate::semantic`. Must stay equal to
+/// `crate::semantic::index::CLASSIFICATION_THRESHOLD` when that module is
+/// compiled in.
+#[cfg(feature = "semantic")]
+use crate::semantic::index::CLASSIFICATION_THRESHOLD;
+#[cfg(not(feature = "semantic"))]
+const CLASSIFICATION_THRESHOLD: f32 = 0.45;
+
 /// Proxy one request. `endpoint` must be one of the four POST paths.
 pub async fn proxy(
     state: AppState,
@@ -72,16 +82,13 @@ pub async fn proxy(
         );
     };
 
-    // If `requested_model` names an auto route, this classifies the request
-    // and picks a candidate to resolve against instead — a plain route (the
-    // overwhelming majority of requests) never reaches `classify_request`'s
-    // body, since the exact-name check inside it fails immediately.
-    let semantic_attempt =
-        classify_request(&state, &config, &requested_model, &payload, expected_api);
-    let resolve_target = semantic_attempt
-        .as_ref()
-        .map(|attempt| attempt.resolve_as.as_str())
-        .unwrap_or(requested_model.as_str());
+    // Every request is classified against every candidate route's
+    // `description`, regardless of what model name the client sent — see
+    // `classify_request`. The requested model name plays no part in
+    // selection anymore; it is kept only for error messages and the trace
+    // log.
+    let semantic_attempt = classify_request(&state, &config, &payload, expected_api);
+    let resolve_target = semantic_attempt.resolve_as.as_str();
 
     let mut resolution = match route::resolve(&config, resolve_target) {
         Ok(r) => r,
@@ -369,7 +376,7 @@ fn count_tokens_locally(
     resolution: &route::Resolution,
     translation: Option<Translation>,
     payload: &serde_json::Value,
-    semantic_attempt: Option<SemanticAttempt>,
+    semantic_attempt: SemanticAttempt,
 ) -> Response {
     let input_tokens = crate::translate::request::estimate_input_tokens(payload);
     let target = &resolution.targets[0];
@@ -435,7 +442,7 @@ fn trace_record(
     resolved: TraceResolved,
     attempts: Vec<crate::record::trace_log::TraceAttempt>,
     usage: Option<TraceUsage>,
-    semantic_attempt: Option<SemanticAttempt>,
+    semantic_attempt: SemanticAttempt,
 ) -> TraceRecord {
     TraceRecord {
         ts: now_rfc3339(),
@@ -451,52 +458,51 @@ fn trace_record(
     }
 }
 
-/// What semantic classification did for one request, distilled into what
+/// What classification did for one request, distilled into what
 /// [`trace_record`] needs to fill in [`TraceRouting`].
 ///
-/// `resolve_as` is what actually went into `route::resolve` — either the
-/// winning candidate's route name, or (when nothing cleared the threshold)
-/// `requested_model` unchanged, passed back through so the trace-building
-/// code does not need to remember it separately.
+/// `resolve_as` is what actually went into `route::resolve`: the winning
+/// candidate's route name, or the reserved `default` route
+/// (`crate::config::DEFAULT_ROUTE`) when nothing cleared the threshold or
+/// classification did not run at all.
 struct SemanticAttempt {
     resolve_as: String,
+    /// Whether the classifier actually ran (embedding model loaded, text
+    /// extracted) — as opposed to being unavailable, in which case
+    /// `resolve_as` is `default` unconditionally and there is nothing to
+    /// show a trace reader beyond "no classifier".
+    classified: bool,
     matched: bool,
     candidates: Vec<TraceCandidate>,
     score: Option<f32>,
-    threshold: f32,
     embed_ms: u64,
 }
 
 /// Build the `routing` block of a trace record.
-///
-/// `semantic_attempt` is `None` whenever classification never ran for this
-/// request — `requested_model` did not name an auto route, or (`semantic`
-/// feature disabled, or no `semantic` route existed at startup) the
-/// classifier was never loaded — and the trace stays `mode: "explicit"`,
-/// exactly as before semantic routing existed.
-fn routing_from(
-    resolution: &route::Resolution,
-    semantic_attempt: Option<SemanticAttempt>,
-) -> TraceRouting {
-    let Some(attempt) = semantic_attempt else {
+fn routing_from(resolution: &route::Resolution, attempt: SemanticAttempt) -> TraceRouting {
+    if !attempt.classified {
         return TraceRouting {
-            mode: "explicit".to_string(),
+            mode: "no_classifier".to_string(),
             matched_route: resolution.route_name.clone(),
-            reason: resolution.kind.reason().to_string(),
+            reason: format!(
+                "no classifier available; falling back to the reserved `{}` route",
+                crate::config::DEFAULT_ROUTE
+            ),
             candidates: Vec::new(),
             score: None,
             threshold: None,
             embed_ms: None,
         };
-    };
+    }
 
     let reason = if attempt.matched {
         "semantic classification matched a candidate".to_string()
     } else {
         format!(
             "semantic classification: best candidate did not clear threshold {:.2}; \
-             falling back to the auto route's own model",
-            attempt.threshold
+             falling back to the reserved `{}` route",
+            CLASSIFICATION_THRESHOLD,
+            crate::config::DEFAULT_ROUTE
         )
     };
 
@@ -506,34 +512,43 @@ fn routing_from(
         reason,
         candidates: attempt.candidates,
         score: attempt.score,
-        threshold: Some(attempt.threshold),
+        threshold: Some(CLASSIFICATION_THRESHOLD),
         embed_ms: Some(attempt.embed_ms),
     }
 }
 
-/// Classify `requested_model` against its `semantic` candidates, if it names
-/// an auto route and the classifier is loaded.
+/// Classify the request's content against every candidate route.
 ///
-/// `None` when `requested_model` does not name a route with a `semantic`
-/// block, when the classifier was never built (no such route existed at
-/// startup — see `crate::server::prepare_classifier`), or when the request's
-/// last user message could not be extracted at all. In every one of those
-/// cases classification never ran, and the caller falls back to resolving
-/// `requested_model` directly, with the trace staying `mode: "explicit"`.
+/// Always attempted, regardless of what model name the client sent — the
+/// requested model name plays no part in route selection anymore.
+/// `classified` is `false` (and `resolve_as` is the reserved `default`
+/// route) only when the classifier was not loaded (should not happen on a
+/// normally started server — see `crate::server::prepare_classifier`) or the
+/// request's last user message could not be extracted at all.
 #[cfg(feature = "semantic")]
 fn classify_request(
     state: &AppState,
-    config: &Config,
-    requested_model: &str,
+    _config: &Config,
     payload: &serde_json::Value,
     expected_api: ApiKind,
-) -> Option<SemanticAttempt> {
-    let classifier = state.classifier.as_ref()?;
-    let semantic = config.routes.get(requested_model)?.semantic.as_ref()?;
-    let threshold = semantic.threshold;
+) -> SemanticAttempt {
+    let fallback = || SemanticAttempt {
+        resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
+        classified: false,
+        matched: false,
+        candidates: Vec::new(),
+        score: None,
+        embed_ms: 0,
+    };
 
-    let text = classification_text(expected_api, payload)?;
-    let verdict = classifier.classify(requested_model, &text, expected_api)?;
+    let Some(classifier) = state.classifier.as_ref() else {
+        return fallback();
+    };
+    let Some(text) = classification_text(expected_api, payload) else {
+        return fallback();
+    };
+
+    let verdict = classifier.classify(&text, expected_api);
 
     let candidates: Vec<TraceCandidate> = verdict
         .candidates
@@ -548,35 +563,41 @@ fn classify_request(
     // close the closest candidate came.
     let score = verdict.candidates.first().map(|(_, score)| *score);
 
-    Some(match verdict.matched {
+    match verdict.matched {
         Some((route, _)) => SemanticAttempt {
             resolve_as: route,
+            classified: true,
             matched: true,
             candidates,
             score,
-            threshold,
             embed_ms: verdict.embed_ms,
         },
         None => SemanticAttempt {
-            resolve_as: requested_model.to_string(),
+            resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
+            classified: true,
             matched: false,
             candidates,
             score,
-            threshold,
             embed_ms: verdict.embed_ms,
         },
-    })
+    }
 }
 
 #[cfg(not(feature = "semantic"))]
 fn classify_request(
     _state: &AppState,
     _config: &Config,
-    _requested_model: &str,
     _payload: &serde_json::Value,
     _expected_api: ApiKind,
-) -> Option<SemanticAttempt> {
-    None
+) -> SemanticAttempt {
+    SemanticAttempt {
+        resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
+        classified: false,
+        matched: false,
+        candidates: Vec::new(),
+        score: None,
+        embed_ms: 0,
+    }
 }
 
 /// The last user message's text, untruncated — used for semantic
@@ -799,13 +820,20 @@ mod tests {
     }
 
     #[test]
-    fn routing_from_stays_explicit_without_a_semantic_attempt() {
-        let res = resolution("claude-*", route::MatchKind::Wildcard);
-        let routing = routing_from(&res, None);
+    fn routing_from_reports_no_classifier() {
+        let res = resolution(crate::config::DEFAULT_ROUTE, route::MatchKind::Exact);
+        let attempt = SemanticAttempt {
+            resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
+            classified: false,
+            matched: false,
+            candidates: Vec::new(),
+            score: None,
+            embed_ms: 0,
+        };
+        let routing = routing_from(&res, attempt);
 
-        assert_eq!(routing.mode, "explicit");
-        assert_eq!(routing.matched_route, "claude-*");
-        assert_eq!(routing.reason, route::MatchKind::Wildcard.reason());
+        assert_eq!(routing.mode, "no_classifier");
+        assert_eq!(routing.matched_route, crate::config::DEFAULT_ROUTE);
         assert!(routing.candidates.is_empty());
         assert!(routing.score.is_none());
         assert!(routing.threshold.is_none());
@@ -817,6 +845,7 @@ mod tests {
         let res = resolution("role-writer", route::MatchKind::Exact);
         let attempt = SemanticAttempt {
             resolve_as: "role-writer".to_string(),
+            classified: true,
             matched: true,
             candidates: vec![
                 TraceCandidate {
@@ -829,16 +858,15 @@ mod tests {
                 },
             ],
             score: Some(0.8),
-            threshold: 0.45,
             embed_ms: 2,
         };
 
-        let routing = routing_from(&res, Some(attempt));
+        let routing = routing_from(&res, attempt);
 
         assert_eq!(routing.mode, "semantic");
         assert_eq!(routing.matched_route, "role-writer");
         assert_eq!(routing.score, Some(0.8));
-        assert_eq!(routing.threshold, Some(0.45));
+        assert_eq!(routing.threshold, Some(CLASSIFICATION_THRESHOLD));
         assert_eq!(routing.embed_ms, Some(2));
         assert_eq!(routing.candidates.len(), 2);
         assert!(routing.reason.contains("matched"), "{}", routing.reason);
@@ -846,25 +874,25 @@ mod tests {
 
     #[test]
     fn routing_from_explains_a_fallback_below_threshold() {
-        let res = resolution("auto", route::MatchKind::Exact);
+        let res = resolution(crate::config::DEFAULT_ROUTE, route::MatchKind::Exact);
         let attempt = SemanticAttempt {
-            resolve_as: "auto".to_string(),
+            resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
+            classified: true,
             matched: false,
             candidates: vec![TraceCandidate {
                 route: "role-writer".to_string(),
                 score: 0.2,
             }],
             score: Some(0.2),
-            threshold: 0.45,
             embed_ms: 1,
         };
 
-        let routing = routing_from(&res, Some(attempt));
+        let routing = routing_from(&res, attempt);
 
         assert_eq!(routing.mode, "semantic");
-        assert_eq!(routing.matched_route, "auto");
+        assert_eq!(routing.matched_route, crate::config::DEFAULT_ROUTE);
         assert_eq!(routing.score, Some(0.2));
-        assert_eq!(routing.threshold, Some(0.45));
+        assert_eq!(routing.threshold, Some(CLASSIFICATION_THRESHOLD));
         assert_eq!(routing.candidates.len(), 1);
         assert!(
             routing.reason.contains("0.45"),
@@ -875,7 +903,9 @@ mod tests {
 
     /// Builds just enough `AppState` to exercise `classify_request` without a
     /// loaded embedding model: a `Recorder` over a scratch directory and a
-    /// config, nothing more.
+    /// config, nothing more. `classifier` stays `None` — see
+    /// `crate::server::AppState::classifier`'s doc comment for why that is a
+    /// legitimate (if unusual outside tests) state.
     fn test_state(config: crate::config::Config) -> (tempfile::TempDir, AppState) {
         let dir = tempfile::tempdir().unwrap();
         let recorder = Recorder::start(
@@ -901,8 +931,8 @@ mod tests {
         (dir, state)
     }
 
-    fn auto_route_config() -> crate::config::Config {
-        use crate::config::{ModelConfig, ProviderConfig, RouteConfig, SecretRef, SemanticConfig};
+    fn classifiable_config() -> crate::config::Config {
+        use crate::config::{ModelConfig, ProviderConfig, RouteConfig, SecretRef};
 
         let mut config = crate::config::Config::default();
         config.providers.insert(
@@ -929,16 +959,13 @@ mod tests {
             },
         );
         config.routes.insert(
-            "auto".to_string(),
+            crate::config::DEFAULT_ROUTE.to_string(),
             RouteConfig {
+                description: Some(crate::config::Description("catch-all".to_string())),
                 model: ModelConfig {
                     default: "anthropic/opus-pinned".to_string(),
                     fallbacks: Vec::new(),
                 },
-                semantic: Some(SemanticConfig {
-                    candidates: vec!["role-writer".to_string()],
-                    threshold: 0.45,
-                }),
                 ..Default::default()
             },
         );
@@ -947,55 +974,28 @@ mod tests {
 
     #[cfg(feature = "semantic")]
     #[tokio::test]
-    async fn classify_request_does_nothing_without_a_loaded_classifier() {
-        // A `semantic` route existed at startup but, in this test, the
-        // classifier is `None` — same as a config that never asked for
-        // semantic routing at all: the caller must fall back, not panic.
-        let (_dir, state) = test_state(auto_route_config());
+    async fn classify_request_falls_back_to_default_without_a_loaded_classifier() {
+        // `classifier` is `None` in this test state — same situation a
+        // never-started classifier would leave a request in: the caller
+        // must fall back to `default`, not panic.
+        let (_dir, state) = test_state(classifiable_config());
         let config = state.config.get();
         let payload = json!({ "messages": [{"role": "user", "content": "hello"}] });
 
-        let attempt = classify_request(
-            &state,
-            &config,
-            "auto",
-            &payload,
-            ApiKind::AnthropicMessages,
-        );
-        assert!(attempt.is_none());
-    }
-
-    #[cfg(feature = "semantic")]
-    #[tokio::test]
-    async fn classify_request_does_nothing_for_a_plain_route() {
-        let (_dir, state) = test_state(auto_route_config());
-        let config = state.config.get();
-        let payload = json!({ "messages": [{"role": "user", "content": "hello"}] });
-
-        let attempt = classify_request(
-            &state,
-            &config,
-            "role-writer",
-            &payload,
-            ApiKind::AnthropicMessages,
-        );
-        assert!(attempt.is_none());
+        let attempt = classify_request(&state, &config, &payload, ApiKind::AnthropicMessages);
+        assert!(!attempt.classified);
+        assert_eq!(attempt.resolve_as, crate::config::DEFAULT_ROUTE);
     }
 
     #[cfg(not(feature = "semantic"))]
     #[tokio::test]
     async fn classify_request_is_always_a_no_op_without_the_semantic_feature() {
-        let (_dir, state) = test_state(auto_route_config());
+        let (_dir, state) = test_state(classifiable_config());
         let config = state.config.get();
         let payload = json!({ "messages": [{"role": "user", "content": "hello"}] });
 
-        let attempt = classify_request(
-            &state,
-            &config,
-            "auto",
-            &payload,
-            ApiKind::AnthropicMessages,
-        );
-        assert!(attempt.is_none());
+        let attempt = classify_request(&state, &config, &payload, ApiKind::AnthropicMessages);
+        assert!(!attempt.classified);
+        assert_eq!(attempt.resolve_as, crate::config::DEFAULT_ROUTE);
     }
 }

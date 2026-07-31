@@ -130,7 +130,6 @@ mod tests {
     fn config_with_codex(wire_api: &str) -> Config {
         let mut config = Config::default();
         config.launch.codex = Some(crate::config::LaunchCodex {
-            model: "unused".to_string(),
             wire_api: wire_api.to_string(),
             extra_args: Vec::new(),
         });

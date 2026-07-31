@@ -22,15 +22,17 @@ Add to `~/.config/opencode/opencode.json`:
         "headers": { "x-gw-client": "opencode" }
       },
       "models": {
-        "role-default": {}
+        "default": {}
       }
     }
   }
 }
 ```
 
-Then select with `-m gateway/role-default`, or set it per agent in your
-`agents/*.md` files (`model: gateway/role-default`).
+Then select `-m gateway/default`, or set it per agent in your `agents/*.md`
+files (`model: gateway/default`). The client still needs some model id; the
+gateway ignores that choice for routing and classifies by prompt content across
+all configured route descriptions.
 
 Notes:
 
@@ -49,7 +51,7 @@ Notes:
 ## Verify
 
 ```sh
-opencode run -m gateway/role-default "ping"
+opencode run -m gateway/default "ping"
 llm-gateway stats --by client     # an opencode row must appear
 ```
 

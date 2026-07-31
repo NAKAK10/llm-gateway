@@ -22,6 +22,13 @@ use crate::paths;
 
 pub use secret::SecretRef;
 
+/// The reserved route name used when a request's content does not clear the
+/// classification threshold for any other route (or is not classified at
+/// all — a build without the `semantic` feature, an unloaded classifier).
+/// `validate` requires this route to exist and forbids it from being a
+/// wildcard; every other route is an ordinary classification candidate.
+pub const DEFAULT_ROUTE: &str = "default";
+
 /// Root of `config.json`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -40,7 +47,11 @@ pub struct Config {
     #[serde(default)]
     pub routes: BTreeMap<String, RouteConfig>,
 
-    #[serde(default)]
+    /// Per-client launch tweaks (`llm-gateway launch claude|codex|opencode`).
+    /// Every field has a sane built-in default, so a normal `config.json`
+    /// omits this key entirely — it exists only for the rare hand-edit
+    /// (extra CLI args, Codex's `wireApi`, opencode's provider overrides).
+    #[serde(default, skip_serializing_if = "LaunchConfig::is_empty")]
     pub launch: LaunchConfig,
 
     #[serde(default)]
@@ -246,23 +257,15 @@ pub struct RouteConfig {
 
     /// Human-readable purpose, inline or as a path to a Markdown file.
     ///
-    /// This is documentation today and the classification corpus once semantic
-    /// routing lands — the more concrete it is, the better that will work.
+    /// This is documentation *and* the classification corpus: every request,
+    /// regardless of what model name the client sent, is classified against
+    /// every route's `description` and dispatched to whichever route's text
+    /// is the closest match. A route with no description cannot win — see
+    /// `validate`, which requires one on every non-wildcard route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<Description>,
 
     pub model: ModelConfig,
-
-    /// Turns this route into an "auto route": instead of forwarding to `model`
-    /// directly, the request body is classified against `candidates` and the
-    /// best match is used.
-    ///
-    /// `model` stays mandatory even here — it is not a fallback default, it is
-    /// the destination when no candidate's similarity clears `threshold`. This
-    /// is why `model` is not `Option`: every route, semantic or not, always has
-    /// somewhere to send the request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub semantic: Option<SemanticConfig>,
 }
 
 /// A `description` value: either the text itself or a path to a file holding it.
@@ -329,38 +332,6 @@ pub struct ModelConfig {
     pub fallbacks: Vec<String>,
 }
 
-/// Semantic routing for a designated auto route.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SemanticConfig {
-    /// Routes eligible for selection. Empty means "every other route that has
-    /// a description".
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub candidates: Vec<String>,
-
-    /// Minimum cosine similarity the top candidate must reach. Below it, this
-    /// route's own `model` is used instead.
-    #[serde(default = "default_threshold")]
-    pub threshold: f32,
-}
-
-/// Hand-written rather than derived: a derived `Default` would give
-/// `threshold: 0.0`, which silently means "every candidate always clears the
-/// bar" — the opposite of a safe default, and different from what parsing an
-/// omitted `threshold` produces.
-impl Default for SemanticConfig {
-    fn default() -> Self {
-        Self {
-            candidates: Vec::new(),
-            threshold: default_threshold(),
-        }
-    }
-}
-
-fn default_threshold() -> f32 {
-    0.45
-}
-
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LaunchConfig {
@@ -374,23 +345,23 @@ pub struct LaunchConfig {
     pub opencode: Option<LaunchOpencode>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+impl LaunchConfig {
+    fn is_empty(&self) -> bool {
+        self.claude.is_none() && self.codex.is_none() && self.opencode.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LaunchClaude {
-    /// Route name passed as `ANTHROPIC_MODEL`.
-    pub model: String,
-
     /// Appended to the child's argv before any user-supplied arguments.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LaunchCodex {
-    /// Route name passed via `-c model="..."`.
-    pub model: String,
-
     /// `responses` or `chat`.
     ///
     /// Sources disagree on whether Codex still accepts `chat`. The gateway
@@ -406,12 +377,9 @@ fn default_wire_api() -> String {
     "responses".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LaunchOpencode {
-    /// Route name; becomes `-m gateway/<model>`.
-    pub model: String,
-
     /// Route names exposed to opencode. Each must appear in `GET /v1/models`
     /// verbatim — opencode fails silently on a mismatch rather than erroring.
     /// Empty means "every non-wildcard route".
@@ -425,9 +393,8 @@ pub struct LaunchOpencode {
     /// reference, so an agent file pinning `model: openai/gpt-…` would
     /// otherwise talk to OpenAI directly and silently bypass the gateway.
     /// Redirecting the built-in providers keeps per-agent model choices
-    /// intact while routing every request through the gateway (the `gpt-*` /
-    /// `claude-*` wildcard routes forward the ids unchanged). Set to `[]` to
-    /// disable.
+    /// intact while routing every request through the gateway. Set to `[]`
+    /// to disable.
     #[serde(default = "default_opencode_overrides")]
     pub override_providers: Vec<String>,
 

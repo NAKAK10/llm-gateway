@@ -2,6 +2,86 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-07-31 — Always classify; remove route-selection theatrics from the config
+
+The old split brain — "exact/wildcard routing is the real thing, semantic
+routing is an opt-in extra" — did not survive contact with the codebase. The
+new rule is simpler: classify every request, keep one reserved fallback, and
+stop pretending the client's `model` string is a policy API.
+
+**Always-classify beat opt-in because the gateway only had one interesting
+routing question left.** `src/server/proxy.rs::classify_request` now embeds the
+last user message for every inbound request, scores it against every
+non-wildcard route description via `src/semantic/index.rs`, and uses the top
+candidate only if it clears `CLASSIFICATION_THRESHOLD` (`0.45`). That is easier
+to explain, easier to trace, and harder to misconfigure than a special
+`routes[].semantic` side path.
+
+**`default` became the one explicit escape hatch.** `src/config/mod.rs`
+reserves the route name, `src/config/validate.rs` requires it to exist and
+forbids it from being a wildcard, and the classifier falls back to it both on a
+low score and on classifier absence. It is still a real route with its own
+`description` and `model`, so it can win honestly instead of being a dead bucket
+at the bottom of the file.
+
+**The config had to stop narrating removed choices.** The everyday schema is now
+`server` + `providers` + `routes` + `logging`; `launch` survives only as the
+rare hand-edit for extra CLI args, Codex's `wireApi`, and opencode's provider
+overrides (`src/config/mod.rs`). `launch.<client>.model` went away because the
+launchers in `src/launch/` always feed the fixed literal `default` to the child
+process now. The client still wants *a* model-shaped string; the gateway no
+longer treats it as authority.
+
+**`semantic` becoming a default feature is what makes the docs honest.**
+`Cargo.toml` now enables it by default, `src/cli/init.rs` downloads the
+`potion-multilingual-128M` files unconditionally before writing `config.json`,
+and the only opt-out is a `--no-default-features` build that always routes to
+`default`. "Install classification if you feel like it later" was no longer a
+true statement once `init` depended on the model being there.
+
+**No migration path is deliberate, not forgotten.** The shape changed too much:
+`routes[].semantic` disappeared, launcher `model` fields disappeared, `init`
+stopped generating wildcard selector routes, and validation now demands a
+literal `default` route plus descriptions on every non-wildcard route. The only
+safe instruction is to delete `~/.config/llm-gateway/config.json` (or the whole
+config directory from `src/paths.rs`) and re-run `llm-gateway init`.
+
+## 2026-07-31 — `init`'s subscription and OpenRouter scaffolding, two bugs fixed
+
+Flagged by the owner as "confusing": a fresh `config.json` can carry
+`anthropic`, `anthropic-subscription`, `openrouter`, `openrouter-anthropic` —
+one upstream's account under several ids. Investigating *why* surfaced two
+real bugs, fixed here, plus one thing that is not a bug.
+
+**Bug: `openrouter-anthropic`'s `baseUrl` doubled `/v1`.** `init` reused
+`KnownProvider::OpenRouter.base_url()` (`https://openrouter.ai/api/v1`, meant
+for the `openai-chat` id) for the Anthropic-protocol id too. `endpoint_url`
+appends `/v1/messages` for any `anthropic-messages` provider, producing
+`https://openrouter.ai/api/v1/v1/messages` — a URL that 404s. OpenRouter's
+Anthropic-compatible root is `/api`, not `/api/v1`; `openrouter-anthropic` now
+gets its own literal base URL instead of borrowing the other id's.
+
+**Bug: two subscriptions collided on one route name.** Choosing both an
+Anthropic and an OpenAI subscription made `init` write `role-subscription`
+twice — the second `Config.routes.insert` silently discarded the first, so
+the Anthropic route vanished from the generated file with no error. Each
+subscription now gets `role-<id>-subscription` (`role-anthropic-subscription`,
+`role-openai-subscription`).
+
+**Not a bug, but worth writing down: why the duplicate ids exist at all.** A
+`ProviderConfig` couples one upstream to exactly one `ApiKind` and one
+`Transport`, by design (`src/config/mod.rs`) — so that
+`route.model.fallbacks` never has to cross either mid-request. OpenRouter
+answers two protocols and Anthropic can be reached by two mechanisms (a key,
+or the subscription's CLI), and neither the code nor the config format has a
+narrower way to say "same account, different shape" than a second id. A
+provider-per-(protocol, transport) model is simpler to reach *from*, but
+folding several shapes into one entry would touch `validate`, `route`,
+`proxy`, `semantic::index`, `usage::tee` and every place that reads
+`ProviderConfig.api` as a single value — a larger change than this pass, and
+not undertaken here. `docs/providers.md` now says this out loud instead of
+leaving the second id to look like an accident.
+
 ## 2026-07-31 — `codex exec` too, rendered as `openai-chat`, with the verification gap recorded
 
 The same reasoning as the entry below, applied to a ChatGPT plan:

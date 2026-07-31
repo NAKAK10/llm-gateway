@@ -58,6 +58,22 @@ Traps we already know about. If you hit one that isn't here, add it.
   startup environment.
 - **`localhost` may resolve to `::1`.** Every config and doc uses `127.0.0.1`.
 
+## Classification / routes
+
+- **Route descriptions are not decorative anymore.** Every request is embedded
+  against every non-wildcard route's `description`; five near-identical
+  descriptions produce five near-identical scores. Write distinguishing text,
+  not provider names in different hats.
+- **The classification threshold is fixed at `0.45`.** It lives in
+  `src/semantic/index.rs` as `CLASSIFICATION_THRESHOLD`; there is no per-route
+  knob and no `routes[].semantic` block anymore.
+- **`default` is both fallback and candidate.** It catches requests when nothing
+  else clears the threshold, but it can also win outright if its description is
+  the best match. Treat it like a real route, not an empty bucket.
+- **`init` needs network and a few hundred MB free.** It downloads the static
+  embedding model unconditionally before writing `config.json`. The only opt-out
+  is a build without default features, which then routes everything to `default`.
+
 ## Cross-protocol translation
 
 Only one direction exists: `anthropic-messages` in → `openai-chat` out

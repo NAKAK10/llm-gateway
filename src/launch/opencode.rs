@@ -48,13 +48,13 @@ pub fn build(
     };
 
     let wanted_models = resolved_models(config, models);
-    let overrides: &[String] = config
+    let overrides: Vec<String> = config
         .launch
         .opencode
         .as_ref()
-        .map(|c| c.override_providers.as_slice())
-        .unwrap_or(&[]);
-    let content = config_content(&base_url, api_key.as_deref(), &wanted_models, overrides);
+        .map(|c| c.override_providers.clone())
+        .unwrap_or_else(|| vec!["openai".to_string(), "anthropic".to_string()]);
+    let content = config_content(&base_url, api_key.as_deref(), &wanted_models, &overrides);
 
     let env = vec![(
         "OPENCODE_CONFIG_CONTENT".to_string(),
