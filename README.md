@@ -62,6 +62,13 @@ llm-gateway stats           # what was spent, per route
 llm-gateway update          # upgrade to the latest release
 ```
 
+Before asking which role to configure, `init` asks one more question: "Which
+language do you mainly write instructions in?" — English, 日本語, 中文, 한국어, or
+Español. Every route's `description` it scaffolds, including `default`'s, is
+generated in that language; see
+[Content-classified routing](#content-classified-routing) for why this
+matters.
+
 **Breaking config change:** there is no migration shim for the old schema.
 Delete `~/.config/llm-gateway/config.json` (or the whole
 `~/.config/llm-gateway/` directory) and re-run `llm-gateway init`.
@@ -129,6 +136,13 @@ Important consequences:
 - **Every non-wildcard route needs a real `description`.** That text is both
   documentation and the classification corpus; boilerplate descriptions produce
   boilerplate routing.
+- **Write `description` in the language you give instructions in.** The
+  embedding model (`potion-multilingual-128M`) aligns meaning weakly across
+  languages: measured cosine similarity between a Japanese instruction and an
+  English `description` sits around 0.19–0.26 — well under the 0.45 threshold
+  — while same-language pairs measure 0.55–0.79. `llm-gateway init` asks which
+  language you mainly write instructions in and generates every route's
+  `description`, including `default`'s, in that language.
 - **Every route's model must be explicit — `"<provider>/<model>"`, no `*`.**
   A model string can no longer borrow the client's requested model name: since
   routing is decided purely by content classification, there is nothing left

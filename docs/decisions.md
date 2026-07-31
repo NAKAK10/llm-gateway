@@ -2,6 +2,49 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-08-01 — `description` must be written in the request's language; `init` adds a language-selection step
+
+Stripping `<system-reminder>` blocks (previous entry) fixed the boilerplate
+mis-routing, but it uncovered a second, larger problem: with the injected
+English preamble gone, every Japanese-language session started falling
+through to `default` on essentially every turn. The route descriptions were
+all written in English, and the requests were in Japanese.
+
+Measured cause: the shipped embedding model, `potion-multilingual-128M`,
+aligns meaning only weakly across languages. Cosine similarity between a
+Japanese instruction and its matching English `description` measured
+**0.19–0.26** — nowhere near the fixed **0.45** threshold — while the same
+instruction against a Japanese-language `description` measured **0.55–0.79**.
+The model is multilingual in the sense that it has vocabulary coverage for
+each language, not in the sense that it places semantically equivalent
+sentences from different languages near each other in embedding space.
+
+**Built: `description` is now a language-matching contract, not just a
+content one.** `llm-gateway init` gained a language-selection step — English,
+日本語, 中文, 한국어, or Español — asked once, before role selection. Every
+route's `description` the wizard scaffolds, including `default`'s, is
+generated in the chosen language. Docs now say explicitly: write
+`description` in whatever language you actually give the model instructions
+in, because the embedding comparison is same-language-only in practice.
+
+**Rejected: translate the request to English before embedding it.** This
+would fix the mismatch without asking users anything, but it requires an LLM
+call in the routing path before the routing decision itself — the entire
+design point of static `model2vec-rs` embeddings is a sub-millisecond,
+model-call-free classification step. A translation call on every request (or
+even just on ones that miss the threshold) reintroduces the latency and cost
+the static-embedding approach exists to avoid, and adds a second point of
+failure ahead of the provider call classification is supposed to select.
+
+**Future option, not built:** embed `description` as multiple per-sentence
+vectors instead of one whole-string vector, and score a route by the max
+cosine across its sentences rather than one embedding of the concatenated
+text. This would not fix cross-lingual alignment, but it addresses a related
+dilution problem — a long, multi-topic `description` embedding gets pulled
+toward its centroid and can under-match a request that clearly matches only
+one sentence of it. Not attempted here because the language mismatch was the
+dominant failure mode by a wide margin.
+
 ## 2026-07-31 — Classification input strips `<system-reminder>` blocks; trace gains `decided_by_text` / `walk`
 
 History walk-back (below) made an existing problem much worse: Claude Code
