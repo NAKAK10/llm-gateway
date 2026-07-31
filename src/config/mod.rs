@@ -425,13 +425,16 @@ pub struct LoggingConfig {
     pub debug: bool,
 
     /// Whether `serve` prints its diagnostic console log (embedding-model
-    /// preparation, per-attempt fallback outcomes, ...) to stderr.
+    /// preparation, which route/provider was picked, per-attempt fallback
+    /// outcomes, ...) to stderr.
     ///
-    /// Off by default: a plain gateway process should stay quiet. Setting it
-    /// to `true` raises the console log level so those `tracing::info!`
-    /// calls are actually emitted; it does not affect the on-disk usage/trace
-    /// logs controlled by [`Self::usage`] and [`Self::debug`] above, and an
-    /// explicit `RUST_LOG` still wins over it.
+    /// Off by default: a plain gateway process should stay quiet, and other
+    /// tooling/agents driving `serve` should not have their stderr suddenly
+    /// grow noisier on upgrade. Setting it to `true` raises the console log
+    /// level so those `tracing::info!` calls are actually emitted; it does
+    /// not affect the on-disk usage/trace logs controlled by [`Self::usage`]
+    /// and [`Self::debug`] above, and an explicit `RUST_LOG` still wins over
+    /// it.
     #[serde(default)]
     pub logging: bool,
 }
@@ -559,4 +562,3 @@ mod tests {
         assert!(parsed.logging);
     }
 }
-

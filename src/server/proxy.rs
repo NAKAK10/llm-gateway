@@ -214,6 +214,12 @@ pub async fn proxy(
             Ok(accepted) => accepted,
             Err(err) => {
                 let dur_ms = started.elapsed().as_millis() as u64;
+                tracing::warn!(
+                    route = %resolution.route_name,
+                    attempts = attempts.len(),
+                    "all upstreams failed for route `{}`: {err}",
+                    resolution.route_name,
+                );
                 if !count_tokens {
                     state.recorder.usage(UsageRecord {
                         ts: now_rfc3339(),
@@ -248,6 +254,35 @@ pub async fn proxy(
                 return error_response(http::StatusCode::BAD_GATEWAY, &err.to_string());
             }
         };
+
+    // Console visibility for "which route/provider/model actually served
+    // this request, and did it take more than one attempt to get there" —
+    // gated behind `logging.logging` (on by default), same as the
+    // per-attempt logs in `upstream::send_with_fallback`.
+    if accepted.attempt > 1 {
+        tracing::info!(
+            route = %resolution.route_name,
+            provider = %accepted.target_provider,
+            model = %accepted.target_model,
+            attempt = accepted.attempt,
+            "route `{}` served by {}/{} after falling back ({} attempt{})",
+            resolution.route_name,
+            accepted.target_provider,
+            accepted.target_model,
+            accepted.attempt,
+            if accepted.attempt == 1 { "" } else { "s" },
+        );
+    } else {
+        tracing::info!(
+            route = %resolution.route_name,
+            provider = %accepted.target_provider,
+            model = %accepted.target_model,
+            "route `{}` served by {}/{}",
+            resolution.route_name,
+            accepted.target_provider,
+            accepted.target_model,
+        );
+    }
 
     let status = accepted.status;
     let upstream_headers = accepted.headers.clone();
@@ -564,22 +599,46 @@ fn classify_request(
     let score = verdict.candidates.first().map(|(_, score)| *score);
 
     match verdict.matched {
-        Some((route, _)) => SemanticAttempt {
-            resolve_as: route,
-            classified: true,
-            matched: true,
-            candidates,
-            score,
-            embed_ms: verdict.embed_ms,
-        },
-        None => SemanticAttempt {
-            resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
-            classified: true,
-            matched: false,
-            candidates,
-            score,
-            embed_ms: verdict.embed_ms,
-        },
+        Some((route, matched_score)) => {
+            // Console visibility for "did the embedding classifier actually
+            // run, and what did it pick" — gated behind `logging.logging`
+            // (on by default) via the console filter in `server::init_tracing`.
+            tracing::info!(
+                route = %route,
+                score = matched_score,
+                embed_ms = verdict.embed_ms,
+                "classified request to route `{route}` (score {matched_score:.3}, embed {}ms)",
+                verdict.embed_ms,
+            );
+            SemanticAttempt {
+                resolve_as: route,
+                classified: true,
+                matched: true,
+                candidates,
+                score,
+                embed_ms: verdict.embed_ms,
+            }
+        }
+        None => {
+            tracing::info!(
+                route = %crate::config::DEFAULT_ROUTE,
+                score = score,
+                embed_ms = verdict.embed_ms,
+                "no route cleared the classification threshold (closest score {}), \
+                 falling back to `{}` (embed {}ms)",
+                score.map(|s| format!("{s:.3}")).unwrap_or_else(|| "n/a".to_string()),
+                crate::config::DEFAULT_ROUTE,
+                verdict.embed_ms,
+            );
+            SemanticAttempt {
+                resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
+                classified: true,
+                matched: false,
+                candidates,
+                score,
+                embed_ms: verdict.embed_ms,
+            }
+        }
     }
 }
 

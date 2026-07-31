@@ -2,6 +2,25 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-07-31 — route/fallback outcomes get their own console lines, `logging.logging` stays opt-in
+
+The previous entry below made `serve`'s console diagnostics opt-in behind
+`logging.logging` (default `false`). Turning that default to `true` was
+tried and reverted: other tooling/agents already driving `serve` should not
+have their stderr suddenly grow noisier on an upgrade they didn't ask for.
+The default stays `false` — quiet unless a user opts in via `config.json` or
+`RUST_LOG`.
+
+**Two new `info!` lines make the routing decision itself visible once
+`logging.logging` is turned on, not just its failures.** `classify_request`
+(`src/server/proxy.rs`) now logs the winning route and its score (or, on a
+fallback, the closest score that still missed the threshold) right after
+every classification, and `proxy` logs which provider/model actually served
+the request once `send_with_fallback` returns — including how many attempts
+it took when a fallback fired. Before this, only failed attempts and startup
+events were logged at all; a successful first-try request produced no
+console line whatsoever, even with `logging.logging: true` set.
+
 ## 2026-07-31 — `serve` gets a quiet-by-default console log behind `logging.logging`
 
 `serve` always printed its `tracing::info!` diagnostics — embedding-model
