@@ -47,6 +47,20 @@ use crate::semantic::index::CLASSIFICATION_THRESHOLD;
 #[cfg(not(feature = "semantic"))]
 const CLASSIFICATION_THRESHOLD: f32 = 0.45;
 
+/// Whether classification should run for this request.
+///
+/// Defaults to `true` (the historical always-classify behaviour) so a
+/// request from anything other than `llm-gateway launch` — a manually
+/// configured client, curl, etc. — is unaffected. `llm-gateway launch` sets
+/// `x-gw-auto-route: 0` when the session answered "no" to its auto-classify
+/// prompt.
+fn auto_route_requested(headers: &HeaderMap) -> bool {
+    match headers.get("x-gw-auto-route").and_then(|v| v.to_str().ok()) {
+        Some(v) => !matches!(v.trim(), "0" | "false" | "no" | "off"),
+        None => true,
+    }
+}
+
 /// Proxy one request. `endpoint` must be one of the four POST paths.
 pub async fn proxy(
     state: AppState,
@@ -87,7 +101,23 @@ pub async fn proxy(
     // `classify_request`. The requested model name plays no part in
     // selection anymore; it is kept only for error messages and the trace
     // log.
-    let semantic_attempt = classify_request(&state, &config, &payload, expected_api);
+    //
+    // The one opt-out is `x-gw-auto-route: 0`, set by `llm-gateway launch`
+    // when the session answered "no" to the auto-classify prompt — then the
+    // model name the client sent is what gets resolved, unclassified.
+    let semantic_attempt = if auto_route_requested(&headers) {
+        classify_request(&state, &config, &payload, expected_api)
+    } else {
+        SemanticAttempt {
+            resolve_as: requested_model.clone(),
+            classified: false,
+            matched: false,
+            candidates: Vec::new(),
+            score: None,
+            embed_ms: 0,
+            manual: true,
+        }
+    };
     let resolve_target = semantic_attempt.resolve_as.as_str();
 
     let mut resolution = match route::resolve(&config, resolve_target) {
@@ -511,10 +541,30 @@ struct SemanticAttempt {
     candidates: Vec<TraceCandidate>,
     score: Option<f32>,
     embed_ms: u64,
+    /// `true` when classification was skipped on purpose because the
+    /// request carried `x-gw-auto-route: 0` — as opposed to `!classified`,
+    /// which means classification was attempted (or would have been) but
+    /// unavailable. `resolve_as` is the model name the client sent, not
+    /// `default`.
+    manual: bool,
 }
 
 /// Build the `routing` block of a trace record.
 fn routing_from(resolution: &route::Resolution, attempt: SemanticAttempt) -> TraceRouting {
+    if attempt.manual {
+        return TraceRouting {
+            mode: "manual".to_string(),
+            matched_route: resolution.route_name.clone(),
+            reason: "x-gw-auto-route: 0; classification skipped, routed by the model name \
+                     the client sent"
+                .to_string(),
+            candidates: Vec::new(),
+            score: None,
+            threshold: None,
+            embed_ms: None,
+        };
+    }
+
     if !attempt.classified {
         return TraceRouting {
             mode: "no_classifier".to_string(),
@@ -574,6 +624,7 @@ fn classify_request(
         candidates: Vec::new(),
         score: None,
         embed_ms: 0,
+        manual: false,
     };
 
     let Some(classifier) = state.classifier.as_ref() else {
@@ -617,6 +668,7 @@ fn classify_request(
                 candidates,
                 score,
                 embed_ms: verdict.embed_ms,
+                manual: false,
             }
         }
         None => {
@@ -637,6 +689,7 @@ fn classify_request(
                 candidates,
                 score,
                 embed_ms: verdict.embed_ms,
+                manual: false,
             }
         }
     }
@@ -656,6 +709,7 @@ fn classify_request(
         candidates: Vec::new(),
         score: None,
         embed_ms: 0,
+        manual: false,
     }
 }
 
@@ -888,6 +942,7 @@ mod tests {
             candidates: Vec::new(),
             score: None,
             embed_ms: 0,
+            manual: false,
         };
         let routing = routing_from(&res, attempt);
 
@@ -918,6 +973,7 @@ mod tests {
             ],
             score: Some(0.8),
             embed_ms: 2,
+            manual: false,
         };
 
         let routing = routing_from(&res, attempt);
@@ -944,6 +1000,7 @@ mod tests {
             }],
             score: Some(0.2),
             embed_ms: 1,
+            manual: false,
         };
 
         let routing = routing_from(&res, attempt);
@@ -958,6 +1015,53 @@ mod tests {
             "reason should mention the threshold: {}",
             routing.reason
         );
+    }
+
+    #[test]
+    fn routing_from_reports_manual_mode_with_the_sent_model_name() {
+        let res = resolution("gpt-5-codex", route::MatchKind::Exact);
+        let attempt = SemanticAttempt {
+            resolve_as: "gpt-5-codex".to_string(),
+            classified: false,
+            matched: false,
+            candidates: Vec::new(),
+            score: None,
+            embed_ms: 0,
+            manual: true,
+        };
+
+        let routing = routing_from(&res, attempt);
+
+        assert_eq!(routing.mode, "manual");
+        assert_eq!(routing.matched_route, "gpt-5-codex");
+        assert!(routing.candidates.is_empty());
+        assert!(routing.score.is_none());
+        assert!(routing.embed_ms.is_none());
+        assert!(routing.reason.contains("x-gw-auto-route"));
+    }
+
+    #[test]
+    fn auto_route_requested_defaults_to_true_without_the_header() {
+        assert!(auto_route_requested(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn auto_route_requested_is_false_for_disabling_values() {
+        for value in ["0", "false", "no", "off"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-gw-auto-route", value.parse().unwrap());
+            assert!(
+                !auto_route_requested(&headers),
+                "{value} should disable auto-route"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_route_requested_is_true_for_1() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gw-auto-route", "1".parse().unwrap());
+        assert!(auto_route_requested(&headers));
     }
 
     /// Builds just enough `AppState` to exercise `classify_request` without a

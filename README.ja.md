@@ -28,6 +28,12 @@ OpenClaw(手動セットアップ)  ─┘        record
 クライアントは `launch` で起動し、環境変数 / CLI オーバーライドで
 リダイレクトを注入します — **クライアントの設定ファイルは一切変更しません**。
 
+`launch` はセッションごとに一度、リクエストを内容で自動分類するか
+（"yes"、既定かつ従来の挙動）、それともエージェントが実際に送ってきた
+モデル名でルーティングするか（"no"）を尋ねます。`--auto` / `--no-auto`
+で非対話的に答えられます。どちらも指定しない場合は端末で確認します
+（標準入力が端末でない場合はプロンプトを省略し "yes" になります）。
+
 ## インストール
 
 ```sh
@@ -374,7 +380,7 @@ launch: {
 ```
 llm-gateway serve [--debug] [--debug-full] [--port N]
 llm-gateway init
-llm-gateway launch <claude|codex|opencode> [--isolate] [--print] [-- ARGS]
+llm-gateway launch <claude|codex|opencode> [--isolate] [--auto|--no-auto] [--print] [-- ARGS]
 llm-gateway config check|show|gitignore
 llm-gateway stats [--by route|client|provider|model|day] [--since D] [--until D]
 llm-gateway trace [--tail] [--route R] [--client C]

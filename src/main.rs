@@ -97,6 +97,17 @@ struct LaunchArgs {
     #[arg(long)]
     isolate: bool,
 
+    /// Auto-classify requests for this session without asking interactively.
+    ///
+    /// Without this or `--no-auto`, the launcher asks yes/no at startup.
+    #[arg(long, conflicts_with = "no_auto")]
+    auto: bool,
+
+    /// Route requests by the model name each agent actually sent for this
+    /// session, without asking interactively — the opposite of `--auto`.
+    #[arg(long)]
+    no_auto: bool,
+
     /// Print the command and environment instead of running anything.
     #[arg(long)]
     print: bool,
@@ -183,10 +194,18 @@ fn run() -> Result<()> {
 
         Command::Launch(args) => {
             let runtime = tokio::runtime::Runtime::new()?;
+            let auto_route = if args.auto {
+                Some(true)
+            } else if args.no_auto {
+                Some(false)
+            } else {
+                None
+            };
             runtime.block_on(launch::run(launch::Options {
                 client: args.client,
                 isolate: args.isolate,
                 print_only: args.print,
+                auto_route,
                 forwarded_args: args.args,
             }))
         }

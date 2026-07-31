@@ -35,7 +35,13 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::launch::Invocation;
 
-pub fn build(config: &Config, model: &str, isolate: bool, args: &[String]) -> Result<Invocation> {
+pub fn build(
+    config: &Config,
+    model: &str,
+    isolate: bool,
+    auto_route: bool,
+    args: &[String],
+) -> Result<Invocation> {
     let (wire_api, extra_args) = match &config.launch.codex {
         Some(cfg) => (cfg.wire_api.clone(), cfg.extra_args.clone()),
         None => ("responses".to_string(), Vec::new()),
@@ -65,7 +71,11 @@ pub fn build(config: &Config, model: &str, isolate: bool, args: &[String]) -> Re
         "-c".to_string(),
         toml_string_override("model_providers.gateway.wire_api", &wire_api),
         "-c".to_string(),
-        "model_providers.gateway.http_headers={ \"x-gw-client\" = \"codex\" }".to_string(),
+        format!(
+            "model_providers.gateway.http_headers={{ \"x-gw-client\" = \"codex\", \
+             \"x-gw-auto-route\" = \"{}\" }}",
+            if auto_route { "1" } else { "0" }
+        ),
         "-c".to_string(),
         "disable_response_storage=true".to_string(),
     ];
@@ -141,7 +151,7 @@ mod tests {
         let config = config_with_codex("responses");
         let model = r#"gpt-5.6-"sol""#;
 
-        let invocation = build(&config, model, false, &[]).unwrap();
+        let invocation = build(&config, model, false, true, &[]).unwrap();
 
         assert_eq!(invocation.program, "codex");
         assert_eq!(
@@ -160,7 +170,7 @@ mod tests {
                 "-c".to_string(),
                 r#"model_providers.gateway.wire_api="responses""#.to_string(),
                 "-c".to_string(),
-                r#"model_providers.gateway.http_headers={ "x-gw-client" = "codex" }"#.to_string(),
+                r#"model_providers.gateway.http_headers={ "x-gw-client" = "codex", "x-gw-auto-route" = "1" }"#.to_string(),
                 "-c".to_string(),
                 "disable_response_storage=true".to_string(),
             ]
@@ -173,12 +183,25 @@ mod tests {
     }
 
     #[test]
+    fn auto_route_false_is_reflected_in_the_http_header() {
+        let config = config_with_codex("responses");
+
+        let invocation = build(&config, "m", false, false, &[]).unwrap();
+
+        assert!(invocation
+            .args
+            .iter()
+            .any(|a| a.contains(r#""x-gw-auto-route" = "0""#)));
+    }
+
+    #[test]
     fn isolate_inserts_ignore_user_config_right_after_exec_and_warns() {
         let config = config_with_codex("responses");
 
         let invocation = build(
             &config,
             "m",
+            true,
             true,
             &["exec".to_string(), "hello".to_string()],
         )
@@ -193,7 +216,7 @@ mod tests {
     fn isolate_does_not_touch_args_when_not_running_exec() {
         let config = config_with_codex("responses");
 
-        let invocation = build(&config, "m", true, &["--foo".to_string()]).unwrap();
+        let invocation = build(&config, "m", true, true, &["--foo".to_string()]).unwrap();
 
         assert!(!invocation
             .args
@@ -204,6 +227,6 @@ mod tests {
     #[test]
     fn invalid_wire_api_is_rejected() {
         let config = config_with_codex("bogus");
-        assert!(build(&config, "m", false, &[]).is_err());
+        assert!(build(&config, "m", false, true, &[]).is_err());
     }
 }

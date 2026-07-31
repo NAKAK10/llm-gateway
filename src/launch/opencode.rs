@@ -39,6 +39,7 @@ pub fn build(
     model: &str,
     models: &[String],
     isolate: bool,
+    auto_route: bool,
     args: &[String],
 ) -> Result<Invocation> {
     let base_url = config.server.base_url();
@@ -54,7 +55,13 @@ pub fn build(
         .as_ref()
         .map(|c| c.override_providers.clone())
         .unwrap_or_else(|| vec!["openai".to_string(), "anthropic".to_string()]);
-    let content = config_content(&base_url, api_key.as_deref(), &wanted_models, &overrides);
+    let content = config_content(
+        &base_url,
+        api_key.as_deref(),
+        &wanted_models,
+        &overrides,
+        auto_route,
+    );
 
     let env = vec![(
         "OPENCODE_CONFIG_CONTENT".to_string(),
@@ -97,6 +104,7 @@ pub fn config_content(
     api_key: Option<&str>,
     models: &[String],
     override_providers: &[String],
+    auto_route: bool,
 ) -> serde_json::Value {
     let mut model_entries = serde_json::Map::new();
     for m in models {
@@ -108,7 +116,7 @@ pub fn config_content(
         "gateway".to_string(),
         serde_json::json!({
             "npm": "@ai-sdk/openai-compatible",
-            "options": gateway_options(base_url, api_key),
+            "options": gateway_options(base_url, api_key, auto_route),
             "models": model_entries,
         }),
     );
@@ -121,7 +129,7 @@ pub fn config_content(
     for id in override_providers {
         providers.insert(
             id.clone(),
-            serde_json::json!({ "options": gateway_options(base_url, api_key) }),
+            serde_json::json!({ "options": gateway_options(base_url, api_key, auto_route) }),
         );
     }
 
@@ -129,7 +137,7 @@ pub fn config_content(
 }
 
 /// The `options` block pointing one provider at the gateway.
-fn gateway_options(base_url: &str, api_key: Option<&str>) -> serde_json::Value {
+fn gateway_options(base_url: &str, api_key: Option<&str>, auto_route: bool) -> serde_json::Value {
     let mut options = serde_json::Map::new();
     options.insert(
         "baseURL".to_string(),
@@ -143,7 +151,10 @@ fn gateway_options(base_url: &str, api_key: Option<&str>) -> serde_json::Value {
     }
     options.insert(
         "headers".to_string(),
-        serde_json::json!({ "x-gw-client": "opencode" }),
+        serde_json::json!({
+            "x-gw-client": "opencode",
+            "x-gw-auto-route": if auto_route { "1" } else { "0" },
+        }),
     );
     serde_json::Value::Object(options)
 }
@@ -187,13 +198,13 @@ mod tests {
 
     #[test]
     fn api_key_field_is_present_only_when_configured() {
-        let with_key = config_content("http://127.0.0.1:4000", Some("secret"), &[], &[]);
+        let with_key = config_content("http://127.0.0.1:4000", Some("secret"), &[], &[], true);
         assert_eq!(
             with_key["provider"]["gateway"]["options"]["apiKey"],
             serde_json::json!("secret")
         );
 
-        let without_key = config_content("http://127.0.0.1:4000", None, &[], &[]);
+        let without_key = config_content("http://127.0.0.1:4000", None, &[], &[], true);
         assert!(without_key["provider"]["gateway"]["options"]
             .get("apiKey")
             .is_none());
@@ -206,7 +217,7 @@ mod tests {
     #[test]
     fn override_providers_are_redirected_without_replacing_their_sdk() {
         let overrides = vec!["openai".to_string(), "anthropic".to_string()];
-        let content = config_content("http://127.0.0.1:4000", Some("k"), &[], &overrides);
+        let content = config_content("http://127.0.0.1:4000", Some("k"), &[], &overrides, true);
 
         for id in ["openai", "anthropic"] {
             assert_eq!(
@@ -233,6 +244,7 @@ mod tests {
             None,
             &["route-a".to_string(), "route-b".to_string()],
             &[],
+            true,
         );
 
         assert_eq!(
@@ -248,12 +260,25 @@ mod tests {
             "opencode"
         );
         assert_eq!(
+            content["provider"]["gateway"]["options"]["headers"]["x-gw-auto-route"],
+            "1"
+        );
+        assert_eq!(
             content["provider"]["gateway"]["models"]["route-a"],
             serde_json::json!({})
         );
         assert_eq!(
             content["provider"]["gateway"]["models"]["route-b"],
             serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn auto_route_false_is_reflected_in_the_header() {
+        let content = config_content("http://127.0.0.1:4000", None, &[], &[], false);
+        assert_eq!(
+            content["provider"]["gateway"]["options"]["headers"]["x-gw-auto-route"],
+            "0"
         );
     }
 
@@ -266,6 +291,7 @@ mod tests {
             "route-a",
             &["route-a".to_string()],
             false,
+            true,
             &["--foo".to_string()],
         )
         .unwrap();
@@ -285,7 +311,15 @@ mod tests {
     fn isolate_adds_pure_flag() {
         let config = Config::default();
 
-        let invocation = build(&config, "route-a", &["route-a".to_string()], true, &[]).unwrap();
+        let invocation = build(
+            &config,
+            "route-a",
+            &["route-a".to_string()],
+            true,
+            true,
+            &[],
+        )
+        .unwrap();
 
         assert!(invocation.args.contains(&"--pure".to_string()));
     }
