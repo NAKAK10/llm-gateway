@@ -2,6 +2,56 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-07-31 — `serve` gets a quiet-by-default console log behind `logging.logging`
+
+`serve` always printed its `tracing::info!` diagnostics — embedding-model
+preparation, and a `warn!` per failed fallback attempt — regardless of
+whether anyone wanted to see them, because the console filter defaulted to
+`"info"` unconditionally.
+
+**Added `logging.logging` (`bool`, default `false`).** `false` raises the
+console filter's default level to `warn`, so only real problems (a broken
+config hot-reload, "this build can't classify at all") reach stderr; `true`
+lowers it back to `info`, showing the routine diagnostics again. An explicit
+`RUST_LOG` still overrides either default, for whoever wants finer control
+than one flag. Per-attempt fallback logging in `upstream::send_with_fallback`
+moved from `warn!` to `info!` to make it part of this toggle — it is a normal,
+expected part of trying the next target, not something that needs an
+operator's attention by itself.
+
+**The startup banner (`listening on ...`, and the `--debug` trace-recording
+notice) moved to `eprintln!`, unconditionally.** Those are the one-time
+confirmation that `serve` actually started with the flags it was given, not a
+diagnostic stream — they should not disappear just because
+`logging.logging` is left at its default.
+
+## 2026-07-31 — `init` routes are named by role, not by provider
+
+Every route `init` scaffolded was named after the *provider* serving it
+(`role-anthropic`, `role-github-copilot`, `role-openrouter`). That reads as
+meaningless once more than one provider is configured: the name says nothing
+about what a request needs to be doing to reach it, only which vendor answers
+it — and it is the route's `description`, not its name, that the classifier
+actually matches against.
+
+**Routes are now named after a functional role in a multi-agent workflow —
+`AgentRole` (`src/cli/init.rs`): manager, architect, explorer, web-researcher,
+browser-operator, implementer, reviewer, tester.** `init` asks which roles to
+configure, then which provider serves each one, producing `role-manager`,
+`role-architect`, and so on, each with a `description` written for the kind of
+task that role does rather than boilerplate about the provider. Nothing stops
+two roles from resolving to the same provider and model.
+
+**Model selection now fetches the provider's own model list over its API
+(`GET /models`, or `GET /v1/models` for Anthropic) and offers it as a
+single-choice prompt, instead of always asking for free-form text.** A free
+model id is easy to mistype and easy to leave stale as a provider retires
+models. The wizard resolves a usable credential first (a typed key, a
+discovered `gh auth token`, or the environment variable the config would
+reference) and falls back to the previous pre-filled text prompt only when it
+cannot reach the endpoint or parse its response — this is a nicety, not
+something `init` should ever block on.
+
 ## 2026-07-31 — `serve` offers to free its port instead of failing cold
 
 Restarting after an upgrade routinely hit `Address already in use` because the

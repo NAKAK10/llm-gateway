@@ -1,10 +1,17 @@
 //! `llm-gateway init` — write a first config.
 //!
-//! Asks three questions (clients, providers, how to store keys), writes a
-//! `config.json` with one classifiable route per selected provider plus the
-//! reserved `default` route, downloads the embedding model classification
-//! needs, and stops. Everything after that is hand-edited; the wizard is a
-//! starting point, not a settings UI.
+//! Asks which clients and providers to use, which agent *role* (manager,
+//! architect, explorer, ...) each configured provider/model should serve,
+//! and how to store keys; writes a `config.json` with one classifiable route
+//! per assigned role plus the reserved `default` route, downloads the
+//! embedding model classification needs, and stops. Everything after that is
+//! hand-edited; the wizard is a starting point, not a settings UI.
+//!
+//! Routes are named after the *role* a request is doing (`role-architect`,
+//! `role-reviewer`, ...), not the provider serving it — see [`AgentRole`].
+//! `role-anthropic` or `role-github-copilot` says nothing about what a
+//! request needs to be doing to reach that route once more than one provider
+//! is configured; the role name is the actual classification distinction.
 //!
 //! One rule it does not break:
 //!
@@ -69,6 +76,138 @@ async fn ensure_classification_model() -> Result<()> {
          to the reserved `default` route without content-based classification",
     )?;
     Ok(())
+}
+
+/// The credential to send a `GET /models` probe with, resolved from whatever
+/// the wizard already knows about a provider — a typed literal, a discovered
+/// `command:` reference actually run, or the environment variable it would
+/// otherwise fall back to. `None` means the wizard has no usable credential
+/// for this provider *in this process* (e.g. the user left the key blank and
+/// has not exported the variable yet); callers fall back to a free-text
+/// model prompt in that case rather than failing.
+fn resolve_key_for_fetch(
+    provider: KnownProvider,
+    providers: &[(KnownProvider, Option<String>)],
+    discovered: &[(KnownProvider, SecretRef)],
+) -> Option<String> {
+    if let Some((_, Some(literal))) = providers.iter().find(|(p, _)| *p == provider) {
+        return Some(literal.clone());
+    }
+    if let Some((_, secret)) = discovered.iter().find(|(p, _)| *p == provider) {
+        let command = secret.raw().strip_prefix("command:")?;
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return (!token.is_empty()).then_some(token);
+    }
+    std::env::var(provider.env_var()).ok()
+}
+
+/// Fetch the model ids a provider currently offers, for the wizard to present
+/// as a single-choice list instead of a free-text prompt.
+///
+/// Every provider here speaks (or is assumed to speak) the OpenAI-style
+/// `GET /models` -> `{"data":[{"id": "..."}, ...]}` shape, except Anthropic,
+/// which uses `GET /v1/models` with its own auth header. A local Ollama needs
+/// no credential at all. Any failure — network, non-2xx, or an unexpected
+/// body shape — is surfaced as `Err` so the caller can fall back to typing a
+/// model name; this is a nicety, not something `init` should ever block on.
+async fn fetch_models(provider: KnownProvider, key: Option<&str>) -> Result<Vec<String>> {
+    use crate::error::Error;
+
+    let http = crate::upstream::client()?;
+    let url = match provider {
+        KnownProvider::Anthropic => format!("{}/v1/models", provider.base_url()),
+        _ => format!("{}/models", provider.base_url()),
+    };
+
+    let mut request = http.get(&url);
+    match provider {
+        KnownProvider::Anthropic => {
+            if let Some(key) = key {
+                request = request.header("x-api-key", key);
+            }
+            request = request.header("anthropic-version", "2023-06-01");
+        }
+        KnownProvider::OllamaLocal => {}
+        _ => {
+            if let Some(key) = key {
+                request = request.header("Authorization", format!("Bearer {key}"));
+            }
+        }
+    }
+    for (name, value) in provider.headers() {
+        request = request.header(*name, *value);
+    }
+
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        return Err(Error::Other(format!(
+            "{} returned {}",
+            url,
+            response.status()
+        )));
+    }
+    let body: serde_json::Value = response.json().await?;
+    let entries = body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| Error::Other(format!("unexpected response shape from {url}")))?;
+    let mut ids: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| entry.get("id").and_then(|id| id.as_str()))
+        .map(str::to_string)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        return Err(Error::Other(format!("{url} listed no models")));
+    }
+    Ok(ids)
+}
+
+/// Ask which model backs one role's route, presenting a fetched model list as
+/// a single-choice (radio) prompt when the wizard could reach the provider's
+/// `/models` endpoint, and falling back to a free-text prompt — pre-filled
+/// with [`KnownProvider::default_model`] — when it could not.
+async fn choose_model(
+    role: AgentRole,
+    provider: KnownProvider,
+    key: Option<&str>,
+) -> Result<String> {
+    let prompt = format!(
+        "Model for the `{}` role (via {})",
+        role.label(),
+        provider.label()
+    );
+    match fetch_models(provider, key).await {
+        Ok(models) => {
+            let default = provider.default_model().to_string();
+            let mut select = cliclack::select(prompt);
+            for model in &models {
+                select = select.item(model.clone(), model.clone(), "");
+            }
+            if models.contains(&default) {
+                select = select.initial_value(default);
+            }
+            Ok(select.interact()?)
+        }
+        Err(err) => {
+            cliclack::log::warning(format!(
+                "{}: could not list models ({err}); type one instead",
+                provider.label(),
+            ))?;
+            Ok(cliclack::input(prompt)
+                .default_input(provider.default_model())
+                .interact()?)
+        }
+    }
 }
 
 pub async fn run() -> Result<()> {
@@ -201,27 +340,53 @@ pub async fn run() -> Result<()> {
         providers.push((*provider, literal));
     }
 
-    // Every classifiable route needs an explicit model now — routing is
-    // decided purely by content classification, so a `*` wildcard model can
-    // no longer be resolved to anything meaningful (see `crate::route`). A
-    // provider chosen for Subscription has no route of its own to pin a model
-    // to here — its own [`KnownProvider::subscription_model`] covers that.
-    let mut models: Vec<(KnownProvider, String)> = Vec::new();
-    for provider in &selected_providers {
-        if subscriptions.contains(provider) {
-            continue;
+    // Routes are scaffolded per functional role rather than per provider now
+    // (see `AgentRole`) — `role-anthropic` or `role-openrouter` says nothing
+    // about what a request needs to be doing to reach it; `role-architect` or
+    // `role-reviewer` is the actual classification distinction. Skipped
+    // entirely when no provider was selected — there is nothing to assign a
+    // role to.
+    let mut roles: Vec<(AgentRole, KnownProvider, String)> = Vec::new();
+    if !selected_providers.is_empty() {
+        let mut role_select =
+            cliclack::multiselect("Which roles do you want to configure routes for?");
+        for role in AgentRole::ALL {
+            role_select = role_select.item(role, role.label(), role.description());
         }
-        let model = cliclack::input(format!(
-            "Model for {}'s `{}` route",
-            provider.label(),
-            provider.route_name(),
-        ))
-        .default_input(provider.default_model())
-        .interact()?;
-        models.push((*provider, model));
+        let selected_roles: Vec<AgentRole> = role_select
+            .initial_values(AgentRole::ALL.to_vec())
+            .interact()?;
+
+        for role in selected_roles {
+            let mut role_provider_select = cliclack::select(format!(
+                "Which provider handles the `{}` role?",
+                role.label()
+            ));
+            for provider in &selected_providers {
+                let hint = if subscriptions.contains(provider) {
+                    "subscription"
+                } else {
+                    ""
+                };
+                role_provider_select =
+                    role_provider_select.item(*provider, provider.label(), hint);
+            }
+            let provider = role_provider_select.interact()?;
+
+            // A subscription CLI's model is not knowable (or, for Claude,
+            // fixed) from here — see `KnownProvider::subscription_model` —
+            // so there is nothing to fetch or ask for that case.
+            let model = if subscriptions.contains(&provider) {
+                provider.subscription_model().to_string()
+            } else {
+                let key = resolve_key_for_fetch(provider, &providers, &discovered);
+                choose_model(role, provider, key.as_deref()).await?
+            };
+            roles.push((role, provider, model));
+        }
     }
 
-    let mut config = build_config_with_auth(&clients, &providers, storage, &subscriptions, &models);
+    let mut config = build_config_with_auth(&clients, &providers, storage, &subscriptions, &roles);
     for provider in &env_fallback {
         let key = SecretRef::new(format!("${{{}}}", provider.env_var()));
         if let Some(provider_config) = config.providers.get_mut(provider.id()) {
@@ -247,10 +412,19 @@ pub async fn run() -> Result<()> {
     }
 
     for provider in &subscriptions {
+        let role_names: Vec<&str> = roles
+            .iter()
+            .filter(|(_, p, _)| p == provider)
+            .map(|(role, _, _)| role.label())
+            .collect();
+        let via = if role_names.is_empty() {
+            "no role assigned to it".to_string()
+        } else {
+            format!("via {}", role_names.join(", "))
+        };
         cliclack::log::info(format!(
-            "{}: `{}` route added, run by `{}` on your subscription — no key needed",
+            "{}: runs on your subscription {via}, driven by `{}` — no key needed",
             provider.label(),
-            provider.subscription_route(),
             provider.subscription_cli().unwrap_or("its CLI"),
         ))?;
     }
@@ -484,52 +658,6 @@ impl KnownProvider {
             _ => None,
         }
     }
-
-    /// Classification text for the route this provider is scaffolded with.
-    ///
-    /// Every request is classified against every route's description now (see
-    /// `crate::semantic::index`), so this needs to say something a request's
-    /// own wording could plausibly match — not just restate the provider's
-    /// name. Deliberately generic: it is a starting point the user is
-    /// expected to edit once they know their own usage pattern, not a
-    /// finished taxonomy.
-    pub fn description(self) -> &'static str {
-        match self {
-            Self::Anthropic => {
-                "Complex reasoning, coding, and multi-step agentic tasks that need careful \
-                 step-by-step thinking and full tool support."
-            }
-            Self::OpenAi => {
-                "General-purpose assistant tasks, coding, and tool use via OpenAI's models."
-            }
-            Self::OpenRouter => {
-                "Wide catalog of open and third-party models; use for specific model requests \
-                 or as a fallback when a primary provider is unavailable."
-            }
-            Self::GithubCopilot => {
-                "Coding assistance and pair-programming tasks via GitHub Copilot's models."
-            }
-            Self::Gemini => "Multimodal tasks and long-context questions via Google Gemini.",
-            Self::Xai => {
-                "Questions about current events and real-time information via xAI's Grok models."
-            }
-            Self::Mistral => "Lightweight, general-purpose tasks via Mistral's models.",
-            Self::DeepSeek => "Cost-efficient reasoning and coding tasks via DeepSeek's models.",
-            Self::Groq => {
-                "Latency-sensitive, simple tasks that benefit from Groq's fast inference."
-            }
-            Self::TogetherAi => "Open-source models hosted via Together AI.",
-            Self::SakanaAi => "Experimental or research-oriented tasks via Sakana AI's models.",
-            Self::Plamo => {
-                "Japanese-language tasks and general assistance via Preferred Networks' PLaMo."
-            }
-            Self::OllamaCloud => "General-purpose tasks via Ollama Cloud's hosted open models.",
-            Self::OllamaLocal => {
-                "Private, offline inference where no data should leave this machine, via a \
-                 locally running Ollama."
-            }
-        }
-    }
 }
 
 /// Whether `name` is an executable on `PATH`.
@@ -581,18 +709,6 @@ impl KnownProvider {
         format!("{}-subscription", self.id())
     }
 
-    /// Route name for this provider's own classifiable route.
-    pub fn route_name(self) -> String {
-        format!("role-{}", self.id())
-    }
-
-    /// Route name for the subscription choice. Namespaced by provider id so
-    /// selecting both Anthropic and OpenAI subscriptions scaffolds two routes
-    /// instead of the second silently overwriting the first.
-    pub fn subscription_route(self) -> String {
-        format!("role-{}-subscription", self.id())
-    }
-
     /// A model reference the subscription CLI accepts, for the scaffolded route.
     pub fn subscription_model(self) -> &'static str {
         match self {
@@ -637,6 +753,114 @@ impl KnownProvider {
     }
 }
 
+/// A functional role in a multi-agent workflow that a route is scaffolded
+/// for.
+///
+/// Naming routes after the *provider* that serves them (`role-anthropic`,
+/// `role-github-copilot`) reads as meaningless once more than one provider is
+/// configured: the name says nothing about what the route is *for*. Naming
+/// them after the job a request is doing — planning, exploring the codebase,
+/// writing code, reviewing it — is what the classification corpus in
+/// [`Self::description`] is actually distinguishing between, so that is what
+/// the route name should say too. Each role is wired to exactly one provider
+/// and model by the wizard; nothing stops a config from pointing several
+/// roles at the same provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRole {
+    Manager,
+    Architect,
+    Explorer,
+    WebResearcher,
+    BrowserOperator,
+    Implementer,
+    Reviewer,
+    Tester,
+}
+
+impl AgentRole {
+    /// Every role the wizard offers, in menu order.
+    pub const ALL: [AgentRole; 8] = [
+        Self::Manager,
+        Self::Architect,
+        Self::Explorer,
+        Self::WebResearcher,
+        Self::BrowserOperator,
+        Self::Implementer,
+        Self::Reviewer,
+        Self::Tester,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Manager => "manager",
+            Self::Architect => "architect",
+            Self::Explorer => "explorer",
+            Self::WebResearcher => "web-researcher",
+            Self::BrowserOperator => "browser-operator",
+            Self::Implementer => "implementer",
+            Self::Reviewer => "reviewer",
+            Self::Tester => "tester",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Manager => "Manager",
+            Self::Architect => "Architect",
+            Self::Explorer => "Explorer",
+            Self::WebResearcher => "Web researcher",
+            Self::BrowserOperator => "Browser operator",
+            Self::Implementer => "Implementer",
+            Self::Reviewer => "Reviewer",
+            Self::Tester => "Tester",
+        }
+    }
+
+    /// Classification text for this role's route.
+    ///
+    /// Every request is classified against every route's description (see
+    /// `crate::semantic::index`), so this needs to describe the *kind of
+    /// task* the role handles, not the role's name.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Manager => {
+                "Coordinating a multi-step task: breaking work into subtasks, delegating to \
+                 other roles, and tracking overall progress."
+            }
+            Self::Architect => {
+                "Designing system architecture, planning approaches, and making structural or \
+                 technical design decisions before code is written."
+            }
+            Self::Explorer => {
+                "Exploring and reading an existing codebase to answer questions about how it is \
+                 structured or where something is implemented, without editing it."
+            }
+            Self::WebResearcher => {
+                "Researching information on the web: searching for documentation, current \
+                 events, or facts outside the local codebase."
+            }
+            Self::BrowserOperator => {
+                "Operating a web browser to interact with pages: clicking, filling forms, and \
+                 navigating sites on the user's behalf."
+            }
+            Self::Implementer => {
+                "Writing or editing code to implement a feature or fix a bug."
+            }
+            Self::Reviewer => {
+                "Reviewing a diff or pull request for bugs, security issues, and logic errors."
+            }
+            Self::Tester => {
+                "Writing or running tests, and diagnosing test failures."
+            }
+        }
+    }
+
+    /// Route name this role is scaffolded under.
+    pub fn route_name(self) -> String {
+        format!("role-{}", self.id())
+    }
+}
+
 /// Which credential a provider should use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthChoice {
@@ -660,12 +884,22 @@ pub enum KeyStorage {
 /// Build the config the wizard's answers imply.
 ///
 /// Pure, so the generated shape is testable without a terminal.
+///
+/// `roles` is the wizard's role assignment: which [`AgentRole`] each route
+/// represents, which provider serves it, and which model — already resolved,
+/// e.g. from the provider's model list fetched over its API, or from
+/// [`KnownProvider::subscription_model`] for a subscription-backed role.
+/// Routes are named after the *role*, not the provider: `role-anthropic` and
+/// `role-github-copilot` say nothing about what a request needs to be doing
+/// to match, while `role-architect` or `role-reviewer` is exactly the
+/// classification corpus in [`AgentRole::description`].
 pub fn build_config(
     clients: &[Client],
     providers: &[(KnownProvider, Option<String>)],
     storage: KeyStorage,
+    roles: &[(AgentRole, KnownProvider, String)],
 ) -> crate::config::Config {
-    build_config_with_auth(clients, providers, storage, &[], &[])
+    build_config_with_auth(clients, providers, storage, &[], roles)
 }
 
 /// [`build_config`], plus the providers whose credential is a subscription
@@ -673,21 +907,16 @@ pub fn build_config(
 ///
 /// A subscription choice replaces the API-key provider entirely: it adds a
 /// *different* provider id (`<id>-subscription`) with an agent-CLI transport,
-/// and a `role-<id>-subscription` route pointing at it, and skips the plain
-/// API-key provider and `role-<id>` route for that same provider — there is
-/// no key to hold for it, so a provider entry for one would always fail with
-/// an empty credential.
-///
-/// `models` overrides [`KnownProvider::default_model`] for a provider's own
-/// classifiable route, e.g. with whatever the wizard's user typed in place of
-/// the suggested default. A provider not present in `models` falls back to
-/// its `default_model()`.
+/// and skips the plain API-key provider for that same provider — there is no
+/// key to hold for it, so a provider entry for one would always fail with an
+/// empty credential. A role assigned to that provider resolves its route to
+/// the `<id>-subscription` provider automatically.
 pub fn build_config_with_auth(
     _clients: &[Client],
     providers: &[(KnownProvider, Option<String>)],
     storage: KeyStorage,
     subscriptions: &[KnownProvider],
-    models: &[(KnownProvider, String)],
+    roles: &[(AgentRole, KnownProvider, String)],
 ) -> crate::config::Config {
     use crate::config::{ApiKind, Config, ModelConfig, ProviderConfig, RouteConfig};
 
@@ -699,13 +928,6 @@ pub fn build_config_with_auth(
             .iter()
             .find(|(candidate, _)| *candidate == p)
             .and_then(|(_, literal)| literal.clone())
-    };
-    let model_for = |p: KnownProvider| -> String {
-        models
-            .iter()
-            .find(|(candidate, _)| *candidate == p)
-            .map(|(_, model)| model.clone())
-            .unwrap_or_else(|| p.default_model().to_string())
     };
 
     let mut config = Config::default();
@@ -761,18 +983,24 @@ pub fn build_config_with_auth(
         );
     }
 
-    for provider in providers.iter().map(|(p, _)| *p) {
+    // Routes are named after the *role* a request is doing, not the provider
+    // serving it — see `AgentRole`. Each assignment resolves to whichever
+    // provider id actually holds the credential: the subscription id when the
+    // role's provider was chosen as a subscription, its plain id otherwise.
+    let target_for = |provider: KnownProvider| -> String {
         if is_subscription_only(provider) {
-            continue;
+            provider.subscription_id()
+        } else {
+            provider.id().to_string()
         }
+    };
+    for (role, provider, model) in roles {
         config.routes.insert(
-            provider.route_name(),
+            role.route_name(),
             RouteConfig {
-                description: Some(crate::config::Description(
-                    provider.description().to_string(),
-                )),
+                description: Some(crate::config::Description(role.description().to_string())),
                 model: ModelConfig {
-                    default: format!("{}/{}", provider.id(), model_for(provider)),
+                    default: format!("{}/{model}", target_for(*provider)),
                     fallbacks: Vec::new(),
                 },
                 ..Default::default()
@@ -781,16 +1009,22 @@ pub fn build_config_with_auth(
     }
 
     // The reserved catch-all for whatever does not clear the classification
-    // threshold on any other route. Points at the first selected provider
-    // that actually has a provider entry — a subscription-only provider has
-    // none, so it is skipped in favor of one that does; if every selected
-    // provider is subscription-only, the first subscription's own id and
-    // model are used instead, since that is the only entry that exists.
-    let default_target = providers
-        .iter()
-        .map(|(p, _)| *p)
-        .find(|p| !is_subscription_only(*p))
-        .map(|p| format!("{}/{}", p.id(), model_for(p)))
+    // threshold on any other route. Points at the first role assignment when
+    // one exists; otherwise falls back to the first selected provider that
+    // actually has a provider entry — a subscription-only provider has none,
+    // so it is skipped in favor of one that does; if every selected provider
+    // is subscription-only, the first subscription's own id and model are
+    // used instead, since that is the only entry that exists.
+    let default_target = roles
+        .first()
+        .map(|(_, provider, model)| format!("{}/{model}", target_for(*provider)))
+        .or_else(|| {
+            providers
+                .iter()
+                .map(|(p, _)| *p)
+                .find(|p| !is_subscription_only(*p))
+                .map(|p| format!("{}/{}", p.id(), p.default_model()))
+        })
         .or_else(|| {
             subscriptions
                 .first()
@@ -814,6 +1048,11 @@ pub fn build_config_with_auth(
         );
     }
 
+    // The subscription provider entry itself — not a route, since a role
+    // assignment above is what actually points a route at it via
+    // `target_for`. A subscription chosen for no role still gets a provider
+    // entry (harmless; `validate` only warns about it), same as an API-key
+    // provider chosen for no role.
     for provider in subscriptions {
         let Some(transport) = provider.subscription_transport() else {
             continue;
@@ -821,9 +1060,8 @@ pub fn build_config_with_auth(
         let Some(api) = transport.fixed_api() else {
             continue;
         };
-        let id = provider.subscription_id();
         config.providers.insert(
-            id.clone(),
+            provider.subscription_id(),
             ProviderConfig {
                 // Both are meaningless for a CLI transport: it has no URL, and
                 // it authenticates itself.
@@ -834,21 +1072,6 @@ pub fn build_config_with_auth(
                 inject_usage: true,
                 transport,
                 agent_args: Vec::new(),
-            },
-        );
-        config.routes.insert(
-            provider.subscription_route(),
-            RouteConfig {
-                description: Some(crate::config::Description(
-                    "Runs on a subscription via the provider's own CLI. Generation only — \
-                     the caller's tools are not passed through."
-                        .to_string(),
-                )),
-                model: ModelConfig {
-                    default: format!("{id}/{}", provider.subscription_model()),
-                    fallbacks: Vec::new(),
-                },
-                ..Default::default()
             },
         );
     }
@@ -891,13 +1114,17 @@ mod tests {
     /// which means `openai-chat` plus the translation layer — the whole reason
     /// it can be offered at all.
     #[test]
-    fn a_subscription_choice_scaffolds_a_cli_transport_and_a_route() {
+    fn a_subscription_choice_scaffolds_a_cli_transport_and_a_role_route() {
         let config = build_config_with_auth(
             &[Client::Claude],
             &[(KnownProvider::Anthropic, None)],
             KeyStorage::Keychain,
             &[KnownProvider::Anthropic],
-            &[],
+            &[(
+                AgentRole::Manager,
+                KnownProvider::Anthropic,
+                "claude-sonnet-5".to_string(),
+            )],
         );
 
         let provider = config
@@ -911,10 +1138,7 @@ mod tests {
         assert!(provider.base_url.is_empty());
         assert!(provider.api_key.is_none());
 
-        let route = config
-            .routes
-            .get("role-anthropic-subscription")
-            .expect("route");
+        let route = config.routes.get("role-manager").expect("route");
         assert_eq!(
             route.model.default,
             "anthropic-subscription/claude-sonnet-5"
@@ -923,9 +1147,9 @@ mod tests {
     }
 
     /// The plain API-key provider is skipped when Subscription is chosen for
-    /// that same provider: there is no key to hold for it, so scaffolding one
-    /// would only produce an always-failing `role-<id>` route with an empty
-    /// credential.
+    /// that same provider: there is no key to hold for it, so a role assigned
+    /// to it resolves to the subscription id instead of an always-failing
+    /// empty-credential provider.
     #[test]
     fn choosing_a_subscription_does_not_also_scaffold_the_api_key_provider() {
         let config = build_config_with_auth(
@@ -933,16 +1157,24 @@ mod tests {
             &[(KnownProvider::Anthropic, None)],
             KeyStorage::Keychain,
             &[KnownProvider::Anthropic],
-            &[],
+            &[(
+                AgentRole::Manager,
+                KnownProvider::Anthropic,
+                "claude-sonnet-5".to_string(),
+            )],
         );
         assert!(!config.providers.contains_key("anthropic"));
-        assert!(!config.routes.contains_key("role-anthropic"));
         assert!(config.providers.contains_key("anthropic-subscription"));
+        assert_eq!(
+            config.routes["role-manager"].model.default,
+            "anthropic-subscription/claude-sonnet-5"
+        );
     }
 
     /// Choosing subscriptions for both Anthropic and OpenAI used to collide:
     /// both wrote to the fixed route name `role-subscription`, so the second
-    /// silently overwrote the first. Each now gets its own `role-<id>-subscription`.
+    /// silently overwrote the first. Routes are now named after the role
+    /// assigned to each, so two different roles each get their own route.
     #[test]
     fn two_subscriptions_scaffold_two_routes_instead_of_colliding() {
         let config = build_config_with_auth(
@@ -953,14 +1185,25 @@ mod tests {
             ],
             KeyStorage::Keychain,
             &[KnownProvider::Anthropic, KnownProvider::OpenAi],
-            &[],
+            &[
+                (
+                    AgentRole::Manager,
+                    KnownProvider::Anthropic,
+                    "claude-sonnet-5".to_string(),
+                ),
+                (
+                    AgentRole::Implementer,
+                    KnownProvider::OpenAi,
+                    "default".to_string(),
+                ),
+            ],
         );
         assert_eq!(
-            config.routes["role-anthropic-subscription"].model.default,
+            config.routes["role-manager"].model.default,
             "anthropic-subscription/claude-sonnet-5"
         );
         assert_eq!(
-            config.routes["role-openai-subscription"].model.default,
+            config.routes["role-implementer"].model.default,
             "openai-subscription/default"
         );
     }
@@ -974,6 +1217,7 @@ mod tests {
             &[Client::Claude],
             &[(KnownProvider::OpenRouter, None)],
             KeyStorage::Keychain,
+            &[],
         );
         let provider = &config.providers["openrouter-anthropic"];
         assert_eq!(provider.base_url, "https://openrouter.ai/api");
@@ -1010,14 +1254,18 @@ mod tests {
             &[(KnownProvider::OpenAi, None)],
             KeyStorage::Keychain,
             &[KnownProvider::OpenAi],
-            &[],
+            &[(
+                AgentRole::Implementer,
+                KnownProvider::OpenAi,
+                "default".to_string(),
+            )],
         );
         let provider = &config.providers["openai-subscription"];
         assert_eq!(provider.transport, crate::config::Transport::CodexCli);
         // Codex renders as openai-chat, which is what the most clients reach.
         assert_eq!(provider.api, crate::config::ApiKind::OpenaiChat);
         assert_eq!(
-            config.routes["role-openai-subscription"].model.default,
+            config.routes["role-implementer"].model.default,
             "openai-subscription/default"
         );
     }
@@ -1040,17 +1288,23 @@ mod tests {
 
     #[test]
     fn no_subscriptions_generates_exactly_what_it_used_to() {
+        let roles = [(
+            AgentRole::Manager,
+            KnownProvider::Anthropic,
+            "claude-sonnet-5".to_string(),
+        )];
         let with = build_config_with_auth(
             &[Client::Claude],
             &[(KnownProvider::Anthropic, None)],
             KeyStorage::Keychain,
             &[],
-            &[],
+            &roles,
         );
         let without = build_config(
             &[Client::Claude],
             &[(KnownProvider::Anthropic, None)],
             KeyStorage::Keychain,
+            &roles,
         );
         assert_eq!(
             serde_json::to_string(&with).unwrap(),
@@ -1064,6 +1318,7 @@ mod tests {
             &[Client::Claude],
             &[(KnownProvider::GithubCopilot, None)],
             KeyStorage::Keychain,
+            &[],
         );
 
         let provider = config
@@ -1102,6 +1357,7 @@ mod tests {
                 (KnownProvider::OllamaLocal, None),
             ],
             KeyStorage::Keychain,
+            &[],
         );
         for id in ["anthropic", "ollama-local"] {
             assert!(
@@ -1121,10 +1377,10 @@ mod tests {
         );
     }
 
-    /// OpenRouter no longer auto-wires itself as a fallback on Anthropic's
-    /// route — an auto-guessed cross-provider fallback used the same `*`
-    /// wildcard mechanism this config no longer supports, and a fallback the
-    /// user did not choose is better left for them to add explicitly. The
+    /// OpenRouter no longer auto-wires itself as a fallback on any route — an
+    /// auto-guessed cross-provider fallback used the same `*` wildcard
+    /// mechanism this config no longer supports, and a fallback the user did
+    /// not choose is better left for them to add explicitly. The
     /// `openrouter-anthropic` provider entry itself is still scaffolded,
     /// ready for a route to reference explicitly.
     #[test]
@@ -1136,6 +1392,11 @@ mod tests {
                 (KnownProvider::OpenRouter, Some("sk-or-test".to_string())),
             ],
             KeyStorage::Literal,
+            &[(
+                AgentRole::Architect,
+                KnownProvider::Anthropic,
+                "claude-sonnet-5".to_string(),
+            )],
         );
 
         assert!(config.providers.contains_key("anthropic"));
@@ -1143,12 +1404,12 @@ mod tests {
 
         let route = config
             .routes
-            .get("role-anthropic")
-            .expect("role-anthropic route");
+            .get("role-architect")
+            .expect("role-architect route");
         assert_eq!(route.model.default, "anthropic/claude-sonnet-5");
         assert!(route.model.fallbacks.is_empty());
 
-        assert!(!config.routes.contains_key("role-openai"));
+        assert!(!config.routes.contains_key("role-implementer"));
     }
 
     #[test]
@@ -1157,26 +1418,39 @@ mod tests {
             &[Client::Codex],
             &[(KnownProvider::OpenAi, Some("sk-test".to_string()))],
             KeyStorage::Literal,
+            &[(
+                AgentRole::Implementer,
+                KnownProvider::OpenAi,
+                "gpt-5.1".to_string(),
+            )],
         );
 
-        let route = config.routes.get("role-openai").expect("role-openai route");
+        let route = config
+            .routes
+            .get("role-implementer")
+            .expect("role-implementer route");
         assert_eq!(route.model.default, "openai/gpt-5.1");
         assert!(route.model.fallbacks.is_empty());
 
-        assert!(!config.routes.contains_key("role-anthropic"));
+        assert!(!config.routes.contains_key("role-architect"));
         assert!(!config.providers.contains_key("openrouter-anthropic"));
     }
 
     #[test]
-    fn unselected_provider_gets_no_route() {
+    fn a_role_not_assigned_gets_no_route() {
         let config = build_config(
             &[Client::Claude, Client::Codex],
             &[(KnownProvider::OpenAi, Some("sk-test".to_string()))],
             KeyStorage::Env,
+            &[(
+                AgentRole::Implementer,
+                KnownProvider::OpenAi,
+                "gpt-5.1".to_string(),
+            )],
         );
 
-        assert!(!config.routes.contains_key("role-anthropic"));
-        assert!(config.routes.contains_key("role-openai"));
+        assert!(!config.routes.contains_key("role-architect"));
+        assert!(config.routes.contains_key("role-implementer"));
     }
 
     #[test]
@@ -1185,6 +1459,7 @@ mod tests {
             &[Client::Claude],
             &[(KnownProvider::Anthropic, Some("sk-ant-test".to_string()))],
             KeyStorage::Literal,
+            &[],
         );
 
         let route = config
@@ -1195,8 +1470,32 @@ mod tests {
         assert!(route.description.is_some());
     }
 
+    /// When at least one role is assigned, the reserved `default` route
+    /// should point at the same target as the first one — not silently fall
+    /// back to a provider's built-in default model, which may not be the one
+    /// the wizard's user actually picked.
     #[test]
-    fn every_selected_provider_gets_a_description_for_classification() {
+    fn the_default_route_prefers_the_first_role_assignment() {
+        let config = build_config(
+            &[Client::Claude],
+            &[(KnownProvider::Anthropic, Some("sk-ant-test".to_string()))],
+            KeyStorage::Literal,
+            &[(
+                AgentRole::Architect,
+                KnownProvider::Anthropic,
+                "claude-opus-9".to_string(),
+            )],
+        );
+
+        let route = config
+            .routes
+            .get(crate::config::DEFAULT_ROUTE)
+            .expect("default route");
+        assert_eq!(route.model.default, "anthropic/claude-opus-9");
+    }
+
+    #[test]
+    fn every_assigned_role_gets_a_description_for_classification() {
         let config = build_config(
             &[Client::Claude],
             &[
@@ -1204,14 +1503,41 @@ mod tests {
                 (KnownProvider::OpenRouter, Some("sk-or-test".to_string())),
             ],
             KeyStorage::Literal,
+            &[
+                (
+                    AgentRole::Architect,
+                    KnownProvider::Anthropic,
+                    "claude-sonnet-5".to_string(),
+                ),
+                (
+                    AgentRole::Explorer,
+                    KnownProvider::OpenRouter,
+                    "openai/gpt-5.1".to_string(),
+                ),
+            ],
         );
 
-        for name in ["role-anthropic", "role-openrouter"] {
+        for name in ["role-architect", "role-explorer"] {
             let route = config.routes.get(name).unwrap_or_else(|| panic!("{name}"));
             assert!(
                 route.description.is_some(),
                 "{name} needs a description to be a classification candidate"
             );
+        }
+    }
+
+    /// Every role has a unique, kebab-case id and a route name derived from
+    /// it — the whole point of naming routes by role instead of provider.
+    #[test]
+    fn every_role_has_a_unique_id_and_route_name() {
+        let mut ids: Vec<&str> = AgentRole::ALL.iter().map(|r| r.id()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), AgentRole::ALL.len(), "role ids must be unique");
+
+        for role in AgentRole::ALL {
+            assert_eq!(role.route_name(), format!("role-{}", role.id()));
+            assert!(!role.description().is_empty());
         }
     }
 
@@ -1221,6 +1547,7 @@ mod tests {
             &[Client::Claude],
             &[(KnownProvider::Anthropic, Some("sk-ant-abc".to_string()))],
             KeyStorage::Literal,
+            &[],
         );
         let provider = config.providers.get("anthropic").unwrap();
         assert_eq!(provider.api_key.as_ref().unwrap().0, "sk-ant-abc");
@@ -1232,6 +1559,7 @@ mod tests {
             &[Client::Claude],
             &[(KnownProvider::Anthropic, None)],
             KeyStorage::Env,
+            &[],
         );
         let provider = config.providers.get("anthropic").unwrap();
         assert_eq!(provider.api_key.as_ref().unwrap().0, "${ANTHROPIC_API_KEY}");
@@ -1243,6 +1571,7 @@ mod tests {
             &[Client::Claude],
             &[(KnownProvider::Anthropic, None)],
             KeyStorage::Keychain,
+            &[],
         );
         let provider = config.providers.get("anthropic").unwrap();
         assert_eq!(provider.api_key.as_ref().unwrap().0, "keychain:anthropic");
@@ -1254,6 +1583,7 @@ mod tests {
             &[Client::Claude],
             &[(KnownProvider::OllamaLocal, None)],
             KeyStorage::Literal,
+            &[],
         );
         let provider = config.providers.get("ollama-local").unwrap();
         assert_eq!(provider.api_key.as_ref().unwrap().0, "local");

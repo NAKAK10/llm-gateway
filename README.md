@@ -333,6 +333,7 @@ For everyday use the schema is just **four top-level keys**:
     dir: "./logs",
     usage: true,
     debug: false,             // trace-YYYY-MM-DD.jsonl — records prompt text!
+    logging: false,           // console diagnostics (embedding prep, fallback attempts)
   },
 }
 ```
@@ -359,6 +360,7 @@ launch: {
 | `routes.<name>.model.fallbacks` | same protocol as the default; tried in order before the first response byte. |
 | `launch` | optional advanced escape hatch only: Claude/Codex/opencode extra args, Codex `wireApi`, opencode `models`/`overrideProviders`. |
 | `logging.debug` | `--debug` truncates user text to 200 chars; `--debug-full` keeps everything. Plain-text prompts on disk — enable deliberately. |
+| `logging.logging` | off by default; set `true` to print `serve`'s console diagnostics (embedding-model prep, per-attempt fallback outcomes) to stderr. An explicit `RUST_LOG` still wins. |
 
 ## Commands
 

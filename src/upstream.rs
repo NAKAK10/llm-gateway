@@ -141,7 +141,7 @@ pub async fn send_with_fallback(
                     });
                 }
                 Err(err) => {
-                    tracing::warn!(target = %target, "agent transport unavailable: {err}");
+                    tracing::info!(target = %target, "agent transport unavailable: {err}");
                     attempts.push(TraceAttempt {
                         n,
                         target: target.to_string(),
@@ -165,7 +165,7 @@ pub async fn send_with_fallback(
             Some(secret) => match secret.resolve() {
                 Ok(v) => Some(v),
                 Err(err) => {
-                    tracing::warn!(target = %target, "skipping target: {err}");
+                    tracing::info!(target = %target, "skipping target: {err}");
                     attempts.push(TraceAttempt {
                         n,
                         target: target.to_string(),
@@ -204,7 +204,7 @@ pub async fn send_with_fallback(
                 } else {
                     "send_error"
                 };
-                tracing::warn!(target = %target, "upstream error: {err}");
+                tracing::info!(target = %target, "upstream error: {err}");
                 attempts.push(TraceAttempt {
                     n,
                     target: target.to_string(),

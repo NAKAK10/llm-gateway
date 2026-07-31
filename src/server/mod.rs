@@ -67,10 +67,10 @@ pub struct AppState {
 
 /// Load config, bind, and serve until interrupted.
 pub async fn serve(options: ServeOptions) -> Result<()> {
-    init_tracing();
-
     let shared = SharedConfig::load(paths::config_file())?;
     let config = shared.get();
+
+    init_tracing(config.logging.logging);
 
     let host = config.server.host.clone();
     let port = options.port_override.unwrap_or(config.server.port);
@@ -127,9 +127,11 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         }
     };
 
-    tracing::info!("llm-gateway listening on http://{host}:{port}");
+    // Always shown, independent of `logging.logging`: this is the startup
+    // confirmation every server-like CLI prints, not a diagnostic.
+    eprintln!("llm-gateway listening on http://{host}:{port}");
     if mode.debug {
-        tracing::info!(
+        eprintln!(
             "trace recording is ON — prompt text is written to disk{}",
             if mode.debug_full {
                 " (untruncated)"
@@ -309,9 +311,19 @@ fn warn_if_semantic_routes_are_unusable(_config: &Config) {
     );
 }
 
-fn init_tracing() {
+/// Set up the console (stderr) log.
+///
+/// Off by default (`verbose == false`, i.e. `config.logging.logging` unset):
+/// only `warn!`/`error!` reach the console, which hides the routine
+/// diagnostics — embedding-model preparation, per-attempt fallback outcomes —
+/// emitted at `info!` elsewhere in this crate. Setting `logging.logging` to
+/// `true` raises the default level to `info` so those show. An explicit
+/// `RUST_LOG` always wins over both, for whoever wants finer control.
+fn init_tracing(verbose: bool) {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let default_level = if verbose { "info" } else { "warn" };
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
     // Ignore a second call (tests may race); the first subscriber wins.
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
