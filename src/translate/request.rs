@@ -109,7 +109,10 @@ fn system_message(payload: &serde_json::Value) -> Option<serde_json::Value> {
     (!text.is_empty()).then(|| serde_json::json!({"role": "system", "content": text}))
 }
 
-fn system_text(system: &serde_json::Value) -> String {
+/// Flatten a `system` value (string, or an array of text blocks) into plain
+/// text. `pub(crate)` because `agent::claude_cli` needs the same rule when it
+/// turns a request into a `--system-prompt` argument.
+pub(crate) fn system_text(system: &serde_json::Value) -> String {
     match system {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(blocks) => text_blocks(blocks).join("\n\n"),
@@ -357,7 +360,10 @@ pub fn estimate_input_tokens(payload: &serde_json::Value) -> u64 {
 /// `type: "text"` block joined. Non-text blocks (images, tool calls, tool
 /// results) are not counted here — they either have no text of their own or
 /// are already reflected in `tools` above.
-fn message_text(message: &serde_json::Value) -> String {
+/// The text content of one message. `pub(crate)` for the same reason as
+/// [`system_text`]: flattening a request into a single prompt uses the same
+/// rule as estimating its size.
+pub(crate) fn message_text(message: &serde_json::Value) -> String {
     match message.get("content") {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(blocks)) => text_blocks(blocks).join("\n"),

@@ -16,6 +16,7 @@
 //! This is a binary-first crate; the library exists so integration tests can
 //! drive the real router and config machinery over real TCP.
 
+pub mod agent;
 pub mod cli;
 pub mod config;
 pub mod error;

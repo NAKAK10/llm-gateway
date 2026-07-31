@@ -88,10 +88,17 @@ pub fn run() -> Result<()> {
             .any(|(candidate, _)| candidate == provider);
         let literal =
             if storage == KeyStorage::Literal && provider.needs_key() && !already_discovered {
-                let value = cliclack::password(format!("API key for {}", provider.label()))
-                    .mask('*')
-                    .allow_empty()
-                    .interact()?;
+                // The hint matters: a subscription user has no API key to paste
+                // here, and without being told that empty is allowed the wizard
+                // reads as "an API key is mandatory for every provider".
+                let value = cliclack::password(format!(
+                    "API key for {} (empty → reference ${{{}}} instead)",
+                    provider.label(),
+                    provider.env_var(),
+                ))
+                .mask('*')
+                .allow_empty()
+                .interact()?;
                 if value.is_empty() {
                     env_fallback.push(*provider);
                     None
@@ -423,6 +430,8 @@ pub fn build_config(
                     .map(|(name, value)| (name.to_string(), value.to_string()))
                     .collect(),
                 inject_usage: true,
+                transport: Default::default(),
+                agent_args: Vec::new(),
             },
         );
     }
@@ -443,6 +452,8 @@ pub fn build_config(
                 )),
                 headers: Default::default(),
                 inject_usage: true,
+                transport: Default::default(),
+                agent_args: Vec::new(),
             },
         );
     }

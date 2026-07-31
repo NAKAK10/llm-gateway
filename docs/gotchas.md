@@ -138,6 +138,41 @@ differ; same-protocol traffic never enters this code path.
   request (human turn vs tool loop); a gateway-wide constant would be wrong half
   the time.
 
+## Agent CLI transport (`claude-cli`)
+
+- **The child must not be able to call the gateway.** `~/.claude/settings.json`'s
+  `env` block can set `ANTHROPIC_BASE_URL`, and an inherited environment can too;
+  either one turns a provider call into an infinite loop. Two independent guards:
+  the child runs with `--setting-sources project` in an empty scratch directory
+  (so user settings never load) and with those variables removed from its
+  environment. Do not "simplify" one of them away.
+- **The caller's tools cannot be passed through, and the child's must be denied.**
+  `claude -p` runs Claude Code's own tools; without `--allowedTools ""` a
+  provider call could edit files nobody asked it to touch. Verified: with the
+  empty allowlist the model may still *attempt* a tool and the attempt is
+  refused, without hanging on a permission prompt.
+- **`kill_on_drop` is not optional.** A client that disconnects drops the
+  response stream; without it the `claude` process keeps generating, unwatched
+  and unbilled to nobody's benefit.
+- **The `assistant` event's `usage` is a mid-run snapshot.** Measured: a 5-token
+  answer reports `output_tokens: 1` there and 5 on the `result` event. The
+  non-streaming path takes `result`'s numbers, because that body is what cost
+  accounting reads.
+- **`--verbose` is required** alongside `--output-format stream-json` for `-p`,
+  and `--include-partial-messages` is what turns the output into real Anthropic
+  stream events. Without the latter you get one complete message and no
+  streaming.
+- **`count_tokens` must never spawn.** There is no way to count tokens with the
+  CLI short of running a whole generation, so a `claude-cli` target takes the
+  local-estimate path instead (`estimated_locally` in the trace log). Wiring it
+  to the transport would spend a real answer to measure a question.
+- **Process startup dominates latency** (~5s per call here). This transport is
+  for routes where that is acceptable; it is not a drop-in replacement for an
+  HTTP provider.
+- **Requests spend subscription limits, not API credit.** A busy route can
+  exhaust a plan's quota, and the failure arrives as an `error` frame carrying
+  the CLI's own message ("usage limit reached").
+
 ## Config / security
 
 - **`command:` secret references run on every request attempt.** That is what

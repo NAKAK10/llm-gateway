@@ -2,6 +2,54 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-07-31 — Subscriptions are served by running the official client, not by holding its credential
+
+A Claude Pro/Max plan authenticates Claude Code. It is not an API key, and the
+two ways to make it look like one are not equivalent:
+
+- **Rejected: presenting the client's credential upstream.** Lifting Claude
+  Code's OAuth token and sending it to `api.anthropic.com` as if the gateway were
+  Claude Code is using a subscription outside what it is sold as. Not built, and
+  the reason is written down here so it does not get "fixed" later.
+- **Built: `transport: "claude-cli"`.** The gateway spawns `claude -p` and
+  translates its output. The official client authenticates itself, with its own
+  login, on the user's own machine — which is also what OpenClaw does
+  (`agentRuntime.id: "claude-cli"`), the prior art this follows.
+
+The shape that made it cheap: `--output-format stream-json --verbose
+--include-partial-messages` emits the provider's **own Anthropic stream events**,
+one per line. So streaming is unwrapping rather than rebuilding, and `usage`
+(cache counts included) and `stop_reason` arrive as the model produced them. The
+non-streaming path reads the single `assistant` event, taking `result`'s usage
+because the assistant event's is a mid-run snapshot.
+
+Design decisions worth keeping:
+
+- **`transport` is a provider field, separate from `api`.** The CLI's output *is*
+  `anthropic-messages`, so protocol and transport are different questions and
+  validation enforces the pairing. Everything downstream — routes, fallback,
+  translation, trace, stats — needed no knowledge of it.
+- **`BodyStream` keeps `reqwest::Error` as its error type** even for a local
+  body. A subprocess never produces one, and its failures are reported as an
+  Anthropic error *body* (readable by the client) rather than a stream error
+  (not). That single choice is why `usage::tee`, `translate::adapter` and
+  `server::passthrough` were untouched by this feature.
+- **The child is a text generator, not a session.** `--allowedTools ""` denies
+  every tool (verified: it refuses without hanging on a permission prompt),
+  `--setting-sources project` in an empty scratch directory loads no user
+  settings, `--strict-mcp-config` loads no MCP servers, and the `ANTHROPIC_*`
+  variables are removed from its environment. The last two guards exist for the
+  same reason: `settings.json`'s `env` or an inherited shell could point the child
+  back at this gateway, forever.
+- **`count_tokens` never spawns.** Answering it would mean running a full
+  generation, so a `claude-cli` target takes the local estimate path that
+  `openai-chat` targets already use.
+
+Accepted limits, documented rather than worked around: the caller's `tools` are
+dropped (making this a generation upstream, not an agent one), a `messages` array
+is flattened into a labelled transcript, sampling parameters have no CLI
+equivalent, and process startup costs ~5s per call.
+
 ## 2026-07-31 — GitHub Copilot is an ordinary provider; `command:` secrets exist for it
 
 Copilot needs no special support in the gateway. `https://api.githubcopilot.com`

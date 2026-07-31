@@ -89,6 +89,31 @@ pub async fn run() -> Result<()> {
 async fn probe(client: &reqwest::Client, id: String, provider: ProviderConfig) -> (Probe, ApiKind) {
     let start = Instant::now();
 
+    // A `claude-cli` provider has nothing to connect to. The equivalent question
+    // is "is the binary there?", and answering it here keeps the table's
+    // promise: every configured provider gets a verdict.
+    if provider.transport == crate::config::Transport::ClaudeCli {
+        let available = crate::agent::is_available();
+        return (
+            Probe {
+                id,
+                base_url: format!("{} (local process)", crate::agent::claude_cli::PROGRAM),
+                // The CLI holds its own login; there is no reference for us to
+                // resolve, so "resolved" means "the tool is installed".
+                key_resolved: available,
+                status: available.then_some(200),
+                error: (!available).then(|| {
+                    format!(
+                        "`{}` not found on PATH — install Claude Code and run it once to log in",
+                        crate::agent::claude_cli::PROGRAM
+                    )
+                }),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            },
+            provider.api,
+        );
+    }
+
     let (key, key_resolved) = match &provider.api_key {
         Some(secret) => match secret.resolve() {
             Ok(value) => (Some(value), true),

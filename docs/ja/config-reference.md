@@ -25,10 +25,12 @@ id は `model` 文字列の最初の `/` より前に現れる部分です。同
 
 | フィールド | デフォルト | 補足 |
 |---|---|---|
-| `baseUrl` | *(必須)* | 末尾スラッシュなし。`anthropic-messages` はホストのルート(`https://api.anthropic.com`)— ゲートウェイが `/v1/messages` を付加する。OpenAI 系はバージョンプレフィックス(`…/v1`)まで含める — ゲートウェイが `/chat/completions` または `/responses` を付加する。 |
+| `baseUrl` | *(`http` では必須)* | 末尾スラッシュなし。`anthropic-messages` はホストのルート(`https://api.anthropic.com`)— ゲートウェイが `/v1/messages` を付加する。OpenAI 系はバージョンプレフィックス(`…/v1`)まで含める — ゲートウェイが `/chat/completions` または `/responses` を付加する。 |
 | `api` | *(必須)* | `openai-chat` \| `openai-responses` \| `anthropic-messages`。あるルートに、その `api` とは異なるプロトコルを話すクライアントから到達できるのは、ゲートウェイがその組み合わせを変換できる場合だけ — 現時点では `anthropic-messages` 受信 → `openai-chat` 送信のみ(つまり Claude Code から任意の OpenAI 互換プロバイダーへ)。それ以外の組み合わせは `400` になる。 |
 | `apiKey` | *(なし)* | リテラル文字列 \| `"${ENV_VAR}"` \| `"keychain:<name>"`(macOS Keychain、サービス名 `llm-gateway/<name>`)\| `"command:<cmd>"`(コマンドの標準出力、例: `command:gh auth token`)。**リクエスト試行ごとに**解決されるため、ローテーションは即時反映 — これが `command:` 形式の存在理由でもある。`serve` プロセスの環境変数は起動時に固定され、外部から更新できないため `${VAR}` ではローテーションするトークンを扱えない。コマンドは試行のたびに実行されるので、高速なものにすること。 |
 | `headers` | `{}` | 追加リクエストヘッダー。例: OpenRouter の任意ヘッダー `HTTP-Referer` / `X-Title`。 |
+| `transport` | `"http"` | `"http"` \| `"claude-cli"`。`claude-cli` はリクエストを送る代わりにローカルの `claude` バイナリを実行する — これが Claude のサブスクリプションでゲートウェイのトラフィックを処理させる方法。この場合 `baseUrl` と `apiKey` は使われず(CLI 自身がログイン済み)、`api` は `anthropic-messages` でなければならない。README の「サブスクリプションベースのプロバイダー」を参照。 |
+| `agentArgs` | `[]` | agent CLI のコマンドラインに追加される引数(`--add-dir`、別の `--permission-mode` など)。`http` transport では無視される。 |
 | `injectUsage` | `true` | ストリーミングの `openai-chat` のみ: トークン数が取れるよう `stream_options.include_usage` を付加する。ストリーム末尾に usage のみのチャンクが 1 つ追加される。 |
 
 ## routes.\<name\>

@@ -13,6 +13,10 @@ use crate::error::{Error, Result};
 pub struct Target {
     pub model_ref: ModelRef,
     pub api: ApiKind,
+    /// How to reach it: HTTP, or a local agent CLI (`crate::agent`).
+    pub transport: crate::config::Transport,
+    /// Extra command-line arguments for an agent CLI transport.
+    pub agent_args: Vec<String>,
     /// `base_url` with no trailing slash.
     pub base_url: String,
     /// Still unresolved — the secret is read per attempt, so a fixed Keychain
@@ -99,6 +103,8 @@ fn build_target(model_ref: ModelRef, provider: &ProviderConfig) -> Target {
     Target {
         model_ref,
         api: provider.api,
+        transport: provider.transport,
+        agent_args: provider.agent_args.clone(),
         base_url: provider.base_url.trim_end_matches('/').to_string(),
         api_key: provider.api_key.clone(),
         headers: provider
@@ -145,6 +151,8 @@ mod tests {
             api_key: None,
             headers: BTreeMap::new(),
             inject_usage: true,
+            transport: Default::default(),
+            agent_args: Vec::new(),
         }
     }
 

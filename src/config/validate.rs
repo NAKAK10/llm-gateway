@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::config::{ApiKind, Config, ModelRef, RouteConfig, SemanticConfig};
+use crate::config::{ApiKind, Config, ModelRef, RouteConfig, SemanticConfig, Transport};
 use crate::error::ValidationReport;
 
 /// Check a parsed config and return everything that is wrong with it.
@@ -134,11 +134,46 @@ pub fn validate(config: &Config, config_path: &Path) -> ValidationReport {
         ));
     }
 
-    for provider_id in config.providers.keys() {
+    for (provider_id, provider) in &config.providers {
         if !used_providers.contains(provider_id.as_str()) {
             report.warn(format!(
                 "provider `{provider_id}` is defined but not used by any route"
             ));
+        }
+
+        match provider.transport {
+            Transport::Http => {
+                if provider.base_url.trim().is_empty() {
+                    report.error(format!(
+                        "provider `{provider_id}`: baseUrl is required for the `http` transport"
+                    ));
+                }
+            }
+            Transport::ClaudeCli => {
+                // The CLI's output *is* Anthropic Messages; declaring anything
+                // else would make the gateway translate away from the shape it
+                // already has, or refuse the request outright.
+                if provider.api != ApiKind::AnthropicMessages {
+                    report.error(format!(
+                        "provider `{provider_id}`: transport `claude-cli` speaks {} — set `api: \"anthropic-messages\"` (found {})",
+                        ApiKind::AnthropicMessages,
+                        provider.api
+                    ));
+                }
+                if !provider.base_url.trim().is_empty() {
+                    report.warn(format!(
+                        "provider `{provider_id}`: baseUrl is ignored by the `claude-cli` transport (it runs a local process)"
+                    ));
+                }
+                // Worth saying out loud: a user who set a key here believes it
+                // is being used, and it is not — the child authenticates with
+                // its own subscription login.
+                if provider.api_key.is_some() {
+                    report.warn(format!(
+                        "provider `{provider_id}`: apiKey is ignored by the `claude-cli` transport; the CLI uses its own login"
+                    ));
+                }
+            }
         }
     }
 
@@ -393,6 +428,8 @@ mod tests {
             api_key: None,
             headers: BTreeMap::new(),
             inject_usage: true,
+            transport: Default::default(),
+            agent_args: Vec::new(),
         }
     }
 
@@ -551,6 +588,123 @@ mod tests {
 
         let report = validate(&c, &nonexistent_path());
         assert!(report.is_ok(), "{:?}", report.errors);
+    }
+
+    /// A `claude-cli` provider needs neither of the two fields every other
+    /// provider requires, and saying so in tests keeps a future "surely baseUrl
+    /// is mandatory" refactor honest.
+    #[test]
+    fn a_claude_cli_provider_needs_no_base_url_or_key() {
+        let mut c = minimal_config();
+        c.providers.insert(
+            "claude-subscription".into(),
+            ProviderConfig {
+                base_url: String::new(),
+                api: ApiKind::AnthropicMessages,
+                api_key: None,
+                headers: BTreeMap::new(),
+                inject_usage: true,
+                transport: Transport::ClaudeCli,
+                agent_args: Vec::new(),
+            },
+        );
+        c.routes
+            .insert("role-sub".into(), route("claude-subscription/sonnet", &[]));
+
+        let report = validate(&c, &nonexistent_path());
+        assert!(report.is_ok(), "{:?}", report.errors);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| w.contains("claude-subscription")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn a_claude_cli_provider_must_declare_the_protocol_the_cli_speaks() {
+        let mut c = minimal_config();
+        c.providers.insert(
+            "wrong-api".into(),
+            ProviderConfig {
+                base_url: String::new(),
+                api: ApiKind::OpenaiChat,
+                api_key: None,
+                headers: BTreeMap::new(),
+                inject_usage: true,
+                transport: Transport::ClaudeCli,
+                agent_args: Vec::new(),
+            },
+        );
+        c.routes
+            .insert("role-x".into(), route("wrong-api/sonnet", &[]));
+
+        let report = validate(&c, &nonexistent_path());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("wrong-api") && e.contains("anthropic-messages")),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn fields_a_claude_cli_provider_ignores_are_warned_about() {
+        // Silently ignoring an apiKey someone deliberately set is worse than
+        // saying it does nothing.
+        let mut c = minimal_config();
+        c.providers.insert(
+            "noisy".into(),
+            ProviderConfig {
+                base_url: "https://example.test".into(),
+                api: ApiKind::AnthropicMessages,
+                api_key: Some(SecretRef::new("sk-unused")),
+                headers: BTreeMap::new(),
+                inject_usage: true,
+                transport: Transport::ClaudeCli,
+                agent_args: Vec::new(),
+            },
+        );
+        c.routes.insert("role-y".into(), route("noisy/sonnet", &[]));
+
+        let report = validate(&c, &nonexistent_path());
+        assert!(report.is_ok(), "{:?}", report.errors);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("noisy") && w.contains("baseUrl")),
+            "{:?}",
+            report.warnings
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("noisy") && w.contains("apiKey")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn an_http_provider_without_a_base_url_is_rejected() {
+        let mut c = minimal_config();
+        c.providers.get_mut("anthropic").unwrap().base_url = String::new();
+
+        let report = validate(&c, &nonexistent_path());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("anthropic") && e.contains("baseUrl")),
+            "{:?}",
+            report.errors
+        );
     }
 
     #[test]

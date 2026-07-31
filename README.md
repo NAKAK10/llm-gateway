@@ -200,6 +200,41 @@ What a translated route costs you:
 
 Full list of what is and is not carried across: `docs/gotchas.md`.
 
+## Subscription-backed providers
+
+A subscription is not an API key. A Claude Pro/Max plan authenticates *Claude
+Code*, and no credential the gateway could hold would let it speak to Anthropic
+on that plan's behalf. So for that one case the gateway does not hold a
+credential — it runs the official client, which already has the login:
+
+```json5
+providers: {
+  // No baseUrl, no apiKey: the CLI authenticates itself.
+  "claude-subscription": { api: "anthropic-messages", transport: "claude-cli" },
+},
+routes: {
+  "role-sub": { model: { default: "claude-subscription/sonnet" } },
+}
+```
+
+From there it is a provider like any other: routes, fallback, `trace`, `stats`.
+`transport: "claude-cli"` is the only unusual line, and `llm-gateway providers`
+reports it as reachable when the binary is installed.
+
+The limits are the CLI's, and they are real:
+
+- **Your tools do not reach it.** `claude -p` has Claude Code's own tools, not
+  the ones in the request, and the gateway denies all of them so a provider call
+  cannot touch your files. This is a generation upstream, not an agent loop.
+- **One prompt.** A `messages` array is flattened into a labelled transcript.
+- **~5s of process startup per call**, and `temperature` / `top_p` /
+  `stop_sequences` / `max_tokens` are dropped — the CLI has no equivalents.
+- Requests count against your **subscription's** limits, not an API balance.
+
+What does survive: real streaming (the CLI emits Anthropic stream events, which
+are forwarded as-is), `usage` including cache counts, and `stop_reason`. Nothing
+else in the gateway changes — the transport is the only difference.
+
 ## Supported providers
 
 `llm-gateway init` can scaffold any of these out of the box. A provider is

@@ -132,13 +132,63 @@ impl std::fmt::Display for ApiKind {
     }
 }
 
+/// How a provider is reached.
+///
+/// Almost always HTTP. `claude-cli` runs the local Claude Code binary instead,
+/// which is the only way a *subscription* can serve gateway traffic: a Claude
+/// Pro/Max plan authenticates that client, not any credential the gateway could
+/// present upstream. See [`crate::agent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Transport {
+    #[default]
+    Http,
+    /// `claude -p`, driven as a subprocess.
+    ClaudeCli,
+}
+
+impl Transport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::ClaudeCli => "claude-cli",
+        }
+    }
+
+    /// Whether a `baseUrl` means anything for this transport.
+    pub fn needs_base_url(self) -> bool {
+        matches!(self, Self::Http)
+    }
+}
+
+impl std::fmt::Display for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderConfig {
     /// Without a trailing slash, e.g. `https://openrouter.ai/api/v1`.
+    ///
+    /// Optional only because a `claude-cli` provider has no URL to speak of;
+    /// `validate` requires it for every HTTP provider.
+    #[serde(default)]
     pub base_url: String,
 
     pub api: ApiKind,
+
+    /// How to reach the provider. Defaults to HTTP, so every existing config
+    /// keeps its meaning.
+    #[serde(default, skip_serializing_if = "is_http")]
+    pub transport: Transport,
+
+    /// Extra arguments appended to an agent CLI's command line. An escape hatch
+    /// for the flags this gateway does not model (`--add-dir`, a different
+    /// `--permission-mode`); ignored by HTTP providers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_args: Vec<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<SecretRef>,
@@ -159,6 +209,10 @@ pub struct ProviderConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn is_http(transport: &Transport) -> bool {
+    *transport == Transport::Http
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

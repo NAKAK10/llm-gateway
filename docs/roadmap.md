@@ -68,8 +68,18 @@ designated auto route (never overriding an explicit route name). Behind the
 ## Phase 4 — agent CLIs as backends
 
 Register `claude -p` / `codex exec` / `opencode run` as upstream "providers"
-so subscription auth can serve API-shaped traffic. No OSS does this today;
-OpenClaw's `agentRuntime.id: "claude-cli"` is the only prior art.
+so subscription auth can serve API-shaped traffic. OpenClaw's
+`agentRuntime.id: "claude-cli"` is the prior art.
+
+- [x] `transport: "claude-cli"` — `claude -p` as a provider, streaming and
+      non-streaming, with the recursion guards and tool denial documented in
+      gotchas.md. Verified end to end against a real subscription.
+- [ ] `codex exec` and `opencode run`, for the same reason on those
+      subscriptions.
+- [ ] tool passthrough. Today a request's `tools` are dropped, which is what
+      makes this a generation upstream rather than an agent one; the CLI would
+      need to accept a foreign tool schema and surface `tool_use` blocks for
+      that to change.
 
 ## Postgres? No.
 
