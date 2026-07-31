@@ -279,6 +279,10 @@ mod tests {
                 description: "a test route",
                 model: { default: "anthropic/opus-pinned" },
             },
+            "default": {
+                description: "catch-all",
+                model: { default: "anthropic/opus-pinned" },
+            },
         },
     }"#;
 
@@ -293,6 +297,10 @@ mod tests {
             "role-writer": {
                 description: "a test route",
                 model: { default: "anthropic/opus-updated" },
+            },
+            "default": {
+                description: "catch-all",
+                model: { default: "anthropic/opus-pinned" },
             },
         },
     }"#;

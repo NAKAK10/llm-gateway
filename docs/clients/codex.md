@@ -41,8 +41,11 @@ model_provider = "gateway"
 disable_response_storage = true
 ```
 
-Your `agents/*.toml` files keep their `model = "gpt-…"` lines unchanged — the
-gateway's `gpt-*` wildcard route forwards those ids as-is.
+Your `agents/*.toml` files can keep their existing `model = "gpt-…"` lines.
+Codex still insists on a model string, but `llm-gateway` no longer uses it to
+choose a route: every request is classified by content against route
+`description`s, and the reserved `default` route catches anything that does not
+clear the threshold.
 
 Notes:
 

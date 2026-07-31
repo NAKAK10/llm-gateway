@@ -1,6 +1,6 @@
 [package]
 name = "llm-gateway"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.85"
 description = "A single local endpoint that fronts Claude Code, Codex CLI, opencode and OpenClaw, with model routing, fallback, cost accounting and auditable routing decisions."
@@ -11,11 +11,15 @@ keywords = ["llm", "gateway", "proxy", "anthropic", "openai"]
 categories = ["command-line-utilities", "web-programming::http-server"]
 
 [features]
-default = []
-# Semantic routing (issue #2): static embeddings via model2vec-rs, used to
-# classify a request against `routes[].description`. Off by default because
-# `model.safetensors` alone is ~500MB — opting in is a deliberate choice, not
-# something every install should pay for.
+default = ["semantic"]
+# Content classification (issue #2): static embeddings via model2vec-rs, used
+# to classify every request against every route's `description` and pick the
+# route whose text is the closest match — the only routing mechanism this
+# gateway has. On by default: `init` downloads the ~500MB embedding model
+# unconditionally, and a build without this feature always falls back to the
+# reserved `default` route without classifying anything. Opt out with
+# `--no-default-features` for a smaller build that only ever forwards to
+# `default`.
 semantic = ["dep:model2vec-rs", "dep:sha2"]
 
 [dependencies]

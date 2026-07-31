@@ -6,10 +6,11 @@ One local endpoint in front of every agent CLI.
 
 `llm-gateway` speaks the three wire protocols its clients need — Anthropic
 Messages (`/v1/messages`), OpenAI Chat (`/v1/chat/completions`) and OpenAI
-Responses (`/v1/responses`) — rewrites only the `model` field of each request,
-and streams the response back **byte-for-byte unmodified**. Model selection,
-fallback, cost accounting and auditable routing decisions all live in one
-config file.
+Responses (`/v1/responses`) — classifies every inbound request against your
+routes' `description` text, rewrites only the upstream `model` field it sends,
+and streams the response back **byte-for-byte unmodified**. Content-based
+routing, fallback, cost accounting and auditable routing decisions all live in
+one config file.
 
 The one deliberate exception is a [cross-protocol route](#cross-protocol-routing):
 when the client's protocol and the provider's differ, the request and response
@@ -47,12 +48,16 @@ already exists), so docs-only merges are safe.
 ## Quick start
 
 ```sh
-llm-gateway init            # interactive; writes ~/.config/llm-gateway/config.json (chmod 600)
+llm-gateway init            # interactive; downloads the embedding model, then writes ~/.config/llm-gateway/config.json (chmod 600)
 llm-gateway serve           # start the gateway on 127.0.0.1:4000
 llm-gateway launch claude   # start Claude Code through the gateway
 llm-gateway stats           # what was spent, per route
 llm-gateway update          # upgrade to the latest release
 ```
+
+**Breaking config change:** there is no migration shim for the old schema.
+Delete `~/.config/llm-gateway/config.json` (or the whole
+`~/.config/llm-gateway/` directory) and re-run `llm-gateway init`.
 
 ## Supported clients
 
@@ -67,93 +72,71 @@ llm-gateway update          # upgrade to the latest release
 client's config. Manual (permanent) setup for every client is documented in
 `docs/clients/`.
 
-## Per-agent models
+## Per-agent model strings
 
 Sub-agents that pin their own model keep working, with **zero changes to the
-agent files** — every request flows through the gateway:
+agent files** — every request still flows through the gateway. What changed is
+that the pinned string no longer chooses a route: it is just whatever the
+client needs to stay happy.
 
-| client | agent model source | how it reaches the gateway |
+| client | where the client keeps its own model string | what that means now |
 |---|---|---|
-| Claude Code | subagent `model:` frontmatter | env redirect covers the whole process; ids resolve via `claude-*` |
-| Codex CLI | `~/.codex/agents/*.toml` `model =` | provider is global, models pass through via `gpt-*` |
-| opencode | `agents/*.md` `model: openai/…` | `launch` also redirects the built-in providers named in `launch.opencode.overrideProviders` (default `openai`, `anthropic`), because opencode picks a provider per model reference — without this, pinned agents would silently bypass the gateway |
+| Claude Code | subagent `model:` frontmatter, or Claude's own `/model` UI | the string is sent and logged, but route selection ignores it |
+| Codex CLI | `~/.codex/agents/*.toml` `model =` | Codex still needs a model name; the gateway classifies by content instead |
+| opencode | `agents/*.md` `model: openai/…` | `launch` still redirects built-in providers so pinned agents do not bypass the gateway |
 
-Routing is by model name by default: an exact route name wins, otherwise the
-longest wildcard prefix. Content-based (semantic) routing, which picks a route
-from the request itself, is available for routes that opt in — see
-[Semantic routing](#semantic-routing) below.
+## Content-classified routing
 
-## Semantic routing
+Classification is now always on. For every inbound request, the gateway embeds
+the **last user message**, compares it against every non-wildcard route's
+`description` with static `model2vec-rs` embeddings, and picks the top match if
+it clears the fixed cosine threshold **0.45**. If nothing clears the bar — or
+classification cannot run at all — the reserved `default` route is used.
 
-Content-based routing picks a route from the *content* of the request instead
-of its `model` name. It runs only for a route that carries a `semantic` block;
-everything else stays exact-name-first, then longest-wildcard-prefix.
+Important consequences:
 
-**Requires a build with the `semantic` cargo feature** — the Homebrew binary
-has it, `cargo install` without `--features semantic` does not. The feature is
-opt-in at build time because the embedding model is ~500MB. A binary without it
-warns at startup and forwards such routes to their own `model` directly, so the
-config stays valid either way. The model is downloaded on first `serve` with a
-`semantic` route configured, and is only loaded into memory when one exists.
-
-`routes[].semantic` is an optional field on any route:
-
-| field | type | default | meaning |
-|---|---|---|---|
-| `candidates` | `string[]` | `[]` | Route names eligible for selection. Empty means "every other route that has a `description`". |
-| `threshold` | `number` | `0.45` | If the top-1 cosine similarity of the request against the candidates falls below this, the auto route's own `model` is used instead. |
-
-Design points:
-
-- **The auto route's own `model` is where requests land when no candidate
-  clears the threshold** — so a route with `semantic` still needs a `model`,
-  exactly like any other route.
-- **An explicit route name is never overridden.** Classification only runs
-  when a request names a route that itself carries `semantic`. This
-  continues the existing rule that an exact route name always wins and is
-  always predictable (see `src/route.rs`, Phase 2 in `docs/roadmap.md`).
-- **Candidates must have a `description`** — that's the classification
-  corpus (long descriptions can live in `llm/*.md`, as today).
-- **Candidates the incoming request cannot reach are excluded at match
-  time** — a request to `/v1/chat/completions` will never resolve to an
-  `anthropic-messages` candidate, because nothing translates in that
-  direction. A Claude Code request *can* pick an `openai-chat` candidate,
-  since that direction is translated (see
-  [Cross-protocol routing](#cross-protocol-routing)).
-- **Route names with `semantic` cannot use a wildcard (`*`).**
+- **The client's requested `model` never picks a route.** It survives only for
+  the client's own UI and for trace logs' `requested_model` field.
+- **Normal builds always include classification.** `semantic` is a default cargo
+  feature, so Homebrew and plain `cargo install` builds behave the same.
+- **`cargo install --no-default-features` is the opt-out.** That smaller build
+  skips classification entirely and always routes to `default`.
+- **`llm-gateway init` always downloads the embedding model** (roughly 500 MB)
+  before it writes `config.json`.
+- **Every non-wildcard route needs a real `description`.** That text is both
+  documentation and the classification corpus; boilerplate descriptions produce
+  boilerplate routing.
+- **Wildcard route names are now an advanced hand-written escape hatch only.**
+  `init` does not generate them, `GET /v1/models` does not list them, and the
+  classifier never scores them.
 
 ```json5
 routes: {
-  "auto": {
-    semantic: {
-      candidates: ["role-light", "role-deep", "role-code"],
-      threshold: 0.45,
-    },
-    // Where requests land when no candidate clears the threshold.
+  "default": {
+    description: "Fallback for requests that do not clearly match any other route.",
     model: {
-      default: "ollama-local/qwen3:8b",
-      fallbacks: ["openrouter/qwen/qwen3-8b"],
+      default: "anthropic/*",
     },
   },
 
-  "role-light": {
-    description: "Short, well-defined chores: summarizing, formatting, commit messages, naming",
+  "role-anthropic": {
+    description: "Complex reasoning, coding, and multi-step agentic tasks that need careful step-by-step thinking and full tool support.",
+    model: {
+      default: "anthropic/*",
+      fallbacks: ["openrouter-anthropic/anthropic/*"],
+    },
+  },
+
+  "role-cheap": {
+    description: "Short chores: summarizing, formatting, commit messages, and other latency-sensitive low-cost tasks.",
     model: {
       default: "ollama-local/qwen3:8b",
       fallbacks: ["groq/llama-3.3-70b-versatile"],
     },
   },
 
-  "role-deep": {
-    description: "./llm/role-deep.md",
-    model: {
-      default: "openrouter/anthropic/claude-opus-5",
-      fallbacks: ["openrouter/google/gemini-3-pro"],
-    },
-  },
-
   "role-code": {
-    description: "Code generation, refactoring, test writing, bug fixes",
+    description: "Code generation, refactoring, test writing, and bug fixes.",
     model: {
       default: "openrouter/qwen/qwen3-coder",
       fallbacks: ["deepseek/deepseek-coder"],
@@ -178,8 +161,11 @@ providers: {
   "ollama-local": { baseUrl: "http://127.0.0.1:11434/v1", api: "openai-chat" },
 },
 routes: {
-  // Reached from Claude Code with: llm-gateway launch claude --model role-cheap
-  "role-cheap": { model: { default: "ollama-local/qwen3:8b" } },
+  // Reached when classification decides this request fits the route.
+  "role-cheap": {
+    description: "Short chores: summarizing, formatting, commit messages",
+    model: { default: "ollama-local/qwen3:8b" },
+  },
 }
 ```
 
@@ -231,10 +217,20 @@ providers: {
   "openai-subscription": { api: "openai-chat", transport: "codex-cli" },
 },
 routes: {
-  "role-sub": { model: { default: "anthropic-subscription/sonnet" } },
-  // `default` means "whatever the CLI is configured to use" — which models a
-  // ChatGPT plan allows is not knowable from here.
-  "role-codex": { model: { default: "openai-subscription/default" } },
+  "default": {
+    description: "Fallback for requests that do not clearly match any other route.",
+    model: { default: "anthropic/*" },
+  },
+  "role-sub": {
+    description: "Requests that should run on the local Claude subscription via the provider CLI. Generation only — caller tools are not passed through.",
+    model: { default: "anthropic-subscription/sonnet" },
+  },
+  // `default` in the model string means "whatever the CLI is configured to use"
+  // — which models a ChatGPT plan allows is not knowable from here.
+  "role-codex": {
+    description: "Requests that should run on the local ChatGPT subscription via Codex CLI.",
+    model: { default: "openai-subscription/default" },
+  },
 }
 ```
 
@@ -293,6 +289,9 @@ Everything lives in `~/.config/llm-gateway/` (override with
 trailing commas are allowed. Changes are hot-reloaded; a broken edit keeps the
 previous config serving and logs the error.
 
+For everyday use the schema is just **four top-level keys**:
+`server`, `providers`, `routes`, `logging`.
+
 ```json5
 {
   server: {
@@ -304,48 +303,55 @@ previous config serving and logs the error.
     "<id>": {
       baseUrl: "https://openrouter.ai/api/v1",
       api: "openai-chat",     // openai-chat | openai-responses | anthropic-messages
-      apiKey: "sk-…",         // literal | "${ENV_VAR}" | "keychain:<name>"
-      headers: { "X-Title": "llm-gateway" },   // optional extra headers
-      injectUsage: true,      // add stream_options.include_usage to streamed chat
+      apiKey: "sk-…",         // literal | "${ENV_VAR}" | "keychain:<name>" | "command:<cmd>"
+      headers: { "X-Title": "llm-gateway" },
+      injectUsage: true,
     },
   },
   routes: {
-    "<name>": {               // what clients put in `model`; `:` and `/` forbidden
-      title: "…",
-      description: "text or ./llm/file.md",   // becomes the semantic-routing corpus later
+    "default": {
+      description: "Fallback for requests that do not clearly match any other route.",
       model: {
-        default: "<provider>/<model>",        // split on the FIRST `/` only
-        fallbacks: ["<provider>/<model>"],    // same protocol as default; tried before first byte
+        default: "<provider>/<model>",
       },
     },
-    "claude-*": {             // wildcard: `*` expands to the requested model
-      model: { default: "anthropic/*" },
+    "role-openai": {
+      description: "General-purpose assistant tasks, coding, and tool use via OpenAI's models.",
+      model: {
+        default: "openai/*",                  // split on the FIRST `/` only
+        fallbacks: ["openrouter/openai/*"],   // same protocol as default; tried before first byte
+      },
     },
   },
-  launch: {
-    // `model` is only the client's MAIN/default model, and it is a route
-    // name — a role route (`role-strategy`) or a passthrough id caught by a
-    // wildcard. Per-agent models are untouched; see "Per-agent models" below.
-    claude:   { model: "claude-sonnet-4-6", extraArgs: [] },
-    codex:    { model: "gpt-5.6", wireApi: "responses", extraArgs: [] },
-    opencode: { model: "role-default", models: [],
-                overrideProviders: ["openai", "anthropic"], extraArgs: [] },
-  },
   logging: {
-    dir: "./logs",            // relative to the config dir
-    usage: true,              // usage-YYYY-MM.jsonl, one line per request
+    dir: "./logs",
+    usage: true,
     debug: false,             // trace-YYYY-MM-DD.jsonl — records prompt text!
   },
+}
+```
+
+Optional advanced key: `launch`. `init` no longer writes it, and most configs
+never need it, but you can hand-edit it for per-client launcher tweaks:
+
+```json5
+launch: {
+  claude:   { extraArgs: [] },
+  codex:    { wireApi: "responses", extraArgs: [] },
+  opencode: { models: [], overrideProviders: ["openai", "anthropic"], extraArgs: [] },
 }
 ```
 
 | field | notes |
 |---|---|
 | `server.apiKey` | resolved once at startup; changing it needs a restart. Required when `host` is not loopback — one key guards every provider credential. |
-| `providers.<id>.apiKey` | resolved per request attempt, so env/Keychain rotation is picked up live. |
+| `providers.<id>.apiKey` | resolved per request attempt, so env/Keychain/`command:` rotation is picked up live. |
 | `providers.<id>.api` | fallbacks may not cross protocols; `config check` enforces it. |
-| `routes.<name>` | exact match wins over wildcards; among wildcards the longest prefix wins. |
-| `description` | treated as a file path when it starts with `./`, `../`, `/` or `~/`. |
+| `routes.default` | required. It is the reserved catch-all when no route clears the classification threshold, and it also participates as a normal candidate. |
+| `routes.<name>.description` | required on every non-wildcard route. Inline text or `./`/`../`/`/`/`~/` path; this is the classification corpus. |
+| `routes.<name>.model.default` | `"<provider>/<model>"`, split on the first `/` only. |
+| `routes.<name>.model.fallbacks` | same protocol as the default; tried in order before the first response byte. |
+| `launch` | optional advanced escape hatch only: Claude/Codex/opencode extra args, Codex `wireApi`, opencode `models`/`overrideProviders`. |
 | `logging.debug` | `--debug` truncates user text to 200 chars; `--debug-full` keeps everything. Plain-text prompts on disk — enable deliberately. |
 
 ## Commands
@@ -353,7 +359,7 @@ previous config serving and logs the error.
 ```
 llm-gateway serve [--debug] [--debug-full] [--port N]
 llm-gateway init
-llm-gateway launch <claude|codex|opencode> [--model R] [--isolate] [--print] [-- ARGS]
+llm-gateway launch <claude|codex|opencode> [--isolate] [--print] [-- ARGS]
 llm-gateway config check|show|gitignore
 llm-gateway stats [--by route|client|provider|model|day] [--since D] [--until D]
 llm-gateway trace [--tail] [--route R] [--client C]
@@ -363,11 +369,10 @@ llm-gateway update [--check]
 
 `update` asks GitHub for the latest release and, if this build is behind, runs
 the upgrade that matches how it was installed — `brew upgrade` for a Homebrew
-install, `cargo install --force` (keeping the `semantic` feature) for a
-`cargo install` one. It never overwrites its own binary: that would leave a
-package manager believing the old version is still there. For a hand-placed
-binary it prints the release link instead. `--check` reports without changing
-anything.
+install, `cargo install --force` for a `cargo install` one. It never overwrites
+its own binary: that would leave a package manager believing the old version is
+still there. For a hand-placed binary it prints the release link instead.
+`--check` reports without changing anything.
 
 ## What fallback does (and does not) do
 

@@ -2,6 +2,50 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-07-31 — Always classify; remove route-selection theatrics from the config
+
+The old split brain — "exact/wildcard routing is the real thing, semantic
+routing is an opt-in extra" — did not survive contact with the codebase. The
+new rule is simpler: classify every request, keep one reserved fallback, and
+stop pretending the client's `model` string is a policy API.
+
+**Always-classify beat opt-in because the gateway only had one interesting
+routing question left.** `src/server/proxy.rs::classify_request` now embeds the
+last user message for every inbound request, scores it against every
+non-wildcard route description via `src/semantic/index.rs`, and uses the top
+candidate only if it clears `CLASSIFICATION_THRESHOLD` (`0.45`). That is easier
+to explain, easier to trace, and harder to misconfigure than a special
+`routes[].semantic` side path.
+
+**`default` became the one explicit escape hatch.** `src/config/mod.rs`
+reserves the route name, `src/config/validate.rs` requires it to exist and
+forbids it from being a wildcard, and the classifier falls back to it both on a
+low score and on classifier absence. It is still a real route with its own
+`description` and `model`, so it can win honestly instead of being a dead bucket
+at the bottom of the file.
+
+**The config had to stop narrating removed choices.** The everyday schema is now
+`server` + `providers` + `routes` + `logging`; `launch` survives only as the
+rare hand-edit for extra CLI args, Codex's `wireApi`, and opencode's provider
+overrides (`src/config/mod.rs`). `launch.<client>.model` went away because the
+launchers in `src/launch/` always feed the fixed literal `default` to the child
+process now. The client still wants *a* model-shaped string; the gateway no
+longer treats it as authority.
+
+**`semantic` becoming a default feature is what makes the docs honest.**
+`Cargo.toml` now enables it by default, `src/cli/init.rs` downloads the
+`potion-multilingual-128M` files unconditionally before writing `config.json`,
+and the only opt-out is a `--no-default-features` build that always routes to
+`default`. "Install classification if you feel like it later" was no longer a
+true statement once `init` depended on the model being there.
+
+**No migration path is deliberate, not forgotten.** The shape changed too much:
+`routes[].semantic` disappeared, launcher `model` fields disappeared, `init`
+stopped generating wildcard selector routes, and validation now demands a
+literal `default` route plus descriptions on every non-wildcard route. The only
+safe instruction is to delete `~/.config/llm-gateway/config.json` (or the whole
+config directory from `src/paths.rs`) and re-run `llm-gateway init`.
+
 ## 2026-07-31 — `init`'s subscription and OpenRouter scaffolding, two bugs fixed
 
 Flagged by the owner as "confusing": a fresh `config.json` can carry

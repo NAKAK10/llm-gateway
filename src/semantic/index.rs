@@ -7,19 +7,30 @@
 //! [`Classifier`] owns the embedding model and the current index together,
 //! and is the only public entry point: [`Classifier::classify`].
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
 
-use crate::config::validate::resolve_candidates;
 use crate::config::watch::SharedConfig;
 use crate::config::{ApiKind, Config, ModelRef};
 use crate::semantic::embed::Embedder;
 
-/// One candidate available to an auto route's classifier.
+/// Cosine similarity a candidate must clear to win classification. Below
+/// this, [`Classifier::classify`] returns no winner and the caller falls
+/// back to the reserved `default` route (`crate::config::DEFAULT_ROUTE`).
+///
+/// Fixed rather than configurable per route: every route is now a
+/// classification candidate by default, so there is no longer a natural
+/// per-route place to hang a threshold on, and one shared cutoff is simpler
+/// to reason about than N independently-tuned ones. `0.45` is carried over
+/// from the old opt-in design's default, which was chosen empirically to
+/// separate genuinely on-topic descriptions from unrelated ones with the
+/// `potion-multilingual-128M` embedding model.
+pub const CLASSIFICATION_THRESHOLD: f32 = 0.45;
+
+/// One candidate available to the classifier.
 ///
 /// `vector` is already L2-normalized (see `Embedder::load`) and `api` is the
 /// protocol the candidate's own `model.default` speaks, so a candidate the
@@ -32,13 +43,7 @@ struct Candidate {
     api: ApiKind,
 }
 
-/// Resolved candidates and threshold for one `semantic` ("auto") route.
-struct RouteEntry {
-    threshold: f32,
-    candidates: Vec<Candidate>,
-}
-
-/// Vector table over every auto route's candidates, built from a single
+/// Vector table over every classifiable route, built from a single
 /// [`Config`] snapshot.
 ///
 /// Cheap to rebuild wholesale: at most a few dozen routes, each costing one
@@ -46,12 +51,13 @@ struct RouteEntry {
 /// [`Classifier`] rebuilds this from scratch on every config change rather
 /// than diffing it.
 pub struct RouteIndex {
-    routes: HashMap<String, RouteEntry>,
+    candidates: Vec<Candidate>,
 }
 
 impl RouteIndex {
-    /// Build the index for every route in `config` that has a `semantic`
-    /// block.
+    /// Build the index from every non-wildcard route in `config` — every
+    /// route is a classification candidate now, including the reserved
+    /// `default` route (see `crate::config::DEFAULT_ROUTE`).
     ///
     /// A candidate that turns out to have no description or an unresolvable
     /// `model.default` is silently skipped rather than causing a build
@@ -59,32 +65,14 @@ impl RouteIndex {
     /// `validate::validate`, which rejects exactly those cases for any
     /// config that is actually live, so this only needs to be defensive.
     pub fn build(config: &Config, embedder: &Embedder) -> Self {
-        let mut routes = HashMap::new();
+        let candidates = config
+            .routes
+            .keys()
+            .filter(|name| !name.contains('*'))
+            .filter_map(|name| embed_candidate(config, embedder, name))
+            .collect();
 
-        for (route_name, route) in &config.routes {
-            let Some(semantic) = &route.semantic else {
-                continue;
-            };
-
-            let candidates = resolve_candidates(config, route_name, semantic)
-                .into_iter()
-                .filter_map(|candidate_name| embed_candidate(config, embedder, candidate_name))
-                .collect();
-
-            routes.insert(
-                route_name.clone(),
-                RouteEntry {
-                    threshold: semantic.threshold,
-                    candidates,
-                },
-            );
-        }
-
-        Self { routes }
-    }
-
-    fn entry(&self, route_name: &str) -> Option<&RouteEntry> {
-        self.routes.get(route_name)
+        Self { candidates }
     }
 }
 
@@ -112,15 +100,15 @@ fn embed_candidate(
     })
 }
 
-/// Outcome of classifying one request against an auto route's candidates.
+/// Outcome of classifying one request against every candidate route.
 #[derive(Debug, Clone)]
 pub struct Verdict {
     /// The winning candidate's route name and its cosine similarity to the
-    /// request text, if the top-scoring candidate cleared the route's
-    /// `threshold`. `None` means the caller should fall back to the auto
-    /// route's own `model` — either no candidate cleared the bar, no
-    /// candidate was reachable from `expected_api`, or `text` failed to
-    /// embed.
+    /// request text, if the top-scoring candidate cleared
+    /// [`CLASSIFICATION_THRESHOLD`]. `None` means the caller should fall
+    /// back to the reserved `default` route — either no candidate cleared
+    /// the bar, no candidate was reachable from `expected_api`, or `text`
+    /// failed to embed.
     pub matched: Option<(String, f32)>,
     /// Every candidate considered (after excluding the unreachable ones —
     /// see [`rank`]), scored and sorted descending by score. Kept even when
@@ -158,7 +146,7 @@ struct Scored {
 /// Reachable means one of two things: the candidate speaks `expected_api`
 /// itself, or the gateway can translate from `expected_api` to what it speaks
 /// (see [`crate::translate::Translation`]). The second case is what lets an
-/// auto route reached over `/v1/messages` pick an `openai-chat` candidate —
+/// a request reached over `/v1/messages` pick an `openai-chat` candidate —
 /// "send the cheap requests to local Ollama" is the whole point of semantic
 /// routing for a Claude Code user, and before translation existed that
 /// candidate could never win.
@@ -242,7 +230,7 @@ impl StaleCheck {
     }
 }
 
-/// Classifies request text against an auto route's candidates.
+/// Classifies request text against every candidate route.
 ///
 /// Owns the embedding model and the current [`RouteIndex`] together, and
 /// keeps the index in step with config hot-reloads by comparing
@@ -274,18 +262,16 @@ impl Classifier {
         }
     }
 
-    /// Classify `text` against `auto_route`'s candidates.
+    /// Classify `text` against every candidate route.
     ///
-    /// Returns `None` only when `auto_route` has no `semantic` block in the
-    /// current index — the one case a caller cannot get anything useful
-    /// back, since there is no `threshold` or candidate list to score
-    /// against. Every other outcome is `Some(Verdict)`: `Verdict::matched`
-    /// is `None` when embedding `text` fails, no candidate is reachable
-    /// from `expected_api`, or the best score misses `threshold`, and in all of
-    /// those cases the caller should fall back to `auto_route`'s own
-    /// `model` — but `Verdict::candidates` is still populated where
-    /// possible, for a caller that wants to record what was considered.
-    pub fn classify(&self, auto_route: &str, text: &str, expected_api: ApiKind) -> Option<Verdict> {
+    /// Always returns a `Verdict`: `matched` is `None` when embedding `text`
+    /// fails, no candidate is reachable from `expected_api`, or the best
+    /// score misses [`CLASSIFICATION_THRESHOLD`] — and in all of those
+    /// cases the caller should fall back to the reserved `default` route
+    /// (`crate::config::DEFAULT_ROUTE`). `candidates` is still populated
+    /// where possible, for a caller that wants to record what was
+    /// considered (e.g. tracing).
+    pub fn classify(&self, text: &str, expected_api: ApiKind) -> Verdict {
         self.stale_check.sync(self.shared.generation(), || {
             let config = self.shared.get();
             self.index
@@ -293,7 +279,6 @@ impl Classifier {
         });
 
         let index = self.index.load();
-        let entry = index.entry(auto_route)?;
 
         let started = Instant::now();
         let vector = self.embedder.embed(text);
@@ -302,19 +287,24 @@ impl Classifier {
         let Some(vector) = vector else {
             // Tokenizer panic or an empty result: nothing was scored, so
             // there is no candidate list to hand back either.
-            return Some(Verdict {
+            return Verdict {
                 matched: None,
                 candidates: Vec::new(),
                 embed_ms,
-            });
+            };
         };
 
-        let scored = rank(&vector, &entry.candidates, expected_api, entry.threshold);
-        Some(Verdict {
+        let scored = rank(
+            &vector,
+            &index.candidates,
+            expected_api,
+            CLASSIFICATION_THRESHOLD,
+        );
+        Verdict {
             matched: scored.winner,
             candidates: scored.all,
             embed_ms,
-        })
+        }
     }
 }
 

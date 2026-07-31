@@ -43,9 +43,10 @@ model_provider = "gateway"
 disable_response_storage = true
 ```
 
-`agents/*.toml` の `model = "gpt-…"` 行はそのままで構いません —
-ゲートウェイの `gpt-*` ワイルドカードルートがそれらの id をそのまま
-転送します。
+`agents/*.toml` の既存の `model = "gpt-…"` 行はそのままで構いません。
+Codex は依然として model 文字列を要求しますが、`llm-gateway` はそれで route を
+決めません。受信したすべてのリクエストを route の `description` に対して
+内容分類し、閾値を超えなかったものは予約済みの `default` route が受けます。
 
 補足:
 

@@ -147,9 +147,10 @@ fn translated_config(upstream: SocketAddr) -> Config {
         "chat-mock".into(),
         provider(&format!("http://{upstream}/v1")),
     );
-    config
-        .routes
-        .insert("role-cheap".into(), route_to("chat-mock/qwen3.5", &[]));
+    config.routes.insert(
+        llm_gateway::config::DEFAULT_ROUTE.into(),
+        route_to("chat-mock/qwen3.5", &[]),
+    );
     config
 }
 
@@ -211,16 +212,17 @@ async fn streamed_response_reaches_the_client_byte_for_byte() {
     config
         .providers
         .insert("mock".into(), provider(&format!("http://{upstream}/v1")));
-    config
-        .routes
-        .insert("role-test".into(), route_to("mock/real-model", &[]));
+    config.routes.insert(
+        llm_gateway::config::DEFAULT_ROUTE.into(),
+        route_to("mock/real-model", &[]),
+    );
 
     let addr = spawn_gateway(config, None).await;
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/v1/chat/completions"))
         .header("x-gw-client", "e2e")
         .json(&serde_json::json!({
-            "model": "role-test",
+            "model": "default",
             "stream": true,
             "messages": [{"role": "user", "content": "ping"}],
         }))
@@ -264,7 +266,7 @@ async fn fallback_reaches_the_second_target_when_the_first_is_dead() {
         .providers
         .insert("mock".into(), provider(&format!("http://{upstream}/v1")));
     config.routes.insert(
-        "role-fb".into(),
+        llm_gateway::config::DEFAULT_ROUTE.into(),
         route_to("dead/primary-model", &["mock/backup-model"]),
     );
 
@@ -272,7 +274,7 @@ async fn fallback_reaches_the_second_target_when_the_first_is_dead() {
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/v1/chat/completions"))
         .json(&serde_json::json!({
-            "model": "role-fb",
+            "model": "default",
             "messages": [{"role": "user", "content": "hi"}],
         }))
         .send()
@@ -374,16 +376,17 @@ async fn protocol_mismatch_is_a_400_not_a_confusing_upstream_error() {
     config
         .providers
         .insert("mock".into(), provider("http://127.0.0.1:9/v1")); // openai-chat
-    config
-        .routes
-        .insert("role-chat".into(), route_to("mock/m", &[]));
+    config.routes.insert(
+        llm_gateway::config::DEFAULT_ROUTE.into(),
+        route_to("mock/m", &[]),
+    );
 
     let addr = spawn_gateway(config, None).await;
     // Calling the *Responses* endpoint with a chat-backed route must be
     // refused up front.
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/v1/responses"))
-        .json(&serde_json::json!({"model": "role-chat", "input": "hi"}))
+        .json(&serde_json::json!({"model": "default", "input": "hi"}))
         .send()
         .await
         .unwrap();
@@ -407,7 +410,7 @@ async fn an_anthropic_client_streams_from_an_openai_chat_provider() {
         .post(format!("http://{addr}/v1/messages"))
         .header("x-gw-client", "claude-code")
         .json(&serde_json::json!({
-            "model": "role-cheap",
+            "model": "default",
             "max_tokens": 1024,
             "stream": true,
             "system": [{"type": "text", "text": "You are terse.", "cache_control": {"type": "ephemeral"}}],
@@ -470,7 +473,7 @@ async fn a_non_streaming_translated_response_arrives_as_an_anthropic_message() {
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages"))
         .json(&serde_json::json!({
-            "model": "role-cheap",
+            "model": "default",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "ping"}],
         }))
@@ -499,7 +502,7 @@ async fn an_upstream_error_reaches_an_anthropic_client_in_its_own_envelope() {
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages"))
         .json(&serde_json::json!({
-            "model": "role-cheap",
+            "model": "default",
             "max_tokens": 64,
             "stream": true,
             "messages": [{"role": "user", "content": "ping"}],
@@ -527,7 +530,7 @@ async fn count_tokens_on_a_translated_route_is_answered_locally() {
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/v1/messages/count_tokens"))
         .json(&serde_json::json!({
-            "model": "role-cheap",
+            "model": "default",
             "messages": [{"role": "user", "content": "count these tokens please"}],
         }))
         .send()

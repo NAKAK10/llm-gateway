@@ -56,9 +56,11 @@ anthropic: {
 },
 ```
 
-ワイルドカードルート `claude-*`(`model: { default: "anthropic/*" }`)は
-Claude Code が要求した id をそのまま転送するため、Anthropic の新しい
-モデル id が出ても設定変更は不要です。
+`init` は現在、`role-anthropic` のような分類可能な route を実のある
+`description` と `model: { default: "anthropic/*" }` 付きで生成します。
+Anthropic 自身のモデル id は右辺でそのまま通るので、新しい id が出ても
+設定変更は不要です — ただし route *選択* を決めるのは、もはや `claude-*`
+ワイルドカードではなく、その `description` に対する分類です。
 
 ### OpenAI
 
@@ -85,7 +87,7 @@ openrouter: {
   headers: { "X-Title": "llm-gateway" },   // 任意のアトリビューション
 },
 // 同じアップストリーム・同じアカウントを Anthropic プロトコルで —
-// `claude-*` が ApiKind をまたがずにフォールバックできるようにする。
+// Anthropic を話す route が ApiKind をまたがずにフォールバックできるようにする。
 // ルートに注意: `/api/v1` ではなく `/api`。`/v1/messages` はゲートウェイが
 // 自分で付け足すので、openai-chat 側の baseUrl をそのまま流用すると
 // `/api/v1/v1/messages` のように二重になってしまう。
@@ -248,7 +250,7 @@ Sakana AI の Fugu は OpenAI 互換 API の背後にあるオーケストレー
 [console.sakana.ai](https://console.sakana.ai) で取得できます。コンソールの
 ダッシュボードにアカウントごとのベース URL が表示されるため、上記と異なる
 場合はそちらを優先してください。Fugu は Anthropic 互換の Messages
-エンドポイントも公開しているので、`claude-*` ルートのフォールバック先に
+エンドポイントも公開しているので、Anthropic を話す route のフォールバック先に
 したい場合は `api: "anthropic-messages"` で別のプロバイダー id を
 登録してください。
 

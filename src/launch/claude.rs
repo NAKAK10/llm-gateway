@@ -27,6 +27,12 @@ use crate::error::Result;
 use crate::launch::Invocation;
 
 /// Environment variables this launcher sets, in the order they are shown.
+///
+/// `model` is always the reserved `default` route name now (see
+/// `crate::config::DEFAULT_ROUTE`) — the gateway classifies every request by
+/// content regardless of what the client sent, so this exists only to give
+/// Claude Code *something* syntactically valid to put in its own UI and
+/// `ANTHROPIC_MODEL` env var.
 pub fn build(config: &Config, model: &str, isolate: bool, args: &[String]) -> Result<Invocation> {
     let mut env = vec![("ANTHROPIC_BASE_URL".to_string(), config.server.base_url())];
     if let Some(api_key) = &config.server.api_key {

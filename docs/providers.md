@@ -53,9 +53,11 @@ anthropic: {
 },
 ```
 
-The `claude-*` wildcard route (`model: { default: "anthropic/*" }`) forwards
-whatever id Claude Code asks for, so new Anthropic model ids need no config
-change.
+`init` now scaffolds a classifiable route such as `role-anthropic` with a real
+`description` and `model: { default: "anthropic/*" }`. Anthropic's own model ids
+still pass through on the right-hand side, so new ids need no config change —
+but route *selection* is now done by classification against that description,
+not by a `claude-*` wildcard being the normal path.
 
 ### OpenAI
 
@@ -81,7 +83,8 @@ openrouter: {
   headers: { "X-Title": "llm-gateway" },   // optional attribution
 },
 // Same upstream, same account, Anthropic wire protocol instead of
-// openai-chat — lets `claude-*` fall back to it without crossing ApiKinds.
+// openai-chat — lets an Anthropic-speaking route fall back to it without
+// crossing ApiKinds.
 // Note the root: `/api`, not `/api/v1` — the gateway appends `/v1/messages`
 // itself, and reusing the `openai-chat` id's baseUrl here would double up to
 // `/api/v1/v1/messages`.
@@ -245,7 +248,7 @@ models `fugu` and `fugu-ultra`. Get a key at
 the base URL for your account, so prefer that value if it differs from the
 one above. Fugu also exposes an Anthropic-compatible Messages endpoint —
 register a second provider id with `api: "anthropic-messages"` if you want it
-as a fallback for `claude-*` routes.
+as a fallback for an Anthropic-speaking route.
 
 ```json5
 routes: {

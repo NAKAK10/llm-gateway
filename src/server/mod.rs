@@ -28,7 +28,9 @@ use axum::routing::{get, post};
 use axum::Router;
 
 use crate::config::watch::SharedConfig;
-use crate::config::{ApiKind, Config};
+use crate::config::ApiKind;
+#[cfg(not(feature = "semantic"))]
+use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::record::{RecordMode, Recorder};
 use crate::{paths, upstream};
@@ -52,11 +54,13 @@ pub struct AppState {
     /// like host and port, it is part of the listener's identity, and
     /// re-resolving a Keychain reference per request would prompt constantly.
     pub inbound_key: Option<String>,
-    /// Loaded once at startup by [`prepare_classifier`], only when at least
-    /// one route in config has a `semantic` block — the embedding model is
-    /// ~489MiB resident, so nothing pays for it unless something asked for
-    /// it. `None` when no route needs it (or, with the `semantic` feature
-    /// disabled, always — see the warning `serve` logs in that case).
+    /// Loaded once at startup by [`prepare_classifier`] — every request is
+    /// classified, so this is always `Some` on a normally started server.
+    /// Kept `Option` (rather than a bare `Arc`) so tests can exercise
+    /// `classify_request`'s fallback path without a real ~500MB embedding
+    /// model loaded; `serve` itself never leaves it `None`. Absent entirely
+    /// (not even the field exists) in a build without the `semantic`
+    /// feature; see the warning `serve` logs in that case.
     #[cfg(feature = "semantic")]
     pub classifier: Option<Arc<crate::semantic::index::Classifier>>,
 }
@@ -94,7 +98,7 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
     let http = upstream::client()?;
 
     #[cfg(feature = "semantic")]
-    let classifier = prepare_classifier(&shared, &config, &http).await?;
+    let classifier = Some(prepare_classifier(&shared, &http).await?);
     #[cfg(not(feature = "semantic"))]
     warn_if_semantic_routes_are_unusable(&config);
 
@@ -134,28 +138,21 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
     Ok(())
 }
 
-/// Prepare the embedding model and build the initial [`crate::semantic::index::Classifier`],
-/// but only if `config` actually has a route that needs it.
+/// Prepare the embedding model and build the initial [`crate::semantic::index::Classifier`].
 ///
-/// `None` when no route has a `semantic` block — the ~489MiB resident model
-/// is never loaded in that case. Otherwise this blocks: `model_file::ensure`
-/// may download ~512MB on first run (progress goes to stderr already) and
-/// `Embedder::load` takes 1.5-4s, so the load runs on a blocking task rather
-/// than tying up an async worker. Blocking startup on this is a deliberate
-/// choice — see the design this implements — but it must be visible in the
+/// Blocks: `model_file::ensure` may download ~512MB on first run (progress
+/// goes to stderr already) and `Embedder::load` takes 1.5-4s, so the load
+/// runs on a blocking task rather than tying up an async worker. Blocking
+/// startup on this is a deliberate choice — every request is classified now,
+/// so there is no "maybe skip it" case left — but it must be visible in the
 /// logs, hence the `info!` calls around it.
 #[cfg(feature = "semantic")]
 async fn prepare_classifier(
     shared: &Arc<SharedConfig>,
-    config: &Config,
     http: &reqwest::Client,
-) -> Result<Option<Arc<crate::semantic::index::Classifier>>> {
-    if !config.routes.values().any(|route| route.semantic.is_some()) {
-        return Ok(None);
-    }
-
+) -> Result<Arc<crate::semantic::index::Classifier>> {
     tracing::info!(
-        "semantic routing is configured; preparing the embedding model \
+        "preparing the embedding model for content classification \
          (may download ~512MB on first run)..."
     );
     let files = crate::semantic::model_file::ensure(http).await?;
@@ -167,30 +164,26 @@ async fn prepare_classifier(
             .map_err(|err| {
                 Error::Other(format!("semantic model loading task panicked: {err}"))
             })??;
-    tracing::info!("semantic routing model loaded");
+    tracing::info!("classification model loaded");
 
-    Ok(Some(Arc::new(crate::semantic::index::Classifier::new(
+    Ok(Arc::new(crate::semantic::index::Classifier::new(
         shared, embedder,
-    ))))
+    )))
 }
 
-/// Warn once, at startup, when config asks for semantic routing but this
-/// build cannot provide it.
+/// Warn once, at startup, that this build cannot classify requests at all.
 ///
-/// The config schema is not feature-gated (see [`crate::config::SemanticConfig`]),
-/// so a route can have a `semantic` block even in a binary built without the
-/// `semantic` feature. That must not be a hard error: the route still works,
-/// it just always forwards to its own `model` — the same as if no candidate
-/// had ever cleared the threshold.
+/// Without the `semantic` feature every request falls back to the reserved
+/// `default` route unconditionally — still a working gateway, just not the
+/// classifying one.
 #[cfg(not(feature = "semantic"))]
-fn warn_if_semantic_routes_are_unusable(config: &Config) {
-    if config.routes.values().any(|route| route.semantic.is_some()) {
-        tracing::warn!(
-            "config has route(s) with `semantic`, but this build does not have the `semantic` \
-             feature enabled; those routes will forward to their own `model` directly, without \
-             classification. Rebuild with `--features semantic` to enable it."
-        );
-    }
+fn warn_if_semantic_routes_are_unusable(_config: &Config) {
+    tracing::warn!(
+        "this build does not have the `semantic` feature enabled; every request will be routed \
+         to the reserved `{}` route without classification. Rebuild with the default features \
+         (or `--features semantic`) to enable content-based routing.",
+        crate::config::DEFAULT_ROUTE
+    );
 }
 
 fn init_tracing() {

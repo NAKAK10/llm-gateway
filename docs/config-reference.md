@@ -10,15 +10,25 @@ instead of being ignored.
 Hot reload: every field except `server.*` applies on save. A failed parse or
 validation keeps the previous config live and logs why.
 
+**Breaking schema change:** there is no migration path from the old config
+format. Delete `~/.config/llm-gateway/config.json` (or the whole
+`~/.config/llm-gateway/` directory) and re-run `llm-gateway init`.
+
+For normal use the top-level shape is just **four keys**:
+`server`, `providers`, `routes`, `logging`.
+
+`launch` still exists, but only as an optional hand-edited escape hatch for
+launcher quirks; `init` does not write it anymore.
+
 ## server
 
 | field | default | notes |
 |---|---|---|
 | `host` | `"127.0.0.1"` | Use the literal IP, not `localhost` (which may resolve to `::1`). Non-loopback requires `apiKey` — startup is refused otherwise. |
 | `port` | `4000` | |
-| `apiKey` | *(none)* | Inbound bearer token. Resolved **once at startup** (unlike provider keys). Accepted as `Authorization: Bearer …` or `x-api-key`. `/health` stays open. |
+| `apiKey` | *(none)* | Inbound bearer token. Resolved **once at startup** (unlike provider keys). Accepted as `Authorization: Bearer ...` or `x-api-key`. `/health` stays open. |
 
-## providers.\<id\>
+## providers.<id>
 
 The id is what appears before the first `/` in `model` strings. The same
 upstream may be registered under several ids to expose different protocols.
@@ -33,30 +43,60 @@ upstream may be registered under several ids to expose different protocols.
 | `agentArgs` | `[]` | Extra arguments appended to an agent CLI's command line (`--add-dir`, a different `--permission-mode`). Ignored by the `http` transport. |
 | `injectUsage` | `true` | Streamed `openai-chat` only: adds `stream_options.include_usage` so token counts exist. Appends one usage-only chunk at stream end. |
 
-## routes.\<name\>
+## routes.<name>
 
 The name is what clients send as `model`. Must not contain `:` or `/`.
-A trailing `*` makes it a prefix wildcard; exact matches beat wildcards, and
-among wildcards the longest prefix wins. Wildcard routes are not listed in
-`GET /v1/models`.
+A trailing `*` is still accepted as a prefix wildcard, but wildcard routes are
+an advanced hand-written escape hatch now: `init` does not generate them,
+`GET /v1/models` does not list them, and classification never scores them.
+
+Every **non-wildcard** route participates as a classification candidate,
+including the reserved `default` route.
 
 | field | default | notes |
 |---|---|---|
 | `title` | *(none)* | Display only. |
-| `description` | *(none)* | Inline text, or a path when it starts with `./` `../` `/` `~/` (relative paths resolve against the config dir). Future semantic routing classifies against this — write it as "when should this route be picked". |
-| `model.default` | *(required)* | `"<provider>/<model>"`, split on the **first** `/` only — `openrouter/anthropic/claude-x` and `ollama-cloud/glm:cloud` both parse. `*` in the model part is replaced by the requested name. |
+| `description` | *(required on non-wildcard routes)* | Inline text, or a path when it starts with `./` `../` `/` `~/` (relative paths resolve against the config dir). This is the classification corpus: every request's last user message is embedded and compared against every non-wildcard route's `description`. Write it as "when should this route win?" |
+| `model.default` | *(required)* | `"<provider>/<model>"`, split on the **first** `/` only — `openrouter/anthropic/claude-x` and `ollama-cloud/glm:cloud` both parse. `*` in the model part expands only when a wildcard route is actually resolved. |
 | `model.fallbacks` | `[]` | Tried in order, only before the first response byte, only on connect failure / timeout / 408 / 429 / 5xx. Must use providers with the same `api` as the default. |
-| `semantic.candidates` | `[]` | **Needs a build with the `semantic` cargo feature; without it these routes forward to their own `model` and a startup warning says so.** Route names eligible for selection when *this* route is requested by name. Empty means "every other route that has a `description`". Candidates must have a `description` (the classification corpus); candidates the incoming request's protocol can neither match nor be translated to are excluded at match time. An explicit route name is never overridden — classification only runs for a route that itself carries `semantic`. A route name with `semantic` cannot end in `*`. |
-| `semantic.threshold` | `0.45` | If the top-1 cosine similarity against the candidates falls below this, `model` on this route is used instead — so a route with `semantic` still requires `model`. |
 
-## launch.\<client\>
+### Reserved route: `default`
+
+A route literally named `default` is **required**. Validation rejects configs
+that omit it or try to make it a wildcard.
+
+`default` has two jobs:
+
+1. it is the catch-all when no candidate clears the fixed classification
+   threshold `0.45`; and
+2. it is a perfectly ordinary route with its own `description` and `model`, so
+   it can also win classification on its own merits.
+
+If classification cannot run at all — for example a build without the default
+`semantic` feature (`--no-default-features`) — requests also fall back to
+`default`.
+
+### Classification behavior
+
+- Always on in normal builds. `semantic` is a **default cargo feature**.
+- `llm-gateway init` downloads the embedding model unconditionally before it
+  writes `config.json`.
+- The client's requested `model` string is ignored for route selection. It is
+  kept only for client-side UX and trace logs' `requested_model` field.
+- Similarity uses static `model2vec-rs` embeddings with a fixed cosine
+  threshold `0.45` (`src/semantic/index.rs`). There is no per-route threshold.
+
+## launch.<client> (optional advanced key)
+
+A normal generated `config.json` omits `launch` entirely. Add it only when you
+need launcher-specific overrides.
 
 | field | applies to | notes |
 |---|---|---|
-| `model` | all | Route name the client starts on. |
-| `extraArgs` | all | Inserted before user-supplied arguments. |
+| `extraArgs` | claude / codex / opencode | Inserted before user-supplied arguments. |
 | `wireApi` | codex | `"responses"` (default) or `"chat"`. The gateway serves both endpoints; which one your Codex accepts depends on its version. |
 | `models` | opencode | Route names to expose. Empty = every non-wildcard route. Verified against the live gateway before starting. |
+| `overrideProviders` | opencode | Built-in opencode provider ids whose `baseURL` is redirected to the gateway. Default: `["openai", "anthropic"]`. |
 
 ## logging
 
@@ -77,6 +117,9 @@ cache_write_tok, dur_ms, status(success|aborted|error), stream, error?`
 last_user_text?, tokens_est, tools, has_image, stream}, routing{mode,
 matched_route, reason, …scores when semantic}, resolved{provider, model, api, translation?},
 attempts[{n, target, result, ms}], usage?{in_tok, out_tok}`
+
+`routing.mode` is `semantic` when classification ran and `no_classifier` when
+it could not, in which case the request fell back to `default`.
 
 `resolved.translation` is present only when the request crossed protocols
 (e.g. `"anthropic-messages->openai-chat"`); its absence means the response was

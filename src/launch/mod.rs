@@ -46,7 +46,6 @@ impl Client {
 
 pub struct Options {
     pub client: Client,
-    pub model_override: Option<String>,
     pub isolate: bool,
     pub print_only: bool,
     pub forwarded_args: Vec<String>,
@@ -106,44 +105,28 @@ pub async fn run(options: Options) -> Result<()> {
     let config = Config::load()?;
 
     let invocation = match options.client {
-        Client::Claude => {
-            let cfg = config
-                .launch
-                .claude
-                .as_ref()
-                .ok_or_else(|| missing_launch_config(Client::Claude))?;
-            let model = options
-                .model_override
-                .clone()
-                .unwrap_or_else(|| cfg.model.clone());
-            claude::build(&config, &model, options.isolate, &options.forwarded_args)?
-        }
-        Client::Codex => {
-            let cfg = config
-                .launch
-                .codex
-                .as_ref()
-                .ok_or_else(|| missing_launch_config(Client::Codex))?;
-            let model = options
-                .model_override
-                .clone()
-                .unwrap_or_else(|| cfg.model.clone());
-            codex::build(&config, &model, options.isolate, &options.forwarded_args)?
-        }
+        Client::Claude => claude::build(
+            &config,
+            crate::config::DEFAULT_ROUTE,
+            options.isolate,
+            &options.forwarded_args,
+        )?,
+        Client::Codex => codex::build(
+            &config,
+            crate::config::DEFAULT_ROUTE,
+            options.isolate,
+            &options.forwarded_args,
+        )?,
         Client::Opencode => {
-            let cfg = config
+            let models = config
                 .launch
                 .opencode
                 .as_ref()
-                .ok_or_else(|| missing_launch_config(Client::Opencode))?;
-            let model = options
-                .model_override
-                .clone()
-                .unwrap_or_else(|| cfg.model.clone());
-            let models = cfg.models.clone();
+                .map(|cfg| cfg.models.clone())
+                .unwrap_or_default();
             opencode::build(
                 &config,
-                &model,
+                crate::config::DEFAULT_ROUTE,
                 &models,
                 options.isolate,
                 &options.forwarded_args,
@@ -179,13 +162,13 @@ pub async fn run(options: Options) -> Result<()> {
     }
 
     if let Client::Opencode = options.client {
-        // Presence was already checked above when building the invocation.
-        let cfg = config
+        let models = config
             .launch
             .opencode
             .as_ref()
-            .expect("launch.opencode presence already checked");
-        let wanted = opencode::resolved_models(&config, &cfg.models);
+            .map(|cfg| cfg.models.clone())
+            .unwrap_or_default();
+        let wanted = opencode::resolved_models(&config, &models);
         let api_key = match &config.server.api_key {
             Some(key) => Some(key.resolve()?),
             None => None,
@@ -227,14 +210,6 @@ pub async fn run(options: Options) -> Result<()> {
 }
 
 /// An actionable error for a missing `launch.<client>` block.
-fn missing_launch_config(client: Client) -> Error {
-    let key = client.program();
-    Error::Other(format!(
-        "launch.{key} is not configured\n\
-         add launch.{key}.model to config.json (the route to use for `llm-gateway launch {key}`)"
-    ))
-}
-
 /// Look up an executable on `PATH`, the same way a shell would.
 fn find_on_path(program: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
