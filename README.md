@@ -380,6 +380,20 @@ its own binary: that would leave a package manager believing the old version is
 still there. For a hand-placed binary it prints the release link instead.
 `--check` reports without changing anything.
 
+`serve` binds before doing anything else. If the port is already taken —
+almost always a previous `llm-gateway serve` still running — it identifies the
+process (via `lsof`) and asks before touching anything:
+
+```
+▲  port 4000 is already in use by another process (pid 12345)
+◆  kill it and start this one instead?
+│  ● Yes / ○ No
+```
+
+Answering `No` leaves the other process alone and exits without starting;
+answering `Yes` terminates it and binds. A non-interactive run (no terminal
+attached) answers as if you said `No` rather than guessing.
+
 ## What fallback does (and does not) do
 
 Fallback triggers on connection failure, header timeout, 408, 429 and 5xx —
