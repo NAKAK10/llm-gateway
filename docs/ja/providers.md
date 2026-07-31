@@ -56,10 +56,13 @@ anthropic: {
 },
 ```
 
-`init` は現在、`role-anthropic` のような分類可能な route を実のある
-`description` と明示的な `model: { default: "anthropic/claude-sonnet-4-6" }`
-付きで生成します(モデルはウィザードが尋ね、既定の提案を入力欄に
-あらかじめ入れておきます)。route *選択* を決めるのは、もはや `claude-*`
+`init` は現在、ウィザードがこのプロバイダーを割り当てた *ロール* にちなんで
+名付けた分類可能な route(例: `role-architect`、`role-implementer` —
+ウィザードの `AgentRole` を参照)を、実のある `description` と明示的な
+`model: { default: "anthropic/claude-sonnet-4-6" }` 付きで生成します
+(モデルはウィザードがプロバイダーの API から一覧取得できればそこから
+選ばせ、できなければ既定の提案を入力欄にあらかじめ入れたテキスト入力に
+フォールバックします)。route *選択* を決めるのは、もはや `claude-*`
 ワイルドカードではなく、その `description` に対する分類です — そしてモデル
 自身も、もう `*` ワイルドカードにはできません: routing がクライアントの
 requested model を見なくなった以上、`*` が代入すべきものは何も残っていない

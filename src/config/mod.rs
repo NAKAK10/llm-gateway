@@ -423,6 +423,17 @@ pub struct LoggingConfig {
     /// default. `--debug` on the command line overrides this.
     #[serde(default)]
     pub debug: bool,
+
+    /// Whether `serve` prints its diagnostic console log (embedding-model
+    /// preparation, per-attempt fallback outcomes, ...) to stderr.
+    ///
+    /// Off by default: a plain gateway process should stay quiet. Setting it
+    /// to `true` raises the console log level so those `tracing::info!`
+    /// calls are actually emitted; it does not affect the on-disk usage/trace
+    /// logs controlled by [`Self::usage`] and [`Self::debug`] above, and an
+    /// explicit `RUST_LOG` still wins over it.
+    #[serde(default)]
+    pub logging: bool,
 }
 
 impl Default for LoggingConfig {
@@ -431,6 +442,7 @@ impl Default for LoggingConfig {
             dir: default_log_dir(),
             usage: true,
             debug: false,
+            logging: false,
         }
     }
 }
@@ -519,3 +531,32 @@ impl Config {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `logging.logging` defaults to `false` — a plain gateway process stays
+    /// quiet unless the user opts into the console diagnostics.
+    #[test]
+    fn logging_console_flag_defaults_to_false() {
+        assert!(!LoggingConfig::default().logging);
+    }
+
+    /// An existing `config.json` written before this field existed must keep
+    /// parsing, with the console log staying off — the whole point of
+    /// `#[serde(default)]` here.
+    #[test]
+    fn logging_console_flag_is_optional_in_json() {
+        let parsed: LoggingConfig = json5::from_str(r#"{ "dir": "./logs" }"#).unwrap();
+        assert!(!parsed.logging);
+    }
+
+    #[test]
+    fn logging_console_flag_can_be_turned_on() {
+        let parsed: LoggingConfig =
+            json5::from_str(r#"{ "dir": "./logs", "logging": true }"#).unwrap();
+        assert!(parsed.logging);
+    }
+}
+

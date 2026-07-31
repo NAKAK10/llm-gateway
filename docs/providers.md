@@ -53,13 +53,16 @@ anthropic: {
 },
 ```
 
-`init` now scaffolds a classifiable route such as `role-anthropic` with a real
-`description` and an explicit `model: { default: "anthropic/claude-sonnet-4-6" }`
-(the wizard prompts for the model, pre-filled with a suggested default) — route
+`init` now scaffolds a classifiable route named after the *role* the wizard
+assigns this provider to (e.g. `role-architect`, `role-implementer` — see
+[`AgentRole`](../src/cli/init.rs) in the wizard), with a real `description`
+and an explicit `model: { default: "anthropic/claude-sonnet-4-6" }` — the
+wizard fetches the provider's model list over its API where possible and lets
+you pick one, falling back to a pre-filled text prompt when it can't. Route
 *selection* is done by classification against that description, not by a
-`claude-*` wildcard being the normal path, and the model itself can no longer be
-a `*` wildcard either: since routing no longer looks at the client's requested
-model string, there is nothing left for one to substitute.
+`claude-*` wildcard being the normal path, and the model itself can no longer
+be a `*` wildcard either: since routing no longer looks at the client's
+requested model string, there is nothing left for one to substitute.
 
 ### OpenAI
 
