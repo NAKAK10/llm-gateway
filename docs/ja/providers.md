@@ -57,10 +57,13 @@ anthropic: {
 ```
 
 `init` は現在、`role-anthropic` のような分類可能な route を実のある
-`description` と `model: { default: "anthropic/*" }` 付きで生成します。
-Anthropic 自身のモデル id は右辺でそのまま通るので、新しい id が出ても
-設定変更は不要です — ただし route *選択* を決めるのは、もはや `claude-*`
-ワイルドカードではなく、その `description` に対する分類です。
+`description` と明示的な `model: { default: "anthropic/claude-sonnet-4-6" }`
+付きで生成します(モデルはウィザードが尋ね、既定の提案を入力欄に
+あらかじめ入れておきます)。route *選択* を決めるのは、もはや `claude-*`
+ワイルドカードではなく、その `description` に対する分類です — そしてモデル
+自身も、もう `*` ワイルドカードにはできません: routing がクライアントの
+requested model を見なくなった以上、`*` が代入すべきものは何も残っていない
+からです。
 
 ### OpenAI
 

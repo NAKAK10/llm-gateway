@@ -106,6 +106,10 @@ Important consequences:
 - **Every non-wildcard route needs a real `description`.** That text is both
   documentation and the classification corpus; boilerplate descriptions produce
   boilerplate routing.
+- **Every route's model must be explicit — `"<provider>/<model>"`, no `*`.**
+  A model string can no longer borrow the client's requested model name: since
+  routing is decided purely by content classification, there is nothing left
+  for a `*` to substitute at request time, and one now fails config validation.
 - **Wildcard route names are now an advanced hand-written escape hatch only.**
   `init` does not generate them, `GET /v1/models` does not list them, and the
   classifier never scores them.
@@ -115,15 +119,15 @@ routes: {
   "default": {
     description: "Fallback for requests that do not clearly match any other route.",
     model: {
-      default: "anthropic/*",
+      default: "anthropic/claude-sonnet-4-6",
     },
   },
 
   "role-anthropic": {
     description: "Complex reasoning, coding, and multi-step agentic tasks that need careful step-by-step thinking and full tool support.",
     model: {
-      default: "anthropic/*",
-      fallbacks: ["openrouter-anthropic/anthropic/*"],
+      default: "anthropic/claude-sonnet-4-6",
+      fallbacks: ["openrouter-anthropic/anthropic/claude-sonnet-4-6"],
     },
   },
 
@@ -206,9 +210,11 @@ Anthropic: how do you pay for it?
 | `claude-cli` | `claude -p` | `anthropic-messages` | yes — streaming, tools-denied, end to end |
 | `codex-cli` | `codex exec` | `openai-chat` | plumbing and error paths only; see below |
 
-Choosing a subscription does not remove the API-key provider — a plan is good for
-generation and a key is good for anything needing tools, so a config can hold
-both and routes pick per request.
+Choosing a subscription for a provider does not also scaffold that provider's
+API-key entry — there is no key to hold for it, so one would only produce an
+always-failing route with an empty credential. Add the API-key provider back
+by hand later if you want a route that needs tools alongside the
+subscription's generation-only one.
 
 ```json5
 providers: {
@@ -219,11 +225,11 @@ providers: {
 routes: {
   "default": {
     description: "Fallback for requests that do not clearly match any other route.",
-    model: { default: "anthropic/*" },
+    model: { default: "anthropic-subscription/claude-sonnet-5" },
   },
   "role-sub": {
     description: "Requests that should run on the local Claude subscription via the provider CLI. Generation only — caller tools are not passed through.",
-    model: { default: "anthropic-subscription/sonnet" },
+    model: { default: "anthropic-subscription/claude-sonnet-5" },
   },
   // `default` in the model string means "whatever the CLI is configured to use"
   // — which models a ChatGPT plan allows is not knowable from here.
@@ -318,8 +324,8 @@ For everyday use the schema is just **four top-level keys**:
     "role-openai": {
       description: "General-purpose assistant tasks, coding, and tool use via OpenAI's models.",
       model: {
-        default: "openai/*",                  // split on the FIRST `/` only
-        fallbacks: ["openrouter/openai/*"],   // same protocol as default; tried before first byte
+        default: "openai/gpt-5.1",                     // split on the FIRST `/` only
+        fallbacks: ["openrouter/openai/gpt-5.1"],      // same protocol as default; tried before first byte
       },
     },
   },

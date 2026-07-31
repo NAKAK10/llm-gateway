@@ -62,11 +62,11 @@ providers: {
 routes: {
   "role-sub": {
     description: "Requests that should run on my Claude subscription through the local Claude CLI. Generation only — caller tools are not passed through.",
-    model: { default: "claude-subscription/sonnet" },
+    model: { default: "claude-subscription/claude-sonnet-5" },
   },
   "default": {
     description: "Fallback for requests that do not clearly match any other route.",
-    model: { default: "anthropic/*" },
+    model: { default: "anthropic/claude-sonnet-4-6" },
   },
 }
 ```
@@ -86,7 +86,7 @@ To reach **Claude models through the gateway with full API fidelity** instead �
 tools, multi-turn, streaming exactly as the API defines it — buy them from a
 provider that sells API access:
 
-- **OpenRouter** — `openrouter-anthropic/anthropic/*`, the Anthropic wire
+- **OpenRouter** — `openrouter-anthropic/anthropic/<model>`, the Anthropic wire
   protocol, so no translation.
 - **GitHub Copilot** — a subscription with an official API, so a Copilot plan
   does serve gateway traffic. See `docs/providers.md`; the models must be
@@ -117,7 +117,7 @@ providers: {
 routes: {
   "default": {
     description: "Fallback for requests that do not clearly match any other route.",
-    model: { default: "anthropic/*" },
+    model: { default: "anthropic/claude-sonnet-4-6" },
   },
   "role-cheap": {
     description: "Short chores: summarizing, formatting, commit messages",

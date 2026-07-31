@@ -54,10 +54,12 @@ anthropic: {
 ```
 
 `init` now scaffolds a classifiable route such as `role-anthropic` with a real
-`description` and `model: { default: "anthropic/*" }`. Anthropic's own model ids
-still pass through on the right-hand side, so new ids need no config change —
-but route *selection* is now done by classification against that description,
-not by a `claude-*` wildcard being the normal path.
+`description` and an explicit `model: { default: "anthropic/claude-sonnet-4-6" }`
+(the wizard prompts for the model, pre-filled with a suggested default) — route
+*selection* is done by classification against that description, not by a
+`claude-*` wildcard being the normal path, and the model itself can no longer be
+a `*` wildcard either: since routing no longer looks at the client's requested
+model string, there is nothing left for one to substitute.
 
 ### OpenAI
 

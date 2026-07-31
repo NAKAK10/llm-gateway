@@ -61,8 +61,8 @@ pub struct Resolution {
     /// Route key from the config (may contain `*`).
     pub route_name: String,
     pub kind: MatchKind,
-    /// `default` first, then `fallbacks`, each already `*`-expanded and paired
-    /// with its provider's protocol. Never empty.
+    /// `default` first, then `fallbacks`, each paired with its provider's
+    /// protocol. Never empty.
     pub targets: Vec<Target>,
 }
 
@@ -92,7 +92,7 @@ pub fn resolve(config: &Config, requested: &str) -> Result<Resolution> {
                 provider: parsed.provider.clone(),
                 route: route_name.to_string(),
             })?;
-        targets.push(build_target(parsed.expand(requested), provider));
+        targets.push(build_target(parsed, provider));
     }
 
     Ok(Resolution {
@@ -180,7 +180,7 @@ mod tests {
             route("openrouter/qwen/qwen3.5", &["openrouter/deepseek/v4"]),
         );
         c.routes
-            .insert("claude-*".into(), route("anthropic/*", &[]));
+            .insert("claude-*".into(), route("anthropic/sonnet-pinned", &[]));
         c.routes
             .insert("claude-opus-*".into(), route("anthropic/opus-pinned", &[]));
         c
@@ -197,12 +197,12 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_expands_to_the_requested_model() {
+    fn route_name_wildcard_still_matches_by_prefix() {
         let c = config();
         let r = resolve(&c, "claude-sonnet-4-6").unwrap();
         assert_eq!(r.kind, MatchKind::Wildcard);
         assert_eq!(r.targets[0].model_ref.provider, "anthropic");
-        assert_eq!(r.targets[0].model_ref.model, "claude-sonnet-4-6");
+        assert_eq!(r.targets[0].model_ref.model, "sonnet-pinned");
     }
 
     #[test]

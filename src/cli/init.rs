@@ -201,7 +201,27 @@ pub async fn run() -> Result<()> {
         providers.push((*provider, literal));
     }
 
-    let mut config = build_config_with_auth(&clients, &providers, storage, &subscriptions);
+    // Every classifiable route needs an explicit model now — routing is
+    // decided purely by content classification, so a `*` wildcard model can
+    // no longer be resolved to anything meaningful (see `crate::route`). A
+    // provider chosen for Subscription has no route of its own to pin a model
+    // to here — its own [`KnownProvider::subscription_model`] covers that.
+    let mut models: Vec<(KnownProvider, String)> = Vec::new();
+    for provider in &selected_providers {
+        if subscriptions.contains(provider) {
+            continue;
+        }
+        let model = cliclack::input(format!(
+            "Model for {}'s `{}` route",
+            provider.label(),
+            provider.route_name(),
+        ))
+        .default_input(provider.default_model())
+        .interact()?;
+        models.push((*provider, model));
+    }
+
+    let mut config = build_config_with_auth(&clients, &providers, storage, &subscriptions, &models);
     for provider in &env_fallback {
         let key = SecretRef::new(format!("${{{}}}", provider.env_var()));
         if let Some(provider_config) = config.providers.get_mut(provider.id()) {
@@ -576,12 +596,43 @@ impl KnownProvider {
     /// A model reference the subscription CLI accepts, for the scaffolded route.
     pub fn subscription_model(self) -> &'static str {
         match self {
-            // The CLI resolves aliases, so this keeps working across releases.
-            Self::Anthropic => "sonnet",
+            // The full id, not the `sonnet` alias: `sonnet-5` (which reads as
+            // the natural next step from `sonnet`) is not a valid alias and
+            // resolves to `model_not_found`, so the exact id is spelled out to
+            // avoid that trap.
+            Self::Anthropic => "claude-sonnet-5",
             // Codex has no alias, and which models a ChatGPT plan allows is
             // not knowable here — `default` means "whatever the CLI is
             // configured to use".
             _ => "default",
+        }
+    }
+
+    /// A concrete `<model>` suggested as the starting point for this
+    /// provider's classifiable route.
+    ///
+    /// Routing is decided purely by content classification now (see
+    /// `crate::semantic::index`), so a route's model can no longer be a `*`
+    /// wildcard resolved from the client's request — every route needs an
+    /// explicit model. These are reasonable, current defaults, not a
+    /// guarantee: the wizard prompts with this pre-filled and lets the user
+    /// type a different one before it is written.
+    pub fn default_model(self) -> &'static str {
+        match self {
+            Self::Anthropic => "claude-sonnet-5",
+            Self::OpenAi => "gpt-5.1",
+            Self::OpenRouter => "openai/gpt-5.1",
+            Self::GithubCopilot => "gpt-5.4",
+            Self::Gemini => "gemini-2.5-pro",
+            Self::Xai => "grok-4",
+            Self::Mistral => "mistral-large-latest",
+            Self::DeepSeek => "deepseek-chat",
+            Self::Groq => "llama-3.3-70b-versatile",
+            Self::TogetherAi => "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            Self::SakanaAi => "sakana-1",
+            Self::Plamo => "plamo-2",
+            Self::OllamaCloud => "qwen3:8b",
+            Self::OllamaLocal => "qwen3:8b",
         }
     }
 }
@@ -614,38 +665,55 @@ pub fn build_config(
     providers: &[(KnownProvider, Option<String>)],
     storage: KeyStorage,
 ) -> crate::config::Config {
-    build_config_with_auth(clients, providers, storage, &[])
+    build_config_with_auth(clients, providers, storage, &[], &[])
 }
 
 /// [`build_config`], plus the providers whose credential is a subscription
 /// rather than a key.
 ///
-/// A subscription choice adds a *second* provider id (`<id>-subscription`) with
-/// an agent-CLI transport, and a `role-<id>-subscription` route pointing at
-/// it. It
-/// does not remove the API-key provider: the two are good at different things —
-/// a plan for generation, a key for anything that needs tools — and a config
-/// that holds both lets a route choose per request.
+/// A subscription choice replaces the API-key provider entirely: it adds a
+/// *different* provider id (`<id>-subscription`) with an agent-CLI transport,
+/// and a `role-<id>-subscription` route pointing at it, and skips the plain
+/// API-key provider and `role-<id>` route for that same provider — there is
+/// no key to hold for it, so a provider entry for one would always fail with
+/// an empty credential.
+///
+/// `models` overrides [`KnownProvider::default_model`] for a provider's own
+/// classifiable route, e.g. with whatever the wizard's user typed in place of
+/// the suggested default. A provider not present in `models` falls back to
+/// its `default_model()`.
 pub fn build_config_with_auth(
     _clients: &[Client],
     providers: &[(KnownProvider, Option<String>)],
     storage: KeyStorage,
     subscriptions: &[KnownProvider],
+    models: &[(KnownProvider, String)],
 ) -> crate::config::Config {
     use crate::config::{ApiKind, Config, ModelConfig, ProviderConfig, RouteConfig};
 
     let selected: Vec<KnownProvider> = providers.iter().map(|(p, _)| *p).collect();
     let has = |p: KnownProvider| selected.contains(&p);
+    let is_subscription_only = |p: KnownProvider| subscriptions.contains(&p);
     let literal_for = |p: KnownProvider| {
         providers
             .iter()
             .find(|(candidate, _)| *candidate == p)
             .and_then(|(_, literal)| literal.clone())
     };
+    let model_for = |p: KnownProvider| -> String {
+        models
+            .iter()
+            .find(|(candidate, _)| *candidate == p)
+            .map(|(_, model)| model.clone())
+            .unwrap_or_else(|| p.default_model().to_string())
+    };
 
     let mut config = Config::default();
 
     for (provider, literal) in providers {
+        if is_subscription_only(*provider) {
+            continue;
+        }
         config.providers.insert(
             provider.id().to_string(),
             ProviderConfig {
@@ -665,8 +733,9 @@ pub fn build_config_with_auth(
     }
 
     // OpenRouter can also speak the Anthropic wire protocol under
-    // `openrouter/anthropic/*`; expose it under its own id so Anthropic's
-    // classifiable route can fall back to it without crossing `ApiKind`s.
+    // `openrouter/anthropic/<model>`; expose it under its own id so a route
+    // can reach an OpenRouter-hosted model over the Anthropic protocol
+    // without crossing `ApiKind`s.
     //
     // Its Anthropic-compatible root is `/api`, not `/api/v1` — unlike the
     // `openai-chat` id, which needs the `/v1` prefix because the gateway
@@ -693,6 +762,9 @@ pub fn build_config_with_auth(
     }
 
     for provider in providers.iter().map(|(p, _)| *p) {
+        if is_subscription_only(provider) {
+            continue;
+        }
         config.routes.insert(
             provider.route_name(),
             RouteConfig {
@@ -700,7 +772,7 @@ pub fn build_config_with_auth(
                     provider.description().to_string(),
                 )),
                 model: ModelConfig {
-                    default: format!("{}/*", provider.id()),
+                    default: format!("{}/{}", provider.id(), model_for(provider)),
                     fallbacks: Vec::new(),
                 },
                 ..Default::default()
@@ -708,35 +780,23 @@ pub fn build_config_with_auth(
         );
     }
 
-    if has(KnownProvider::Anthropic) && has(KnownProvider::OpenRouter) {
-        // Both share the same `ApiKind`, so OpenRouter can serve as a
-        // fallback on Anthropic's own classifiable route without crossing
-        // protocols.
-        if let Some(route) = config
-            .routes
-            .get_mut(&KnownProvider::Anthropic.route_name())
-        {
-            route
-                .model
-                .fallbacks
-                .push("openrouter-anthropic/anthropic/*".to_string());
-        }
-    }
-
-    if has(KnownProvider::OpenAi) && has(KnownProvider::OpenRouter) {
-        if let Some(route) = config.routes.get_mut(&KnownProvider::OpenAi.route_name()) {
-            route
-                .model
-                .fallbacks
-                .push("openrouter/openai/*".to_string());
-        }
-    }
-
     // The reserved catch-all for whatever does not clear the classification
-    // threshold on any other route — points at the first selected provider,
-    // which is as good a default as any and always exists once at least one
-    // provider was chosen.
-    if let Some((first, _)) = providers.first() {
+    // threshold on any other route. Points at the first selected provider
+    // that actually has a provider entry — a subscription-only provider has
+    // none, so it is skipped in favor of one that does; if every selected
+    // provider is subscription-only, the first subscription's own id and
+    // model are used instead, since that is the only entry that exists.
+    let default_target = providers
+        .iter()
+        .map(|(p, _)| *p)
+        .find(|p| !is_subscription_only(*p))
+        .map(|p| format!("{}/{}", p.id(), model_for(p)))
+        .or_else(|| {
+            subscriptions
+                .first()
+                .map(|p| format!("{}/{}", p.subscription_id(), p.subscription_model()))
+        });
+    if let Some(default_model) = default_target {
         config.routes.insert(
             crate::config::DEFAULT_ROUTE.to_string(),
             RouteConfig {
@@ -746,7 +806,7 @@ pub fn build_config_with_auth(
                         .to_string(),
                 )),
                 model: ModelConfig {
-                    default: format!("{}/*", first.id()),
+                    default: default_model,
                     fallbacks: Vec::new(),
                 },
                 ..Default::default()
@@ -837,6 +897,7 @@ mod tests {
             &[(KnownProvider::Anthropic, None)],
             KeyStorage::Keychain,
             &[KnownProvider::Anthropic],
+            &[],
         );
 
         let provider = config
@@ -854,21 +915,28 @@ mod tests {
             .routes
             .get("role-anthropic-subscription")
             .expect("route");
-        assert_eq!(route.model.default, "anthropic-subscription/sonnet");
+        assert_eq!(
+            route.model.default,
+            "anthropic-subscription/claude-sonnet-5"
+        );
         assert!(route.description.is_some(), "the route explains its limits");
     }
 
-    /// The API-key provider stays: a plan is good for generation and a key is
-    /// good for tools, so a config that holds both lets routes choose.
+    /// The plain API-key provider is skipped when Subscription is chosen for
+    /// that same provider: there is no key to hold for it, so scaffolding one
+    /// would only produce an always-failing `role-<id>` route with an empty
+    /// credential.
     #[test]
-    fn choosing_a_subscription_does_not_remove_the_api_key_provider() {
+    fn choosing_a_subscription_does_not_also_scaffold_the_api_key_provider() {
         let config = build_config_with_auth(
             &[Client::Claude],
             &[(KnownProvider::Anthropic, None)],
             KeyStorage::Keychain,
             &[KnownProvider::Anthropic],
+            &[],
         );
-        assert!(config.providers.contains_key("anthropic"));
+        assert!(!config.providers.contains_key("anthropic"));
+        assert!(!config.routes.contains_key("role-anthropic"));
         assert!(config.providers.contains_key("anthropic-subscription"));
     }
 
@@ -885,10 +953,11 @@ mod tests {
             ],
             KeyStorage::Keychain,
             &[KnownProvider::Anthropic, KnownProvider::OpenAi],
+            &[],
         );
         assert_eq!(
             config.routes["role-anthropic-subscription"].model.default,
-            "anthropic-subscription/sonnet"
+            "anthropic-subscription/claude-sonnet-5"
         );
         assert_eq!(
             config.routes["role-openai-subscription"].model.default,
@@ -941,6 +1010,7 @@ mod tests {
             &[(KnownProvider::OpenAi, None)],
             KeyStorage::Keychain,
             &[KnownProvider::OpenAi],
+            &[],
         );
         let provider = &config.providers["openai-subscription"];
         assert_eq!(provider.transport, crate::config::Transport::CodexCli);
@@ -974,6 +1044,7 @@ mod tests {
             &[Client::Claude],
             &[(KnownProvider::Anthropic, None)],
             KeyStorage::Keychain,
+            &[],
             &[],
         );
         let without = build_config(
@@ -1050,8 +1121,14 @@ mod tests {
         );
     }
 
+    /// OpenRouter no longer auto-wires itself as a fallback on Anthropic's
+    /// route — an auto-guessed cross-provider fallback used the same `*`
+    /// wildcard mechanism this config no longer supports, and a fallback the
+    /// user did not choose is better left for them to add explicitly. The
+    /// `openrouter-anthropic` provider entry itself is still scaffolded,
+    /// ready for a route to reference explicitly.
     #[test]
-    fn anthropic_route_gets_openrouter_anthropic_fallback() {
+    fn openrouter_anthropic_provider_exists_but_is_not_auto_wired_as_a_fallback() {
         let config = build_config(
             &[Client::Claude],
             &[
@@ -1068,11 +1145,8 @@ mod tests {
             .routes
             .get("role-anthropic")
             .expect("role-anthropic route");
-        assert_eq!(route.model.default, "anthropic/*");
-        assert_eq!(
-            route.model.fallbacks,
-            vec!["openrouter-anthropic/anthropic/*".to_string()]
-        );
+        assert_eq!(route.model.default, "anthropic/claude-sonnet-5");
+        assert!(route.model.fallbacks.is_empty());
 
         assert!(!config.routes.contains_key("role-openai"));
     }
@@ -1086,7 +1160,7 @@ mod tests {
         );
 
         let route = config.routes.get("role-openai").expect("role-openai route");
-        assert_eq!(route.model.default, "openai/*");
+        assert_eq!(route.model.default, "openai/gpt-5.1");
         assert!(route.model.fallbacks.is_empty());
 
         assert!(!config.routes.contains_key("role-anthropic"));
@@ -1117,7 +1191,7 @@ mod tests {
             .routes
             .get(crate::config::DEFAULT_ROUTE)
             .expect("default route");
-        assert_eq!(route.model.default, "anthropic/*");
+        assert_eq!(route.model.default, "anthropic/claude-sonnet-5");
         assert!(route.description.is_some());
     }
 
