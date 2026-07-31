@@ -2,6 +2,55 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-08-01 — `description` accepts an array of language variants; each is embedded separately and scored by max cosine
+
+The previous entry fixed same-language routing but assumed traffic is
+single-language per session. It isn't: a route's requests come from two
+sources at once — the human, writing in whatever language `init` asked
+about, and sub-agents / harness-injected text (tool descriptions, `CLAUDE.md`
+boilerplate, tool-result echoes), which is overwhelmingly English regardless
+of what the human writes. A `description` written only in the human's
+language routes the human's own turns correctly but gives that English-shaped
+traffic nothing to match — the previous entry's measured 0.19–0.26
+cross-lingual cosine sends it to `default` every time.
+
+Writing both languages into one `description` string doesn't fix this either.
+Measured cosine similarity for the same Japanese instruction against its
+matching description, mean-pooled through the embedding model's 64-token
+window, went from **0.550** (Japanese only) down to **0.433** (Japanese and
+English concatenated in one string) — under the fixed 0.45 threshold.
+Concatenating languages into a single embedding pulls both toward a centroid
+that matches neither as well as either matched alone.
+
+**Built: `routes.<name>.description` accepts a string or a string array.**
+Each array entry is embedded independently; classification scores a route by
+the **max cosine across all its variants**, not one embedding of concatenated
+text. A single string remains valid and behaves exactly like a one-element
+array. Each entry follows the existing inline-text-or-path rule (`./` `../`
+`/` `~/` for a path).
+
+**`llm-gateway init` now scaffolds two variants when the chosen language
+isn't English: `[chosen language, English]`.** Every generated route's
+`description`, including `default`'s, becomes a two-element array, so
+sub-agent and harness-originated English traffic still lands on the right
+route without diluting the human-language match the way one merged string
+would.
+
+**Rejected: translate the request into English before embedding it.** Same
+objection as the previous entry's rejected option, restated for the array
+case — it requires an LLM call in the routing path before the routing
+decision itself, which defeats the entire point of static, sub-millisecond
+`model2vec-rs` classification. That is a latency, cost, and new-failure-point
+tradeoff on every request, paid to reach the same place per-variant max-cosine
+matching reaches for close to zero added cost: one extra stored embedding per
+variant, compared at classification time, no extra model calls.
+
+This also resolves the previous entry's "future option, not built" note about
+per-sentence scoring: it's the same max-cosine mechanism, but scoped to whole
+language variants rather than sentence fragments, because the dominant
+dilution source turned out to be cross-language mixing, not general
+multi-topic length.
+
 ## 2026-08-01 — `description` must be written in the request's language; `init` adds a language-selection step
 
 Stripping `<system-reminder>` blocks (previous entry) fixed the boilerplate

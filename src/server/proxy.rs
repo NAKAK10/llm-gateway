@@ -1602,7 +1602,7 @@ mod tests {
         config.routes.insert(
             "role-writer".to_string(),
             RouteConfig {
-                description: Some(crate::config::Description("writes prose".to_string())),
+                description: Some(crate::config::Description(vec!["writes prose".to_string()])),
                 model: ModelConfig {
                     default: "anthropic/opus-pinned".to_string(),
                     fallbacks: Vec::new(),
@@ -1613,7 +1613,7 @@ mod tests {
         config.routes.insert(
             crate::config::DEFAULT_ROUTE.to_string(),
             RouteConfig {
-                description: Some(crate::config::Description("catch-all".to_string())),
+                description: Some(crate::config::Description(vec!["catch-all".to_string()])),
                 model: ModelConfig {
                     default: "anthropic/opus-pinned".to_string(),
                     fallbacks: Vec::new(),

@@ -942,8 +942,18 @@ impl KnownProvider {
 /// description scores 0.19-0.26 cosine similarity in practice, nowhere near
 /// the 0.45 routing threshold, while same-language pairs score 0.55-0.79. So
 /// the wizard asks up front, once, which language its user mainly writes
-/// instructions in, and generates every role's description (and the `default`
-/// route's) in that language instead of defaulting to English regardless.
+/// instructions in, and generates every role's description (and the
+/// `default` route's) in that language instead of defaulting to English
+/// regardless.
+///
+/// For anything other than `English`, that description is written as two
+/// [`crate::config::Description`] variants — the selected language plus
+/// English — rather than one string mixing both: real traffic is language-
+/// mixed too (a human's own instructions in their language, a sub-agent
+/// prompt or harness message typically in English), and concatenating both
+/// languages into a single description dilutes each embedding rather than
+/// covering both (see [`AgentRole::description_variants`] and
+/// [`Self::default_route_description_variants`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DescriptionLanguage {
     English,
@@ -1001,6 +1011,27 @@ impl DescriptionLanguage {
                 "Repuesto para solicitudes que no coinciden claramente con la description de \
                  ninguna otra route."
             }
+        }
+    }
+
+    /// The `default` route's description, as the variants `init` actually
+    /// writes into `RouteConfig.description` (see
+    /// `crate::config::Description`): a single English string when English is
+    /// selected, or `[this language, English]` otherwise.
+    ///
+    /// The English fallback variant matters because the same weak
+    /// cross-language alignment that motivates asking this question in the
+    /// first place also means English-shaped requests (an English harness or
+    /// sub-agent prompt, say) still need something to match against even when
+    /// the user's own language is something else.
+    pub fn default_route_description_variants(self) -> Vec<&'static str> {
+        if matches!(self, Self::English) {
+            vec![self.default_route_description()]
+        } else {
+            vec![
+                self.default_route_description(),
+                Self::English.default_route_description(),
+            ]
         }
     }
 }
@@ -1112,8 +1143,9 @@ impl AgentRole {
             },
             Self::Explorer => match lang {
                 English => {
-                    "Exploring and reading an existing codebase to answer questions about how \
-                     it is structured or where something is implemented, without editing it."
+                    "Exploring and reading the existing codebase: locate files, functions and \
+                     logic, answer questions about how the code is structured, without \
+                     editing it."
                 }
                 Japanese => "既存のコードベースを編集せずに読んで調査し、構造やどこに何が実装されているかの質問に答える。",
                 Chinese => "阅读并调查现有代码库(不做修改),回答关于结构或某功能实现位置的问题。",
@@ -1125,8 +1157,8 @@ impl AgentRole {
             },
             Self::WebResearcher => match lang {
                 English => {
-                    "Researching information on the web: searching for documentation, current \
-                     events, or facts outside the local codebase."
+                    "Researching information on the internet: web search for documentation, \
+                     current events, or facts outside the local codebase."
                 }
                 Japanese => "Web で情報を調査する: ドキュメント検索、最新情報やコードベース外の事実の調査。",
                 Chinese => "在网络上调查信息:搜索文档、最新资讯或代码库之外的事实。",
@@ -1150,7 +1182,10 @@ impl AgentRole {
                 }
             },
             Self::Implementer => match lang {
-                English => "Writing or editing code to implement a feature or fix a bug.",
+                English => {
+                    "Fix a bug or implement a feature by writing or editing code. Build a \
+                     page, component, or app."
+                }
                 Japanese => "コードを書いて機能やLP・ページ・UIを作成・実装する。バグを修正する。",
                 Chinese => "编写或修改代码以实现功能或修复缺陷。",
                 Korean => "코드를 작성하거나 수정해 기능을 구현하거나 버그를 수정한다.",
@@ -1158,8 +1193,8 @@ impl AgentRole {
             },
             Self::Reviewer => match lang {
                 English => {
-                    "Reviewing a diff or pull request for bugs, security issues, and logic \
-                     errors."
+                    "Code-review a diff or pull request and point out problems: correctness, \
+                     security, and logic."
                 }
                 Japanese => "プルリクエストやPR、diff をコードレビューして、バグやセキュリティ問題、ロジックエラーを指摘する。",
                 Chinese => "对 diff 或拉取请求进行代码审查,指出缺陷、安全问题和逻辑错误。",
@@ -1189,6 +1224,28 @@ impl AgentRole {
                      como git y gh; tareas menores como operaciones de archivos."
                 }
             },
+        }
+    }
+
+    /// This role's description as the variants `init` actually writes into
+    /// `RouteConfig.description` (see `crate::config::Description`): a single
+    /// English string when English is selected, or `[this language,
+    /// English]` otherwise.
+    ///
+    /// The English variant is not just a translation convenience — it is what
+    /// lets the route still win classification against English-shaped
+    /// traffic (a sub-agent prompt, a harness message) even when the wizard's
+    /// user mainly writes in another language, since embedding one variant
+    /// per language avoids diluting either (see the module doc on
+    /// `crate::config::Description`).
+    pub fn description_variants(self, lang: DescriptionLanguage) -> Vec<&'static str> {
+        if matches!(lang, DescriptionLanguage::English) {
+            vec![self.description(lang)]
+        } else {
+            vec![
+                self.description(lang),
+                self.description(DescriptionLanguage::English),
+            ]
         }
     }
 
@@ -1338,7 +1395,10 @@ pub fn build_config_with_auth(
             role.route_name(),
             RouteConfig {
                 description: Some(crate::config::Description(
-                    role.description(lang).to_string(),
+                    role.description_variants(lang)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
                 )),
                 model: ModelConfig {
                     default: format!("{}/{model}", target_for(*provider)),
@@ -1376,7 +1436,10 @@ pub fn build_config_with_auth(
             crate::config::DEFAULT_ROUTE.to_string(),
             RouteConfig {
                 description: Some(crate::config::Description(
-                    lang.default_route_description().to_string(),
+                    lang.default_route_description_variants()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
                 )),
                 model: ModelConfig {
                     default: default_model,
@@ -2047,8 +2110,14 @@ mod tests {
     /// module doc on `DescriptionLanguage`), so it must be reproduced
     /// character-for-character rather than paraphrased — a config built with
     /// `Japanese` selected should carry this exact string for `role-implementer`.
+    ///
+    /// It must also carry the English variant right behind it, as a
+    /// two-element array rather than a single mixed-language string: an
+    /// amalgamated description would dilute both languages' embeddings (see
+    /// the module doc on `crate::config::Description`), so the wizard writes
+    /// one entry per language instead of concatenating them.
     #[test]
-    fn japanese_implementer_description_matches_the_tuned_wording() {
+    fn japanese_implementer_description_is_a_two_element_ja_en_array() {
         let config = build_config(
             &[Client::Claude],
             &[(KnownProvider::Anthropic, None)],
@@ -2061,10 +2130,60 @@ mod tests {
             DescriptionLanguage::Japanese,
         );
         let route = config.routes.get("role-implementer").expect("route");
+        let variants: Vec<&str> = route
+            .description
+            .as_ref()
+            .unwrap()
+            .variants()
+            .iter()
+            .map(String::as_str)
+            .collect();
         assert_eq!(
-            route.description.as_ref().unwrap().0,
-            "コードを書いて機能やLP・ページ・UIを作成・実装する。バグを修正する。"
+            variants,
+            vec![
+                "コードを書いて機能やLP・ページ・UIを作成・実装する。バグを修正する。",
+                "Fix a bug or implement a feature by writing or editing code. Build a \
+                 page, component, or app.",
+            ]
         );
+    }
+
+    /// `English` selected needs no second variant — the whole point of
+    /// asking the language question is that English is already the language
+    /// most sub-agent/harness traffic arrives in, so there is nothing to
+    /// cover twice.
+    #[test]
+    fn english_description_stays_a_single_variant() {
+        let config = build_config(
+            &[Client::Claude],
+            &[(KnownProvider::Anthropic, None)],
+            KeyStorage::Keychain,
+            &[(
+                AgentRole::Implementer,
+                KnownProvider::Anthropic,
+                "claude-sonnet-5".to_string(),
+            )],
+            DescriptionLanguage::English,
+        );
+        let route = config.routes.get("role-implementer").expect("route");
+        assert_eq!(route.description.as_ref().unwrap().variants().len(), 1);
+    }
+
+    /// The `default` route gets the same ja+en treatment as a role route.
+    #[test]
+    fn japanese_default_route_description_is_a_two_element_array() {
+        let config = build_config(
+            &[Client::Claude],
+            &[(KnownProvider::Anthropic, None)],
+            KeyStorage::Keychain,
+            &[],
+            DescriptionLanguage::Japanese,
+        );
+        let route = config
+            .routes
+            .get(crate::config::DEFAULT_ROUTE)
+            .expect("default route");
+        assert_eq!(route.description.as_ref().unwrap().variants().len(), 2);
     }
 
     /// `Chore` was added alongside the language picker — a role for PR
