@@ -2,6 +2,33 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-07-31 — `serve` offers to free its port instead of failing cold
+
+Restarting after an upgrade routinely hit `Address already in use` because the
+previous `llm-gateway serve` was still running — and the message arrived only
+*after* a multi-second classification model load, with no next step spelled
+out beyond "go find and kill it yourself."
+
+**The bind moves to the very top of `serve`, before the recorder or classifier
+are touched, and a conflict now asks instead of just failing.**
+`bind_or_offer_to_free_port` (`src/server/mod.rs`) tries the bind first; on
+`AddrInUse` it shells out to `lsof -iTCP:<port> -sTCP:LISTEN -t` to find the
+exact PID(s) holding that port, and uses `cliclack::confirm` — the same
+prompt style `init` already uses — to ask before killing anything. `Yes`
+sends each PID a plain `kill` (SIGTERM, so another `llm-gateway serve` shuts
+its watcher and recorder down cleanly) and retries the bind for up to 3s to
+give the kernel time to actually release the socket; `No`, or a still-taken
+port after killing, aborts with an explanation rather than starting a second
+instance or looping forever. A non-interactive run (no terminal — e.g. a
+supervisor) gets an I/O error from `cliclack` immediately, which lands on the
+same "don't start, don't kill anything" outcome as answering `No` — refusing
+to guess is safer than guessing yes on someone's unattended process.
+
+**Scoped to the exact port, not "any `llm-gateway` process."** A blind
+`pkill llm-gateway` could take out an unrelated instance serving a different
+port on purpose; asking `lsof` about this one port and killing only what it
+reports keeps the blast radius to what is actually in the way.
+
 ## 2026-07-31 — Model wildcards abolished; `init` stops scaffolding a dead subscription route
 
 `stats`'s per-model table started showing route names (`role-anthropic`,

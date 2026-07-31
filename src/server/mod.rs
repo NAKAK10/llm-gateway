@@ -75,6 +75,12 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
     let host = config.server.host.clone();
     let port = options.port_override.unwrap_or(config.server.port);
 
+    // Bound first, before the slower recorder/classifier setup below: a port
+    // conflict is caught in milliseconds this way instead of after a
+    // multi-second classification model load, and the interactive prompt (if
+    // any) happens before anything else has been started.
+    let listener = bind_or_offer_to_free_port(&host, port).await?;
+
     // Validation already refuses non-loopback + no key, but validation runs
     // against the file — re-check here so a future code path can't bypass it.
     let inbound_key = match &config.server.api_key {
@@ -121,7 +127,6 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         }
     };
 
-    let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
     tracing::info!("llm-gateway listening on http://{host}:{port}");
     if mode.debug {
         tracing::info!(
@@ -136,6 +141,124 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
 
     axum::serve(listener, router(state)).await?;
     Ok(())
+}
+
+/// Bind `host:port`, offering to free it when something else already has it.
+///
+/// That "something else" is almost always a previous `llm-gateway serve` left
+/// running, and finding that out by scrolling past a multi-second classifier
+/// load first is not a good way to learn it — hence this runs before any of
+/// that setup starts. Asks before killing anything, and only ever targets the
+/// process(es) actually listening on this exact port, never every
+/// `llm-gateway` process on the machine (which could include one serving a
+/// different port on purpose).
+async fn bind_or_offer_to_free_port(host: &str, port: u16) -> Result<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind((host, port)).await {
+        Ok(listener) => Ok(listener),
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+            let pids = pids_listening_on(port);
+            if pids.is_empty() {
+                return Err(Error::Other(format!(
+                    "port {port} is already in use, but the process holding it could not be \
+                     identified (see `lsof -i :{port}`) — free it manually and try again"
+                )));
+            }
+            cliclack::log::warning(format!(
+                "port {port} is already in use by {} (pid {})",
+                if pids.len() == 1 {
+                    "another process"
+                } else {
+                    "other processes"
+                },
+                pids.iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ))?;
+            let kill = cliclack::confirm(format!(
+                "kill {} and start this one instead?",
+                if pids.len() == 1 { "it" } else { "them" }
+            ))
+            .initial_value(false)
+            .interact()?;
+            if !kill {
+                return Err(Error::Other(format!(
+                    "port {port} is still in use — not starting; stop the other process, or \
+                     pass a different port with `--port`"
+                )));
+            }
+            for pid in &pids {
+                kill_pid(*pid);
+            }
+            // The kernel needs a moment to actually release the socket after
+            // the process holding it dies; poll briefly rather than fail on
+            // the first attempt back.
+            let mut last_err = None;
+            for attempt in 0..20 {
+                match tokio::net::TcpListener::bind((host, port)).await {
+                    Ok(listener) => return Ok(listener),
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                        last_err = Some(e);
+                        if attempt < 19 {
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        }
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Err(Error::Other(format!(
+                "killed pid(s) {} but port {port} is still in use after 3s: {}",
+                pids.iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                last_err.expect("loop only exits via return or after recording last_err"),
+            )))
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// PIDs of processes with an open listening socket on `port`, via `lsof` —
+/// present on macOS and virtually every Linux distro, unlike `ss`/`fuser`
+/// whose output shape differs enough between distros to not be worth parsing.
+#[cfg(unix)]
+fn pids_listening_on(port: u16) -> Vec<u32> {
+    let output = std::process::Command::new("lsof")
+        .args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+        .output();
+    match output {
+        Ok(out) => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(not(unix))]
+fn pids_listening_on(_port: u16) -> Vec<u32> {
+    // No portable, dependency-free way to map a port to a PID on Windows —
+    // callers treat an empty result as "identify and free it manually".
+    Vec::new()
+}
+
+/// Ask the process holding the port to shut down. `SIGTERM` first — this is
+/// normally another `llm-gateway serve`, which shuts its recorder and config
+/// watcher down cleanly on it — with `kill(1)`'s own exit code ignored: a
+/// process that already exited between `lsof` and here is not a failure.
+#[cfg(unix)]
+fn kill_pid(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status();
+}
+
+#[cfg(not(unix))]
+fn kill_pid(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .status();
 }
 
 /// Prepare the embedding model and build the initial [`crate::semantic::index::Classifier`].
