@@ -108,7 +108,13 @@ turns without the gateway holding any per-conversation state: the history that
 arrives with every request is the state. A genuine topic change still wins
 immediately, because the newest text is always tried first. If nothing in the
 walk clears the bar — or classification cannot run at all — the reserved
-`default` route is used.
+`default` route is used. Before any of this, every candidate text has
+`<system-reminder>...</system-reminder>` blocks stripped out — harness
+boilerplate (Claude Code injects one into every session's first user message),
+not the user's own words — and a message left blank afterward counts as no
+text and is skipped just like a textless `tool_result` turn; only the
+classification input is affected, the payload sent to the provider never
+changes.
 
 Important consequences:
 

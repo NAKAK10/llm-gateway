@@ -121,9 +121,22 @@ pub fn format_line(record: &TraceRecord) -> String {
         Some(label) => format!(" xlat={label}"),
         None => String::new(),
     };
+    // `semantic_history` is the one mode where "which text won" is not
+    // obvious from the route alone — the newest text didn't clear threshold,
+    // an older one did. Shown only there; every other mode either has no
+    // decided-by text or it is unambiguously the newest message already
+    // implied by `input.last_user_text`.
+    let decided_by_suffix = if record.routing.mode == "semantic_history" {
+        match &record.routing.decided_by_text {
+            Some(text) => format!(" decided_by={text:?}"),
+            None => String::new(),
+        }
+    } else {
+        String::new()
+    };
 
     format!(
-        "{time} {client}→{route}{score_suffix} [{provider}/{model}]{translation_suffix} {result}{attempts_suffix}{usage_suffix}",
+        "{time} {client}→{route}{score_suffix} [{provider}/{model}]{translation_suffix} {result}{attempts_suffix}{usage_suffix}{decided_by_suffix}",
         client = record.client,
         route = record.routing.matched_route,
         provider = record.resolved.provider,
@@ -161,6 +174,8 @@ mod tests {
                 score: None,
                 threshold: None,
                 embed_ms: None,
+                decided_by_text: None,
+                walk: None,
             },
             resolved: TraceResolved {
                 provider: "anthropic".to_string(),
@@ -238,6 +253,35 @@ mod tests {
         assert_eq!(
             format_line(&record),
             "12:34:56 claude-code→role-writer score=0.81 [anthropic/claude-sonnet-4-6] ok_first_byte"
+        );
+    }
+
+    #[test]
+    fn semantic_history_shows_which_text_decided_it() {
+        let mut record = base_record();
+        record.routing.mode = "semantic_history".to_string();
+        record.routing.matched_route = "role-tester".to_string();
+        record.routing.score = Some(0.7);
+        record.routing.decided_by_text = Some("now write the tests".to_string());
+        assert_eq!(
+            format_line(&record),
+            "12:34:56 claude-code→role-tester score=0.70 [anthropic/claude-sonnet-4-6] \
+             ok_first_byte decided_by=\"now write the tests\""
+        );
+    }
+
+    #[test]
+    fn decided_by_text_is_not_shown_outside_semantic_history() {
+        // `semantic` mode's newest text is already implied by
+        // `input.last_user_text`; showing it again here would be noise.
+        let mut record = base_record();
+        record.routing.mode = "semantic".to_string();
+        record.routing.matched_route = "role-writer".to_string();
+        record.routing.score = Some(0.8);
+        record.routing.decided_by_text = Some("write me a poem".to_string());
+        assert_eq!(
+            format_line(&record),
+            "12:34:56 claude-code→role-writer score=0.80 [anthropic/claude-sonnet-4-6] ok_first_byte"
         );
     }
 }

@@ -2,6 +2,45 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-07-31 — Classification input strips `<system-reminder>` blocks; trace gains `decided_by_text` / `walk`
+
+History walk-back (below) made an existing problem much worse: Claude Code
+injects a `<system-reminder>` block — project `CLAUDE.md` and other harness
+boilerplate — into the first user message of every session. That block is
+long, near-identical across sessions, and in the case that surfaced this it
+scored a stable **0.519** against one route's `description`, comfortably over
+the fixed `0.45` threshold. Before walk-back, that only mis-routed the first
+turn. After walk-back, every ambiguous turn ("continue", a bare tool result)
+that fell through to the walk eventually reached message one and re-picked
+the same route off the boilerplate instead of any real instruction — an
+entire implementation session ended up pinned to a route meant for cheap
+exploratory chores, never once routed by what the user actually asked.
+
+**Built: strip `<system-reminder>...</system-reminder>` blocks from every
+candidate text before it is embedded**, in `classification_texts`
+(`src/server/proxy.rs`) — both the newest-text check and everything the
+history walk tries. A message left blank after stripping is treated as
+textless and skipped exactly like an agentic `tool_result` turn. Only the
+classification input changes: the payload forwarded to the provider is
+untouched, so the harness still sees its own preamble and behaves normally.
+
+**An unterminated block strips to the end of the text, not just to where a
+closing tag would be.** Text containing `<system-reminder>` with no matching
+close is more likely to be a truncated or malformed injection than user
+content that happens to contain the literal string; leaving the tail in would
+let boilerplate back into the corpus anyway. Dropping the whole remainder is
+the safer failure mode.
+
+**Trace gained `routing.decided_by_text` and `routing.walk`** for the same
+reason this bug was hard to see in the first place: the existing trace line
+recorded `matched_route` and a score, but explaining *why* a route won meant
+reasoning backward from an exact score coincidence — this case was only
+caught by noticing the same 0.519 recurring across unrelated requests.
+`decided_by_text` records the first 200 characters of whichever text actually
+won (present only on a match); `walk` lists every text the walk-back tried as
+`{texts_back, top_score}` pairs. The answer now sits on the trace line itself
+instead of requiring re-derivation from scores alone.
+
 ## 2026-07-31 — Cross-protocol fallbacks: reachability moves from config validation to per-target request-time filtering
 
 `route.model.fallbacks` used to be rejected outright by `config check` unless

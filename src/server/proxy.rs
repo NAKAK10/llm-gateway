@@ -34,7 +34,7 @@ use time::format_description::well_known::Rfc3339;
 use crate::config::{ApiKind, Config};
 use crate::error::Error;
 use crate::record::trace_log::{
-    TraceCandidate, TraceInput, TraceRecord, TraceResolved, TraceRouting, TraceUsage,
+    TraceCandidate, TraceInput, TraceRecord, TraceResolved, TraceRouting, TraceUsage, TraceWalkStep,
 };
 use crate::record::usage_log::UsageRecord;
 use crate::record::Recorder;
@@ -153,6 +153,8 @@ pub async fn proxy(
             candidates: Vec::new(),
             score: None,
             embed_ms: 0,
+            decided_by_text: None,
+            walk: Vec::new(),
         }
     };
     let resolve_target = semantic_attempt.resolve_as.as_str();
@@ -606,6 +608,13 @@ struct SemanticAttempt {
     score: Option<f32>,
     /// Total embedding time across every text the history walk tried.
     embed_ms: u64,
+    /// The first 200 characters of the text that decided `resolve_as` —
+    /// `Some` only on [`SemanticOutcome::Matched`]. Every other outcome has
+    /// no single text to blame (no match happened, or none was attempted).
+    decided_by_text: Option<String>,
+    /// Every text the walk tried and its top candidate score, newest text
+    /// first — empty unless the walk actually ran.
+    walk: Vec<TraceWalkStep>,
 }
 
 /// Why `resolve_as` ended up being what it is — one variant per
@@ -701,6 +710,8 @@ fn routing_from(resolution: &route::Resolution, attempt: SemanticAttempt) -> Tra
         score: attempt.score,
         threshold: ran.then_some(CLASSIFICATION_THRESHOLD),
         embed_ms: ran.then_some(attempt.embed_ms),
+        decided_by_text: attempt.decided_by_text,
+        walk: (!attempt.walk.is_empty()).then_some(attempt.walk),
     }
 }
 
@@ -731,6 +742,8 @@ fn classify_request(
         candidates: Vec::new(),
         score: None,
         embed_ms: 0,
+        decided_by_text: None,
+        walk: Vec::new(),
     };
 
     // Texts before classifier: a textless request falls back no matter
@@ -759,10 +772,18 @@ fn classify_request(
     // that shows how close the closest candidate came.
     let mut newest_verdict = None;
     let texts_tried = texts.len().min(HISTORY_WALK_LIMIT);
+    // Every text the walk tries, with its top score — trace-log diagnostics
+    // for "which text decided this, and how close did the ones before it
+    // come," independent of whether the walk ends in a match.
+    let mut walk: Vec<TraceWalkStep> = Vec::new();
 
     for (texts_back, text) in texts.iter().take(HISTORY_WALK_LIMIT).enumerate() {
         let verdict = classifier.classify(text, expected_api);
         embed_ms_total += verdict.embed_ms;
+        walk.push(TraceWalkStep {
+            texts_back,
+            score: verdict.candidates.first().map(|(_, score)| *score),
+        });
 
         if let Some((route, matched_score)) = verdict.matched.clone() {
             // Console visibility for "did the embedding classifier actually
@@ -795,6 +816,8 @@ fn classify_request(
                 candidates: as_trace(&verdict.candidates),
                 score,
                 embed_ms: embed_ms_total,
+                decided_by_text: Some(crate::record::truncate(text, Some(200))),
+                walk,
             };
         }
         if texts_back == 0 {
@@ -825,6 +848,8 @@ fn classify_request(
         candidates: as_trace(&newest.candidates),
         score,
         embed_ms: embed_ms_total,
+        decided_by_text: None,
+        walk,
     }
 }
 
@@ -841,6 +866,8 @@ fn classify_request(
         candidates: Vec::new(),
         score: None,
         embed_ms: 0,
+        decided_by_text: None,
+        walk: Vec::new(),
     }
 }
 
@@ -853,6 +880,22 @@ fn classify_request(
 /// actually score. `Embedder::embed` does its own bounding (800 chars / 64
 /// tokens), so the 200-character truncation `extract_input` applies for the
 /// trace log must not leak into what gets classified.
+///
+/// Every `<system-reminder>` block is stripped out of each text before it is
+/// considered (see [`strip_system_reminders`]): Claude Code's harness injects
+/// one of these into the *first* user message of every session — CLAUDE.md
+/// contents, tool-list boilerplate, and similar text that is identical across
+/// sessions and has nothing to do with what the user actually asked for. That
+/// boilerplate was observed to cosine-match the `role-explorer` route's
+/// description at 0.519 — comfortably over the classification threshold — so
+/// once the history walk reached a session's first message, it classified the
+/// injected reminder instead of the real instruction it wrapped. A message
+/// that is nothing *but* reminder blocks strips down to blank and is skipped
+/// exactly like a message with no text at all, so the walk keeps going to an
+/// older, genuine instruction instead of routing on boilerplate.
+///
+/// This only changes what gets embedded for routing — the request forwarded
+/// to the provider is untouched; nothing here reaches the proxied payload.
 #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
 fn classification_texts(api: ApiKind, payload: &serde_json::Value) -> Vec<String> {
     let messages = match api {
@@ -860,17 +903,55 @@ fn classification_texts(api: ApiKind, payload: &serde_json::Value) -> Vec<String
         _ => payload.get("messages"),
     };
     match messages {
-        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => vec![s.clone()],
+        Some(serde_json::Value::String(s)) => {
+            let stripped = strip_system_reminders(s);
+            if stripped.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![stripped]
+            }
+        }
         Some(serde_json::Value::Array(items)) => items
             .iter()
             .rev()
             .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
             .filter_map(|m| m.get("content"))
             .filter_map(|content| content_text(api, content))
+            .map(|text| strip_system_reminders(&text))
             .filter(|text| !text.trim().is_empty())
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Remove every `<system-reminder>...</system-reminder>` block from `text`,
+/// for [`classification_texts`] — see that function's doc comment for why.
+///
+/// A plain string scan rather than a regex: the tags are literal and never
+/// nested, so `find` on each half is enough and this stays dependency-free.
+/// A block missing its closing tag has everything from the opening tag to
+/// the end of the text dropped, on the theory that a stray reminder leaking
+/// into classification is worse than losing whatever real text might follow
+/// it — the harness always closes its own blocks, so this only fires on
+/// malformed or adversarial input.
+#[cfg_attr(not(feature = "semantic"), allow(dead_code))]
+fn strip_system_reminders(text: &str) -> String {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + OPEN.len()..];
+        match after_open.find(CLOSE) {
+            Some(end) => rest = &after_open[end + CLOSE.len()..],
+            // No closing tag: everything from here to the end is dropped.
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn now_rfc3339() -> String {
@@ -1180,6 +1261,51 @@ mod tests {
         assert_eq!(texts, vec!["real instruction"]);
     }
 
+    #[test]
+    fn classification_texts_strip_a_system_reminder_around_the_real_instruction() {
+        // The harness-injected block wraps real text; only the real
+        // instruction should remain a candidate for classification.
+        let content = "<system-reminder>CLAUDE.md contents here</system-reminder>\
+                       please refactor the parser";
+        let payload = json!({ "messages": [{"role": "user", "content": content}] });
+        let texts = classification_texts(ApiKind::AnthropicMessages, &payload);
+        assert_eq!(texts, vec!["please refactor the parser"]);
+    }
+
+    #[test]
+    fn classification_texts_skip_a_message_that_is_only_a_system_reminder() {
+        // A message that strips down to nothing must be treated exactly like
+        // a textless message: skipped, so the walk reaches the older, real
+        // instruction instead of classifying boilerplate.
+        let payload = json!({ "messages": [
+            {"role": "user", "content": "write the release notes"},
+            {"role": "user", "content": "<system-reminder>CLAUDE.md contents here</system-reminder>"},
+        ]});
+        let texts = classification_texts(ApiKind::AnthropicMessages, &payload);
+        assert_eq!(texts, vec!["write the release notes"]);
+    }
+
+    #[test]
+    fn classification_texts_drop_everything_after_an_unclosed_system_reminder() {
+        // A missing closing tag is treated as "the rest is boilerplate too" —
+        // safer to drop trailing text than let a truncated reminder leak into
+        // classification.
+        let content = "real instruction<system-reminder>never closed";
+        let payload = json!({ "messages": [{"role": "user", "content": content}] });
+        let texts = classification_texts(ApiKind::AnthropicMessages, &payload);
+        assert_eq!(texts, vec!["real instruction"]);
+    }
+
+    #[test]
+    fn classification_texts_strip_multiple_system_reminder_blocks() {
+        let content = "<system-reminder>first</system-reminder>\
+                       the real ask\
+                       <system-reminder>second</system-reminder>";
+        let payload = json!({ "messages": [{"role": "user", "content": content}] });
+        let texts = classification_texts(ApiKind::AnthropicMessages, &payload);
+        assert_eq!(texts, vec!["the real ask"]);
+    }
+
     fn resolution(route_name: &str, kind: route::MatchKind) -> route::Resolution {
         route::Resolution {
             route_name: route_name.to_string(),
@@ -1197,6 +1323,8 @@ mod tests {
             candidates: Vec::new(),
             score: None,
             embed_ms: 0,
+            decided_by_text: None,
+            walk: Vec::new(),
         };
         let routing = routing_from(&res, attempt);
 
@@ -1206,6 +1334,8 @@ mod tests {
         assert!(routing.score.is_none());
         assert!(routing.threshold.is_none());
         assert!(routing.embed_ms.is_none());
+        assert!(routing.decided_by_text.is_none());
+        assert!(routing.walk.is_none());
     }
 
     #[test]
@@ -1217,6 +1347,8 @@ mod tests {
             candidates: Vec::new(),
             score: None,
             embed_ms: 0,
+            decided_by_text: None,
+            walk: Vec::new(),
         };
         let routing = routing_from(&res, attempt);
 
@@ -1249,6 +1381,11 @@ mod tests {
             ],
             score: Some(0.8),
             embed_ms: 2,
+            decided_by_text: Some("write me a poem".to_string()),
+            walk: vec![TraceWalkStep {
+                texts_back: 0,
+                score: Some(0.8),
+            }],
         };
 
         let routing = routing_from(&res, attempt);
@@ -1260,6 +1397,8 @@ mod tests {
         assert_eq!(routing.embed_ms, Some(2));
         assert_eq!(routing.candidates.len(), 2);
         assert!(routing.reason.contains("matched"), "{}", routing.reason);
+        assert_eq!(routing.decided_by_text.as_deref(), Some("write me a poem"));
+        assert_eq!(routing.walk.as_ref().map(Vec::len), Some(1));
     }
 
     #[test]
@@ -1274,6 +1413,21 @@ mod tests {
             }],
             score: Some(0.7),
             embed_ms: 3,
+            decided_by_text: Some("now write the tests".to_string()),
+            walk: vec![
+                TraceWalkStep {
+                    texts_back: 0,
+                    score: Some(0.2),
+                },
+                TraceWalkStep {
+                    texts_back: 1,
+                    score: Some(0.3),
+                },
+                TraceWalkStep {
+                    texts_back: 2,
+                    score: Some(0.7),
+                },
+            ],
         };
 
         let routing = routing_from(&res, attempt);
@@ -1287,6 +1441,11 @@ mod tests {
             "reason should say how far the walk went: {}",
             routing.reason
         );
+        assert_eq!(
+            routing.decided_by_text.as_deref(),
+            Some("now write the tests")
+        );
+        assert_eq!(routing.walk.as_ref().map(Vec::len), Some(3));
     }
 
     #[test]
@@ -1301,6 +1460,21 @@ mod tests {
             }],
             score: Some(0.2),
             embed_ms: 1,
+            decided_by_text: None,
+            walk: vec![
+                TraceWalkStep {
+                    texts_back: 0,
+                    score: Some(0.2),
+                },
+                TraceWalkStep {
+                    texts_back: 1,
+                    score: Some(0.15),
+                },
+                TraceWalkStep {
+                    texts_back: 2,
+                    score: Some(0.1),
+                },
+            ],
         };
 
         let routing = routing_from(&res, attempt);
@@ -1320,6 +1494,14 @@ mod tests {
             "reason should say how many texts were tried: {}",
             routing.reason
         );
+        // A fallback has no single text that decided the outcome, but the
+        // walk that tried and rejected each candidate is still there to
+        // diagnose from.
+        assert!(routing.decided_by_text.is_none());
+        let walk = routing.walk.expect("a below-threshold walk records scores");
+        assert_eq!(walk.len(), 3);
+        assert_eq!(walk[0].score, Some(0.2));
+        assert_eq!(walk[2].score, Some(0.1));
     }
 
     #[test]
@@ -1331,6 +1513,8 @@ mod tests {
             candidates: Vec::new(),
             score: None,
             embed_ms: 0,
+            decided_by_text: None,
+            walk: Vec::new(),
         };
 
         let routing = routing_from(&res, attempt);
@@ -1341,6 +1525,8 @@ mod tests {
         assert!(routing.score.is_none());
         assert!(routing.embed_ms.is_none());
         assert!(routing.reason.contains("x-gw-auto-route"));
+        assert!(routing.decided_by_text.is_none());
+        assert!(routing.walk.is_none());
     }
 
     #[test]

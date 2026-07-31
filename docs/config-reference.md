@@ -93,6 +93,15 @@ If classification cannot run at all — for example a build without the default
   keeps its route across ambiguous turns. The walk is stateless: it reruns from
   the request's own message history every time, so the same request always
   classifies the same way regardless of gateway restarts or config reloads.
+- Before any text is embedded, `<system-reminder>...</system-reminder>` blocks
+  are stripped from it (`src/server/proxy.rs`, `classification_texts`) — this
+  is harness-injected context, not the user's own words, and it would
+  otherwise skew both the newest-text score and every text the walk-back
+  tries. A user message left blank after stripping counts as no text and is
+  skipped exactly like a textless `tool_result` turn. This only changes the
+  classification input: the payload forwarded to the provider is never
+  modified. A block with no closing tag has everything from `<system-reminder>`
+  to the end of the text removed.
 
 ## launch.<client> (optional advanced key)
 
@@ -124,7 +133,7 @@ cache_write_tok, dur_ms, status(success|aborted|error), stream, error?`
 `trace-*.jsonl`:
 `ts, req_id, client, endpoint, requested_model, input{messages_n,
 last_user_text?, tokens_est, tools, has_image, stream}, routing{mode,
-matched_route, reason, …scores when semantic}, resolved{provider, model, api, translation?},
+matched_route, reason, decided_by_text?, walk?, …scores when semantic}, resolved{provider, model, api, translation?},
 attempts[{n, target, result, ms}], usage?{in_tok, out_tok}`
 
 `routing.mode` is `semantic` when the newest user text decided the route
@@ -134,6 +143,13 @@ scored below the threshold and an earlier user text matched instead (the
 user text at all, and `no_classifier` when classification could not run. Every
 mode except `semantic`'s match and `semantic_history` means the request fell
 back to `default`.
+
+`routing.decided_by_text` is the first 200 characters of whichever text
+actually decided the route — present only on a match (`semantic` or
+`semantic_history`), absent on a `default` fallback. `routing.walk` lists
+every text the history walk tried, in order, as `{texts_back, top_score}`
+pairs, so a single trace line shows which text won and how the walk got there
+without having to re-derive it from scores alone.
 
 `resolved.translation` is present only when the request crossed protocols
 (e.g. `"anthropic-messages->openai-chat"`); its absence means the response was

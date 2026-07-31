@@ -91,6 +91,14 @@ name はクライアントが `model` として送るものです。`:` と `/` 
   ステートレスで、毎回リクエスト自身のメッセージ履歴から再計算されるため、
   同じリクエストはゲートウェイの再起動や設定リロードに関係なく常に同じ
   分類になる。
+- どのテキストも埋め込まれる前に、`<system-reminder>...</system-reminder>`
+  ブロックが除去される(`src/server/proxy.rs` の `classification_texts`)。
+  これはハーネスが注入する文脈であって user 自身の言葉ではなく、放置すると
+  最新テキストのスコアだけでなく遡り先のスコアまで歪めてしまう。除去した
+  結果 user message が空白だけになった場合は、テキストなしの `tool_result`
+  ターンと同様にスキップされる。これが変えるのは分類の入力だけで、
+  プロバイダーへ転送する payload は変更されない。閉じタグの無いブロックは
+  `<system-reminder>` からテキスト末尾までがすべて除去される。
 
 ## launch.<client> (任意の上級者向けキー)
 
@@ -122,7 +130,7 @@ cache_write_tok, dur_ms, status(success|aborted|error), stream, error?`
 `trace-*.jsonl`:
 `ts, req_id, client, endpoint, requested_model, input{messages_n,
 last_user_text?, tokens_est, tools, has_image, stream}, routing{mode,
-matched_route, reason, …セマンティック時はスコアも}, resolved{provider, model, api, translation?},
+matched_route, reason, decided_by_text?, walk?, …セマンティック時はスコアも}, resolved{provider, model, api, translation?},
 attempts[{n, target, result, ms}], usage?{in_tok, out_tok}`
 
 `routing.mode` は、最新の user テキストで route が決まったとき(マッチ、
@@ -132,6 +140,13 @@ attempts[{n, target, result, ms}], usage?{in_tok, out_tok}`
 `no_text`、分類自体が走れなかったときは `no_classifier` です。`semantic` の
 マッチと `semantic_history` 以外はすべて `default` にフォールバックしたことを
 意味します。
+
+`routing.decided_by_text` は、実際に route を決めたテキストの先頭 200 文字です
+— マッチしたとき(`semantic` または `semantic_history`)にのみ存在し、
+`default` へのフォールバックでは存在しません。`routing.walk` は履歴ウォーク
+バックが試したテキストを順に `{texts_back, top_score}` の一覧として記録する
+ので、スコアだけから手で再推理しなくても、どのテキストが勝ちどう遡ったかが
+trace の 1 行だけでわかります。
 
 `resolved.translation` はリクエストがプロトコルをまたいだ場合にのみ存在し
 (例: `"anthropic-messages->openai-chat"`)、存在しなければレスポンスが

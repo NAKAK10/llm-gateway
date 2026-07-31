@@ -62,12 +62,43 @@ pub struct TraceRouting {
     pub threshold: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embed_ms: Option<u64>,
+    /// The text that actually decided `matched_route` — the first 200
+    /// characters of the user message the history walk matched on. `None`
+    /// unless `mode` is `semantic` or `semantic_history`: a below-threshold
+    /// fallback, a manual route, or a missing classifier/text has no single
+    /// text to point at.
+    ///
+    /// This exists because the harness boilerplate every Claude Code session
+    /// injects into its first user message (a `<system-reminder>` block) once
+    /// cosine-matched a route description closely enough to hijack routing,
+    /// and there was no way to tell from the trace log alone which text won —
+    /// only that a route was picked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by_text: Option<String>,
+    /// Every text the history walk tried, oldest attempt order (newest text
+    /// first, same as the walk itself), with each one's top candidate score —
+    /// so a surprising route can be diagnosed without reproducing the request.
+    /// Omitted when the walk never ran (same conditions as `candidates`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub walk: Option<Vec<TraceWalkStep>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceCandidate {
     pub route: String,
     pub score: f32,
+}
+
+/// One text the semantic history walk tried, and how close its best
+/// candidate came.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceWalkStep {
+    /// How many messages back this text was: `0` is the newest user text.
+    pub texts_back: usize,
+    /// The top candidate's score for this text, if the classifier scored
+    /// anything at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +181,8 @@ mod tests {
                 score: None,
                 threshold: None,
                 embed_ms: None,
+                decided_by_text: None,
+                walk: None,
             },
             resolved: TraceResolved {
                 provider: "anthropic".to_string(),
