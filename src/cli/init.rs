@@ -500,11 +500,28 @@ pub async fn run() -> Result<()> {
     // entirely when no provider was selected — there is nothing to assign a
     // role to.
     let mut roles: Vec<(AgentRole, KnownProvider, String)> = Vec::new();
+    let mut lang = DescriptionLanguage::English;
     if !selected_providers.is_empty() {
+        // Asked before the role menu, not after: the menu's own description
+        // hints (and every description written into the generated config) are
+        // shown in whichever language is picked here, since a mismatch
+        // between a user's queries and the classification corpus is exactly
+        // what makes routing fail (see `DescriptionLanguage`).
+        let mut lang_select = cliclack::select(
+            "Which language do you mainly write instructions in? (route descriptions are the \
+             classification corpus, so they should match)",
+        );
+        for language in DescriptionLanguage::ALL {
+            lang_select = lang_select.item(language, language.label(), "");
+        }
+        lang = lang_select
+            .initial_value(DescriptionLanguage::English)
+            .interact()?;
+
         let mut role_select =
             cliclack::multiselect("Which roles do you want to configure routes for?");
         for role in AgentRole::ALL {
-            role_select = role_select.item(role, role.label(), role.description());
+            role_select = role_select.item(role, role.label(), role.description(lang));
         }
         let selected_roles: Vec<AgentRole> = role_select
             .initial_values(AgentRole::ALL.to_vec())
@@ -539,7 +556,8 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    let mut config = build_config_with_auth(&clients, &providers, storage, &subscriptions, &roles);
+    let mut config =
+        build_config_with_auth(&clients, &providers, storage, &subscriptions, &roles, lang);
     for provider in &env_fallback {
         let key = SecretRef::new(format!("${{{}}}", provider.env_var()));
         if let Some(provider_config) = config.providers.get_mut(provider.id()) {
@@ -915,6 +933,78 @@ impl KnownProvider {
     }
 }
 
+/// The language the wizard's user mainly writes instructions in.
+///
+/// Route `description`s are the classification corpus a request's text is
+/// matched against (see `crate::semantic::index`), and the embedding model
+/// backing that match (potion-multilingual-128M, a static model2vec model) is
+/// weakly aligned across languages: a Japanese query against an English
+/// description scores 0.19-0.26 cosine similarity in practice, nowhere near
+/// the 0.45 routing threshold, while same-language pairs score 0.55-0.79. So
+/// the wizard asks up front, once, which language its user mainly writes
+/// instructions in, and generates every role's description (and the `default`
+/// route's) in that language instead of defaulting to English regardless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescriptionLanguage {
+    English,
+    Japanese,
+    Chinese,
+    Korean,
+    Spanish,
+}
+
+impl DescriptionLanguage {
+    /// Every language the wizard offers, in menu order.
+    pub const ALL: [DescriptionLanguage; 5] = [
+        Self::English,
+        Self::Japanese,
+        Self::Chinese,
+        Self::Korean,
+        Self::Spanish,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::English => "en",
+            Self::Japanese => "ja",
+            Self::Chinese => "zh",
+            Self::Korean => "ko",
+            Self::Spanish => "es",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::English => "English",
+            Self::Japanese => "日本語",
+            Self::Chinese => "中文",
+            Self::Korean => "한국어",
+            Self::Spanish => "Español",
+        }
+    }
+
+    /// Classification text for the reserved `default` route, in this
+    /// language.
+    pub fn default_route_description(self) -> &'static str {
+        match self {
+            Self::English => {
+                "Fallback for requests that do not clearly match any other route's description."
+            }
+            Self::Japanese => {
+                "他のどの route の description にも明確にマッチしないリクエストのフォールバック。"
+            }
+            Self::Chinese => "当请求与其他任何 route 的 description 都不明确匹配时的兜底。",
+            Self::Korean => {
+                "다른 어떤 route의 description과도 명확히 일치하지 않는 요청을 위한 폴백."
+            }
+            Self::Spanish => {
+                "Repuesto para solicitudes que no coinciden claramente con la description de \
+                 ninguna otra route."
+            }
+        }
+    }
+}
+
 /// A functional role in a multi-agent workflow that a route is scaffolded
 /// for.
 ///
@@ -937,11 +1027,12 @@ pub enum AgentRole {
     Implementer,
     Reviewer,
     Tester,
+    Chore,
 }
 
 impl AgentRole {
     /// Every role the wizard offers, in menu order.
-    pub const ALL: [AgentRole; 8] = [
+    pub const ALL: [AgentRole; 9] = [
         Self::Manager,
         Self::Architect,
         Self::Explorer,
@@ -950,6 +1041,7 @@ impl AgentRole {
         Self::Implementer,
         Self::Reviewer,
         Self::Tester,
+        Self::Chore,
     ];
 
     pub fn id(self) -> &'static str {
@@ -962,6 +1054,7 @@ impl AgentRole {
             Self::Implementer => "implementer",
             Self::Reviewer => "reviewer",
             Self::Tester => "tester",
+            Self::Chore => "chore",
         }
     }
 
@@ -975,41 +1068,127 @@ impl AgentRole {
             Self::Implementer => "Implementer",
             Self::Reviewer => "Reviewer",
             Self::Tester => "Tester",
+            Self::Chore => "Chore",
         }
     }
 
-    /// Classification text for this role's route.
+    /// Classification text for this role's route, in `lang`.
     ///
     /// Every request is classified against every route's description (see
     /// `crate::semantic::index`), so this needs to describe the *kind of
-    /// task* the role handles, not the role's name.
-    pub fn description(self) -> &'static str {
+    /// task* the role handles, not the role's name — and it needs to be
+    /// written in whatever language the wizard's user mainly writes
+    /// instructions in, since the embedding model backing that match aligns
+    /// weakly across languages (see [`DescriptionLanguage`]). Kept short:
+    /// the embedding model truncates at 64 tokens.
+    pub fn description(self, lang: DescriptionLanguage) -> &'static str {
+        use DescriptionLanguage::{Chinese, English, Japanese, Korean, Spanish};
         match self {
-            Self::Manager => {
-                "Coordinating a multi-step task: breaking work into subtasks, delegating to \
-                 other roles, and tracking overall progress."
-            }
-            Self::Architect => {
-                "Designing system architecture, planning approaches, and making structural or \
-                 technical design decisions before code is written."
-            }
-            Self::Explorer => {
-                "Exploring and reading an existing codebase to answer questions about how it is \
-                 structured or where something is implemented, without editing it."
-            }
-            Self::WebResearcher => {
-                "Researching information on the web: searching for documentation, current \
-                 events, or facts outside the local codebase."
-            }
-            Self::BrowserOperator => {
-                "Operating a web browser to interact with pages: clicking, filling forms, and \
-                 navigating sites on the user's behalf."
-            }
-            Self::Implementer => "Writing or editing code to implement a feature or fix a bug.",
-            Self::Reviewer => {
-                "Reviewing a diff or pull request for bugs, security issues, and logic errors."
-            }
-            Self::Tester => "Writing or running tests, and diagnosing test failures.",
+            Self::Manager => match lang {
+                English => {
+                    "Coordinating a multi-step task: breaking work into subtasks, delegating to \
+                     other roles, and tracking overall progress."
+                }
+                Japanese => "複数ステップのタスクをサブタスクに分割し、他のロールに委任して進捗を管理する。",
+                Chinese => "将多步骤任务拆分为子任务,委派给其他角色并跟踪整体进度。",
+                Korean => "여러 단계로 이루어진 작업을 하위 작업으로 나누고 다른 역할에 위임하며 전체 진행 상황을 관리한다.",
+                Spanish => {
+                    "Divide una tarea de varios pasos en subtareas, las delega a otros roles y \
+                     hace seguimiento del progreso general."
+                }
+            },
+            Self::Architect => match lang {
+                English => {
+                    "Designing system architecture, planning approaches, and making structural \
+                     or technical design decisions before code is written."
+                }
+                Japanese => "システム設計やアーキテクチャの検討、実装前の技術的な設計判断や方針の計画を行う。",
+                Chinese => "进行系统设计与架构考量,在编写代码前做出技术设计决策与方案规划。",
+                Korean => "시스템 설계와 아키텍처를 검토하고, 코드 작성 전에 기술적 설계 결정과 방침을 계획한다.",
+                Spanish => {
+                    "Diseña la arquitectura del sistema y define decisiones técnicas o el \
+                     enfoque antes de escribir código."
+                }
+            },
+            Self::Explorer => match lang {
+                English => {
+                    "Exploring and reading an existing codebase to answer questions about how \
+                     it is structured or where something is implemented, without editing it."
+                }
+                Japanese => "既存のコードベースを編集せずに読んで調査し、構造やどこに何が実装されているかの質問に答える。",
+                Chinese => "阅读并调查现有代码库(不做修改),回答关于结构或某功能实现位置的问题。",
+                Korean => "기존 코드베이스를 수정하지 않고 읽어서 조사하고, 구조나 무엇이 어디에 구현되어 있는지에 대한 질문에 답한다.",
+                Spanish => {
+                    "Lee e investiga el código existente sin modificarlo, respondiendo \
+                     preguntas sobre su estructura o dónde está implementado algo."
+                }
+            },
+            Self::WebResearcher => match lang {
+                English => {
+                    "Researching information on the web: searching for documentation, current \
+                     events, or facts outside the local codebase."
+                }
+                Japanese => "Web で情報を調査する: ドキュメント検索、最新情報やコードベース外の事実の調査。",
+                Chinese => "在网络上调查信息:搜索文档、最新资讯或代码库之外的事实。",
+                Korean => "웹에서 정보를 조사한다: 문서 검색, 최신 정보나 코드베이스 밖의 사실 조사.",
+                Spanish => {
+                    "Investiga información en la web: busca documentación, noticias recientes \
+                     o datos fuera del código base."
+                }
+            },
+            Self::BrowserOperator => match lang {
+                English => {
+                    "Operating a web browser to interact with pages: clicking, filling forms, \
+                     and navigating sites on the user's behalf."
+                }
+                Japanese => "ブラウザを操作してページをクリック・フォーム入力・サイト巡回を代行する。",
+                Chinese => "操作浏览器与页面交互:点击、填写表单、浏览网站。",
+                Korean => "브라우저를 조작해 페이지와 상호작용한다: 클릭, 폼 입력, 사이트 탐색을 대행한다.",
+                Spanish => {
+                    "Opera un navegador para interactuar con páginas: hacer clic, rellenar \
+                     formularios y navegar sitios."
+                }
+            },
+            Self::Implementer => match lang {
+                English => "Writing or editing code to implement a feature or fix a bug.",
+                Japanese => "コードを書いて機能やLP・ページ・UIを作成・実装する。バグを修正する。",
+                Chinese => "编写或修改代码以实现功能或修复缺陷。",
+                Korean => "코드를 작성하거나 수정해 기능을 구현하거나 버그를 수정한다.",
+                Spanish => "Escribe o edita código para implementar una función o corregir un error.",
+            },
+            Self::Reviewer => match lang {
+                English => {
+                    "Reviewing a diff or pull request for bugs, security issues, and logic \
+                     errors."
+                }
+                Japanese => "プルリクエストやPR、diff をコードレビューして、バグやセキュリティ問題、ロジックエラーを指摘する。",
+                Chinese => "对 diff 或拉取请求进行代码审查,指出缺陷、安全问题和逻辑错误。",
+                Korean => "풀 리퀘스트나 diff를 코드 리뷰하여 버그, 보안 문제, 로직 오류를 지적한다.",
+                Spanish => {
+                    "Revisa un diff o pull request en busca de errores, problemas de seguridad \
+                     y fallos de lógica."
+                }
+            },
+            Self::Tester => match lang {
+                English => "Writing or running tests, and diagnosing test failures.",
+                Japanese => "テストの作成・実行、テスト失敗の原因調査を行う。",
+                Chinese => "编写或运行测试,并排查测试失败的原因。",
+                Korean => "테스트를 작성하거나 실행하고, 테스트 실패 원인을 조사한다.",
+                Spanish => "Escribe o ejecuta pruebas, y diagnostica fallos en las pruebas.",
+            },
+            Self::Chore => match lang {
+                English => {
+                    "Creating, merging, and checking pull requests; running simple shell \
+                     commands like git and gh; small chores like file operations."
+                }
+                Japanese => "PRの作成・マージ・確認、git や gh などの簡単なシェルコマンドの実行、ファイル操作などのちょっとした雑務を行う。",
+                Chinese => "创建、合并和检查拉取请求;运行 git、gh 等简单的 shell 命令;执行文件操作等零碎杂务。",
+                Korean => "PR 생성, 병합, 확인; git나 gh 같은 간단한 셸 명령 실행; 파일 작업 등 자잘한 잡무를 수행한다.",
+                Spanish => {
+                    "Crea, fusiona y revisa pull requests; ejecuta comandos de shell simples \
+                     como git y gh; tareas menores como operaciones de archivos."
+                }
+            },
         }
     }
 
@@ -1056,8 +1235,9 @@ pub fn build_config(
     providers: &[(KnownProvider, Option<String>)],
     storage: KeyStorage,
     roles: &[(AgentRole, KnownProvider, String)],
+    lang: DescriptionLanguage,
 ) -> crate::config::Config {
-    build_config_with_auth(clients, providers, storage, &[], roles)
+    build_config_with_auth(clients, providers, storage, &[], roles, lang)
 }
 
 /// [`build_config`], plus the providers whose credential is a subscription
@@ -1075,6 +1255,7 @@ pub fn build_config_with_auth(
     storage: KeyStorage,
     subscriptions: &[KnownProvider],
     roles: &[(AgentRole, KnownProvider, String)],
+    lang: DescriptionLanguage,
 ) -> crate::config::Config {
     use crate::config::{ApiKind, Config, ModelConfig, ProviderConfig, RouteConfig};
 
@@ -1156,7 +1337,9 @@ pub fn build_config_with_auth(
         config.routes.insert(
             role.route_name(),
             RouteConfig {
-                description: Some(crate::config::Description(role.description().to_string())),
+                description: Some(crate::config::Description(
+                    role.description(lang).to_string(),
+                )),
                 model: ModelConfig {
                     default: format!("{}/{model}", target_for(*provider)),
                     fallbacks: Vec::new(),
@@ -1193,9 +1376,7 @@ pub fn build_config_with_auth(
             crate::config::DEFAULT_ROUTE.to_string(),
             RouteConfig {
                 description: Some(crate::config::Description(
-                    "Fallback for requests that do not clearly match any other route's \
-                     description."
-                        .to_string(),
+                    lang.default_route_description().to_string(),
                 )),
                 model: ModelConfig {
                     default: default_model,
@@ -1348,6 +1529,7 @@ mod tests {
                 KnownProvider::Anthropic,
                 "claude-sonnet-5".to_string(),
             )],
+            DescriptionLanguage::English,
         );
 
         let provider = config
@@ -1385,6 +1567,7 @@ mod tests {
                 KnownProvider::Anthropic,
                 "claude-sonnet-5".to_string(),
             )],
+            DescriptionLanguage::English,
         );
         assert!(!config.providers.contains_key("anthropic"));
         assert!(config.providers.contains_key("anthropic-subscription"));
@@ -1420,6 +1603,7 @@ mod tests {
                     "default".to_string(),
                 ),
             ],
+            DescriptionLanguage::English,
         );
         assert_eq!(
             config.routes["role-manager"].model.default,
@@ -1441,6 +1625,7 @@ mod tests {
             &[(KnownProvider::OpenRouter, None)],
             KeyStorage::Keychain,
             &[],
+            DescriptionLanguage::English,
         );
         let provider = &config.providers["openrouter-anthropic"];
         assert_eq!(provider.base_url, "https://openrouter.ai/api");
@@ -1482,6 +1667,7 @@ mod tests {
                 KnownProvider::OpenAi,
                 "default".to_string(),
             )],
+            DescriptionLanguage::English,
         );
         let provider = &config.providers["openai-subscription"];
         assert_eq!(provider.transport, crate::config::Transport::CodexCli);
@@ -1522,12 +1708,14 @@ mod tests {
             KeyStorage::Keychain,
             &[],
             &roles,
+            DescriptionLanguage::English,
         );
         let without = build_config(
             &[Client::Claude],
             &[(KnownProvider::Anthropic, None)],
             KeyStorage::Keychain,
             &roles,
+            DescriptionLanguage::English,
         );
         assert_eq!(
             serde_json::to_string(&with).unwrap(),
@@ -1542,6 +1730,7 @@ mod tests {
             &[(KnownProvider::GithubCopilot, None)],
             KeyStorage::Keychain,
             &[],
+            DescriptionLanguage::English,
         );
 
         let provider = config
@@ -1581,6 +1770,7 @@ mod tests {
             ],
             KeyStorage::Keychain,
             &[],
+            DescriptionLanguage::English,
         );
         for id in ["anthropic", "ollama-local"] {
             assert!(
@@ -1620,6 +1810,7 @@ mod tests {
                 KnownProvider::Anthropic,
                 "claude-sonnet-5".to_string(),
             )],
+            DescriptionLanguage::English,
         );
 
         assert!(config.providers.contains_key("anthropic"));
@@ -1646,6 +1837,7 @@ mod tests {
                 KnownProvider::OpenAi,
                 "gpt-5.1".to_string(),
             )],
+            DescriptionLanguage::English,
         );
 
         let route = config
@@ -1670,6 +1862,7 @@ mod tests {
                 KnownProvider::OpenAi,
                 "gpt-5.1".to_string(),
             )],
+            DescriptionLanguage::English,
         );
 
         assert!(!config.routes.contains_key("role-architect"));
@@ -1683,6 +1876,7 @@ mod tests {
             &[(KnownProvider::Anthropic, Some("sk-ant-test".to_string()))],
             KeyStorage::Literal,
             &[],
+            DescriptionLanguage::English,
         );
 
         let route = config
@@ -1708,6 +1902,7 @@ mod tests {
                 KnownProvider::Anthropic,
                 "claude-opus-9".to_string(),
             )],
+            DescriptionLanguage::English,
         );
 
         let route = config
@@ -1738,6 +1933,7 @@ mod tests {
                     "openai/gpt-5.1".to_string(),
                 ),
             ],
+            DescriptionLanguage::English,
         );
 
         for name in ["role-architect", "role-explorer"] {
@@ -1760,7 +1956,7 @@ mod tests {
 
         for role in AgentRole::ALL {
             assert_eq!(role.route_name(), format!("role-{}", role.id()));
-            assert!(!role.description().is_empty());
+            assert!(!role.description(DescriptionLanguage::English).is_empty());
         }
     }
 
@@ -1771,6 +1967,7 @@ mod tests {
             &[(KnownProvider::Anthropic, Some("sk-ant-abc".to_string()))],
             KeyStorage::Literal,
             &[],
+            DescriptionLanguage::English,
         );
         let provider = config.providers.get("anthropic").unwrap();
         assert_eq!(provider.api_key.as_ref().unwrap().0, "sk-ant-abc");
@@ -1783,6 +1980,7 @@ mod tests {
             &[(KnownProvider::Anthropic, None)],
             KeyStorage::Env,
             &[],
+            DescriptionLanguage::English,
         );
         let provider = config.providers.get("anthropic").unwrap();
         assert_eq!(provider.api_key.as_ref().unwrap().0, "${ANTHROPIC_API_KEY}");
@@ -1795,6 +1993,7 @@ mod tests {
             &[(KnownProvider::Anthropic, None)],
             KeyStorage::Keychain,
             &[],
+            DescriptionLanguage::English,
         );
         let provider = config.providers.get("anthropic").unwrap();
         assert_eq!(provider.api_key.as_ref().unwrap().0, "keychain:anthropic");
@@ -1807,9 +2006,87 @@ mod tests {
             &[(KnownProvider::OllamaLocal, None)],
             KeyStorage::Literal,
             &[],
+            DescriptionLanguage::English,
         );
         let provider = config.providers.get("ollama-local").unwrap();
         assert_eq!(provider.api_key.as_ref().unwrap().0, "local");
+    }
+
+    /// Every language must give every role its own, non-empty description —
+    /// an accidental fallthrough to another arm (or an English string reused
+    /// verbatim for a different language) would defeat the whole point of
+    /// asking, since the classification corpus needs to match the language
+    /// the user actually queries in.
+    #[test]
+    fn every_language_gives_every_role_a_distinct_nonempty_description() {
+        for lang in DescriptionLanguage::ALL {
+            let mut descriptions: Vec<&str> = AgentRole::ALL
+                .iter()
+                .map(|role| role.description(lang))
+                .collect();
+            for (role, description) in AgentRole::ALL.iter().zip(descriptions.iter()) {
+                assert!(
+                    !description.is_empty(),
+                    "{:?} has no description in {:?}",
+                    role,
+                    lang
+                );
+            }
+            descriptions.sort_unstable();
+            descriptions.dedup();
+            assert_eq!(
+                descriptions.len(),
+                AgentRole::ALL.len(),
+                "{:?} has duplicate role descriptions",
+                lang
+            );
+        }
+    }
+
+    /// The Japanese wording is tuned against real embedding scores (see the
+    /// module doc on `DescriptionLanguage`), so it must be reproduced
+    /// character-for-character rather than paraphrased — a config built with
+    /// `Japanese` selected should carry this exact string for `role-implementer`.
+    #[test]
+    fn japanese_implementer_description_matches_the_tuned_wording() {
+        let config = build_config(
+            &[Client::Claude],
+            &[(KnownProvider::Anthropic, None)],
+            KeyStorage::Keychain,
+            &[(
+                AgentRole::Implementer,
+                KnownProvider::Anthropic,
+                "claude-sonnet-5".to_string(),
+            )],
+            DescriptionLanguage::Japanese,
+        );
+        let route = config.routes.get("role-implementer").expect("route");
+        assert_eq!(
+            route.description.as_ref().unwrap().0,
+            "コードを書いて機能やLP・ページ・UIを作成・実装する。バグを修正する。"
+        );
+    }
+
+    /// `Chore` was added alongside the language picker — a role for PR
+    /// creation/merging and small shell chores — and must scaffold a route
+    /// like any other role.
+    #[test]
+    fn chore_role_scaffolds_a_route() {
+        let config = build_config(
+            &[Client::Claude],
+            &[(KnownProvider::Anthropic, None)],
+            KeyStorage::Keychain,
+            &[(
+                AgentRole::Chore,
+                KnownProvider::Anthropic,
+                "claude-sonnet-5".to_string(),
+            )],
+            DescriptionLanguage::English,
+        );
+        let route = config.routes.get("role-chore").expect("role-chore route");
+        assert!(route.description.is_some());
+        assert_eq!(AgentRole::Chore.id(), "chore");
+        assert_eq!(AgentRole::Chore.label(), "Chore");
     }
 }
 

@@ -62,6 +62,12 @@ llm-gateway stats           # ルートごとの消費量を表示
 llm-gateway update          # 最新リリースへ更新
 ```
 
+`init` はどの role を設定するか尋ねる前に、もう一つ質問をします:
+「主にどの言語で指示を書きますか?」— English、日本語、中文、한국어、Español の
+5 択です。`default` を含め、生成されるすべての route の `description` は
+選んだ言語で書かれます。理由は[コンテンツ分類ルーティング](#コンテンツ分類ルーティング)
+を参照してください。
+
 **破壊的な設定変更:** 旧スキーマからの移行処理はありません。
 `~/.config/llm-gateway/config.json`(または `~/.config/llm-gateway/` 全体)を
 削除して、`llm-gateway init` をやり直してください。
@@ -128,6 +134,12 @@ tool_result のターンをまたいでも会話は route を維持しますが�
 - **ワイルドカードではない route には必ず実のある `description` が要ります。**
   その文章がそのまま分類コーパスなので、ボイラープレートしか書かなければ
   ボイラープレートなルーティングになります。
+- **`description` は指示に使う言語で書いてください。** 埋め込みモデル
+  (`potion-multilingual-128M`)は言語をまたいだ意味の整列が弱く、日本語の指示と
+  英語の `description` の cosine 類似度は実測で 0.19〜0.26 — 閾値 0.45 に届き
+  ません — なのに対し、同一言語同士なら 0.55〜0.79 あります。`llm-gateway
+  init` は主にどの言語で指示を書くか尋ね、`default` を含むすべての route の
+  `description` をその言語で生成します。
 - **ワイルドカード route 名は、今や手書き設定向けの上級者用 escape hatch です。**
   `init` は生成せず、`GET /v1/models` にも載らず、分類器も採点しません。
 
