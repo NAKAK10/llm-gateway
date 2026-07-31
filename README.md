@@ -65,7 +65,9 @@ llm-gateway update          # upgrade to the latest release
 Before asking which role to configure, `init` asks one more question: "Which
 language do you mainly write instructions in?" — English, 日本語, 中文, 한국어, or
 Español. Every route's `description` it scaffolds, including `default`'s, is
-generated in that language; see
+generated in that language — and, when you pick anything other than English,
+as a two-entry array of `[that language, English]`, so English-only traffic
+from sub-agents or the harness itself still lands on the right route. See
 [Content-classified routing](#content-classified-routing) for why this
 matters.
 
@@ -143,6 +145,20 @@ Important consequences:
   — while same-language pairs measure 0.55–0.79. `llm-gateway init` asks which
   language you mainly write instructions in and generates every route's
   `description`, including `default`'s, in that language.
+- **`description` also accepts an array of strings — one variant per
+  language.** Each entry is embedded separately, and a route's score is the
+  **max cosine across all its variants**. This matters because real traffic
+  mixes languages: a human writing Japanese, but sub-agent prompts and
+  harness-injected text that are overwhelmingly English regardless. Writing
+  both languages into a single `description` does not fix that — mean-pooled
+  through the embedding model's 64-token window, the same Japanese
+  instruction's cosine dropped from **0.550** (Japanese-only description) to
+  **0.433** (Japanese and English concatenated) — under threshold, because
+  concatenation dilutes both languages toward a centroid that matches neither
+  as well as either did alone. Separate variants keep each language's full
+  score. A plain string is still valid and behaves like a one-element array.
+  `llm-gateway init` scaffolds `[chosen language, English]` whenever you pick
+  anything other than English.
 - **Every route's model must be explicit — `"<provider>/<model>"`, no `*`.**
   A model string can no longer borrow the client's requested model name: since
   routing is decided purely by content classification, there is nothing left
@@ -161,7 +177,12 @@ routes: {
   },
 
   "role-anthropic": {
-    description: "Complex reasoning, coding, and multi-step agentic tasks that need careful step-by-step thinking and full tool support.",
+    // Two variants, embedded separately, scored by max cosine — matches
+    // both a Japanese-speaking human and English sub-agent/harness traffic.
+    description: [
+      "慎重な段階的思考と完全なツール対応を必要とする、複雑な推論・コーディング・マルチステップな agent 的タスク。",
+      "Complex reasoning, coding, and multi-step agentic tasks that need careful step-by-step thinking and full tool support.",
+    ],
     model: {
       default: "anthropic/claude-sonnet-4-6",
       fallbacks: ["openrouter-anthropic/anthropic/claude-sonnet-4-6"],

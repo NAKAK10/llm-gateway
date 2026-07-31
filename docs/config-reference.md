@@ -56,7 +56,7 @@ including the reserved `default` route.
 | field | default | notes |
 |---|---|---|
 | `title` | *(none)* | Display only. |
-| `description` | *(required on non-wildcard routes)* | Inline text, or a path when it starts with `./` `../` `/` `~/` (relative paths resolve against the config dir). This is the classification corpus: every request's newest user text (walking back through history when the newest scores below the threshold — see "Classification behavior") is embedded and compared against every non-wildcard route's `description`. Write it as "when should this route win?" Write it **in the language you give instructions in** — the embedding model aligns meaning weakly across languages, so a description in a different language than the request scores far lower (see the README's [Content-classified routing](../README.md#content-classified-routing)). `llm-gateway init` generates every `description`, including `default`'s, in whichever language you tell it you write instructions in. |
+| `description` | *(required on non-wildcard routes)* | `string` or `string[]`. Each entry is inline text, or a path when it starts with `./` `../` `/` `~/` (relative paths resolve against the config dir). This is the classification corpus: every request's newest user text (walking back through history when the newest scores below the threshold — see "Classification behavior") is embedded and compared against every non-wildcard route's `description`. Write it as "when should this route win?" Write it **in the language you give instructions in** — the embedding model aligns meaning weakly across languages, so a description in a different language than the request scores far lower (see the README's [Content-classified routing](../README.md#content-classified-routing)). A `string[]` embeds each entry separately and scores the route by the **max cosine across all variants** — the typical use is one variant per language, so mixed-language traffic (a human writing Japanese, a sub-agent or harness sending English) matches whichever variant fits, instead of diluting both in one mean-pooled string. `llm-gateway init` generates every `description`, including `default`'s, in whichever language you tell it you write instructions in — and as a two-entry array (`[that language, English]`) whenever the chosen language isn't English. |
 | `model.default` | *(required)* | `"<provider>/<model>"`, split on the **first** `/` only — `openrouter/anthropic/claude-x` and `ollama-cloud/glm:cloud` both parse. `*` in the model part expands only when a wildcard route is actually resolved. |
 | `model.fallbacks` | `[]` | Tried in order, only before the first response byte, only on connect failure / timeout / 408 / 429 / 5xx. May use a provider with a different `api` than the default — reachability from the client's protocol is checked per attempt at request time (see [Cross-protocol routing](../README.md#cross-protocol-routing)), not by `config check`; a target the client's protocol cannot reach is skipped. |
 
@@ -93,6 +93,10 @@ If classification cannot run at all — for example a build without the default
   keeps its route across ambiguous turns. The walk is stateless: it reruns from
   the request's own message history every time, so the same request always
   classifies the same way regardless of gateway restarts or config reloads.
+- A route's score is the **max cosine across its `description` variants**
+  when `description` is a `string[]`. Each variant is embedded independently
+  at config-load time; a plain `string` is the one-element case of the same
+  scoring rule.
 - Before any text is embedded, `<system-reminder>...</system-reminder>` blocks
   are stripped from it (`src/server/proxy.rs`, `classification_texts`) — this
   is harness-injected context, not the user's own words, and it would

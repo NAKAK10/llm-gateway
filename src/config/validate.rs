@@ -23,7 +23,9 @@ use crate::error::ValidationReport;
 ///   reserved catch-all used when nothing clears the classification
 ///   threshold (see `crate::semantic::index`)
 /// - `server.host` is not loopback and `server.api_key` is unset
-/// - a `description` path does not exist
+/// - a `description` has no variants (an empty array), or one of its
+///   variants is empty
+/// - a `description` variant that is a path does not exist
 ///
 /// Warnings (allowed but reported):
 /// - the config file is group- or world-readable
@@ -49,7 +51,20 @@ pub fn validate(config: &Config, config_path: &Path) -> ValidationReport {
 
         match &route.description {
             Some(description) => {
-                if let Some(path) = description.path() {
+                if description.variants().is_empty() {
+                    report.error(format!(
+                        "route `{route_name}`: description is an empty array; it needs at least \
+                         one variant to be a classification candidate"
+                    ));
+                }
+                for variant in description.variants() {
+                    if variant.trim().is_empty() {
+                        report.error(format!(
+                            "route `{route_name}`: description has an empty variant"
+                        ));
+                    }
+                }
+                for path in description.paths() {
                     if !path.exists() {
                         report.error(format!(
                             "route `{route_name}`: description path `{}` does not exist",
@@ -256,7 +271,7 @@ mod tests {
 
     fn route(default: &str, fallbacks: &[&str]) -> RouteConfig {
         RouteConfig {
-            description: Some(Description("a test route".to_string())),
+            description: Some(Description(vec!["a test route".to_string()])),
             model: ModelConfig {
                 default: default.to_string(),
                 fallbacks: fallbacks.iter().map(|s| s.to_string()).collect(),
@@ -612,9 +627,82 @@ mod tests {
     #[test]
     fn missing_description_path_is_an_error() {
         let mut c = minimal_config();
-        c.routes.get_mut("role-writer").unwrap().description = Some(Description(
+        c.routes.get_mut("role-writer").unwrap().description = Some(Description(vec![
             "./__llm_gateway_test_missing_description_file__.md".to_string(),
-        ));
+        ]));
+
+        let report = validate(&c, &nonexistent_path());
+        assert!(!report.is_ok());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("role-writer") && e.contains("does not exist")),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    /// A route whose traffic mixes languages describes itself with several
+    /// variants (see the module doc on `crate::config::Description`) — a
+    /// plain array of two or more entries must be accepted without error.
+    #[test]
+    fn a_description_with_multiple_variants_is_accepted() {
+        let mut c = minimal_config();
+        c.routes.get_mut("role-writer").unwrap().description = Some(Description(vec![
+            "日本語の説明".to_string(),
+            "English description".to_string(),
+        ]));
+
+        let report = validate(&c, &nonexistent_path());
+        assert!(report.is_ok(), "{:?}", report.errors);
+    }
+
+    #[test]
+    fn an_empty_description_array_is_an_error() {
+        let mut c = minimal_config();
+        c.routes.get_mut("role-writer").unwrap().description = Some(Description(Vec::new()));
+
+        let report = validate(&c, &nonexistent_path());
+        assert!(!report.is_ok());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("role-writer") && e.contains("empty array")),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn a_description_with_an_empty_variant_is_an_error() {
+        let mut c = minimal_config();
+        c.routes.get_mut("role-writer").unwrap().description =
+            Some(Description(vec!["ok".to_string(), "".to_string()]));
+
+        let report = validate(&c, &nonexistent_path());
+        assert!(!report.is_ok());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("role-writer") && e.contains("empty variant")),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    /// Each variant in a multi-entry description is checked for a path
+    /// independently — one missing path among several variants must still be
+    /// caught.
+    #[test]
+    fn a_missing_path_among_several_variants_is_an_error() {
+        let mut c = minimal_config();
+        c.routes.get_mut("role-writer").unwrap().description = Some(Description(vec![
+            "inline text".to_string(),
+            "./__llm_gateway_test_missing_description_file__.md".to_string(),
+        ]));
 
         let report = validate(&c, &nonexistent_path());
         assert!(!report.is_ok());

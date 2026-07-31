@@ -32,19 +32,27 @@ pub const CLASSIFICATION_THRESHOLD: f32 = 0.45;
 
 /// One candidate available to the classifier.
 ///
-/// `vector` is already L2-normalized (see `Embedder::load`) and `apis` holds
-/// the protocol the candidate's `model.default` speaks plus one for every
-/// resolvable `model.fallbacks` entry (default first) — a candidate the
-/// request cannot reach through *any* of them — not the same protocol, and
-/// not translatable to it — can be excluded before scoring rather than after.
-/// A route's fallbacks may speak a different protocol than its default now
-/// (cross-protocol fallback), so a candidate whose default the request
+/// `vectors` holds one already-L2-normalized embedding (see `Embedder::load`)
+/// per entry in the route's `description` — see [`crate::config::Description`]
+/// for why a route may have more than one — and is never empty for a
+/// candidate that made it into a [`RouteIndex`] (see [`embed_candidate`]). A
+/// candidate's score against a query is the **maximum** cosine to any of
+/// these, so a route described in two languages wins on whichever variant
+/// the request text actually matches, rather than an averaged-down single
+/// embedding.
+///
+/// `apis` holds the protocol the candidate's `model.default` speaks plus one
+/// for every resolvable `model.fallbacks` entry (default first) — a candidate
+/// the request cannot reach through *any* of them — not the same protocol,
+/// and not translatable to it — can be excluded before scoring rather than
+/// after. A route's fallbacks may speak a different protocol than its default
+/// now (cross-protocol fallback), so a candidate whose default the request
 /// cannot reach directly may still be reachable through one of its
 /// fallbacks.
 #[derive(Debug, Clone)]
 struct Candidate {
     name: String,
-    vector: Vec<f32>,
+    vectors: Vec<Vec<f32>>,
     apis: Vec<ApiKind>,
 }
 
@@ -81,10 +89,11 @@ impl RouteIndex {
     }
 }
 
-/// Embed one candidate route's description and resolve its `ApiKind`.
-/// `None` if either step is not possible — see [`RouteIndex::build`] for why
-/// that is expected to be unreachable on a live config, not an error case
-/// worth surfacing here.
+/// Embed every variant of one candidate route's description and resolve its
+/// `ApiKind`. `None` if the description does not resolve to at least one
+/// embeddable variant, or the model resolution step fails — see
+/// [`RouteIndex::build`] for why that is expected to be unreachable on a live
+/// config, not an error case worth surfacing here.
 fn embed_candidate(
     config: &Config,
     embedder: &Embedder,
@@ -92,8 +101,17 @@ fn embed_candidate(
 ) -> Option<Candidate> {
     let candidate_route = config.routes.get(candidate_name)?;
     let description = candidate_route.description.as_ref()?;
-    let text = description.text().ok()?;
-    let vector = embedder.embed(&text)?;
+    let texts = description.texts().ok()?;
+    // A variant that fails to embed (an empty tokenizer result, a caught
+    // panic) is dropped rather than sinking the whole candidate — as long as
+    // at least one variant survives, the candidate can still be scored on it.
+    let vectors: Vec<Vec<f32>> = texts
+        .iter()
+        .filter_map(|text| embedder.embed(text))
+        .collect();
+    if vectors.is_empty() {
+        return None;
+    }
 
     // The default must resolve — same requirement as before — but a
     // fallback that does not (which should be unreachable on a validated
@@ -111,7 +129,7 @@ fn embed_candidate(
 
     Some(Candidate {
         name: candidate_name.to_string(),
-        vector,
+        vectors,
         apis,
     })
 }
@@ -144,6 +162,18 @@ pub struct Verdict {
 /// silently get a similarity that is not cosine similarity at all.
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// A candidate's score against `vector`: the **maximum** cosine similarity to
+/// any of its `description` variants (see `Candidate`'s `vectors` field and
+/// [`crate::config::Description`]). Panics if `vectors` is empty, which
+/// [`embed_candidate`] never produces — every `Candidate` reaching [`rank`]
+/// has at least one.
+fn max_cosine(vector: &[f32], vectors: &[Vec<f32>]) -> f32 {
+    vectors
+        .iter()
+        .map(|v| dot(vector, v))
+        .fold(f32::NEG_INFINITY, f32::max)
 }
 
 /// Every candidate considered (after excluding the unreachable ones), scored
@@ -188,7 +218,7 @@ fn rank(vector: &[f32], candidates: &[Candidate], expected_api: ApiKind, thresho
                     || crate::translate::Translation::select(expected_api, api).is_some()
             })
         })
-        .map(|c| (c.name.clone(), dot(vector, &c.vector)))
+        .map(|c| (c.name.clone(), max_cosine(vector, &c.vectors)))
         .collect();
 
     scored.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -335,10 +365,17 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
 
+    /// A single-variant candidate — most tests only need one embedding.
     fn candidate(name: &str, vector: Vec<f32>, api: ApiKind) -> Candidate {
+        multi_variant_candidate(name, vec![vector], api)
+    }
+
+    /// A candidate with one embedding per `description` variant, for exercising
+    /// the max-cosine scoring [`max_cosine`] does across all of them.
+    fn multi_variant_candidate(name: &str, vectors: Vec<Vec<f32>>, api: ApiKind) -> Candidate {
         Candidate {
             name: name.to_string(),
-            vector,
+            vectors,
             apis: vec![api],
         }
     }
@@ -452,7 +489,7 @@ mod tests {
     fn rank_keeps_a_candidate_reachable_only_through_its_fallback() {
         let mixed = Candidate {
             name: "mixed".to_string(),
-            vector: vec![1.0, 0.0],
+            vectors: vec![vec![1.0, 0.0]],
             apis: vec![ApiKind::OpenaiResponses, ApiKind::OpenaiChat],
         };
 
@@ -462,6 +499,84 @@ mod tests {
             .winner
             .expect("reachable through the fallback's protocol");
         assert_eq!(route, "mixed");
+    }
+
+    /// The point of `max_cosine`: a candidate's score is the best of its
+    /// variants, not their average or the first one — a variant that scores
+    /// low against this particular query must not drag a strong match down.
+    #[test]
+    fn max_cosine_takes_the_best_scoring_variant_not_the_average() {
+        let vectors = vec![
+            vec![0.0, 1.0], // orthogonal to the query: 0.0
+            vec![1.0, 0.0], // identical to the query: 1.0
+        ];
+        let score = max_cosine(&[1.0, 0.0], &vectors);
+        assert!((score - 1.0).abs() < 1e-6, "{score}");
+    }
+
+    /// `rank` must use the same maximum, not just `max_cosine` in isolation:
+    /// a multi-variant candidate should outrank a single-variant one whose
+    /// only embedding is a middling match.
+    #[test]
+    fn rank_scores_a_candidate_by_its_best_variant() {
+        let candidates = vec![
+            multi_variant_candidate(
+                "multi",
+                vec![vec![0.0, 1.0], vec![1.0, 0.0]],
+                ApiKind::AnthropicMessages,
+            ),
+            candidate("single", vec![0.7, 0.7], ApiKind::AnthropicMessages),
+        ];
+
+        let scored = rank(&[1.0, 0.0], &candidates, ApiKind::AnthropicMessages, 0.0);
+
+        let (route, score) = scored.winner.expect("clears threshold 0.0");
+        assert_eq!(route, "multi");
+        assert!((score - 1.0).abs() < 1e-6, "{score}");
+    }
+
+    /// The scenario multi-variant descriptions exist for (see
+    /// `crate::config::Description`): a route embedded once per language
+    /// clears the classification threshold whether the request text is
+    /// Japanese or English, because each language gets scored against its
+    /// own variant rather than one language-mixed embedding diluting both.
+    /// Modeled with synthetic 2-D vectors rather than the real embedder — one
+    /// axis stands in for "Japanese-shaped" text, the other for
+    /// "English-shaped" text — so this stays a fast, model-independent unit
+    /// test like the rest of `rank`'s coverage.
+    #[test]
+    fn a_route_with_ja_and_en_variants_matches_either_languages_query() {
+        let ja_axis = vec![1.0, 0.0];
+        let en_axis = vec![0.0, 1.0];
+        let candidates = vec![multi_variant_candidate(
+            "role-writer",
+            vec![ja_axis.clone(), en_axis.clone()],
+            ApiKind::AnthropicMessages,
+        )];
+
+        let ja_query_scored = rank(
+            &ja_axis,
+            &candidates,
+            ApiKind::AnthropicMessages,
+            CLASSIFICATION_THRESHOLD,
+        );
+        let (route, score) = ja_query_scored
+            .winner
+            .expect("a Japanese-shaped query clears threshold via the ja variant");
+        assert_eq!(route, "role-writer");
+        assert!((score - 1.0).abs() < 1e-6, "{score}");
+
+        let en_query_scored = rank(
+            &en_axis,
+            &candidates,
+            ApiKind::AnthropicMessages,
+            CLASSIFICATION_THRESHOLD,
+        );
+        let (route, score) = en_query_scored
+            .winner
+            .expect("an English-shaped query clears threshold via the en variant");
+        assert_eq!(route, "role-writer");
+        assert!((score - 1.0).abs() < 1e-6, "{score}");
     }
 
     #[test]

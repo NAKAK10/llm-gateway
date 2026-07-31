@@ -257,7 +257,9 @@ pub struct RouteConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
 
-    /// Human-readable purpose, inline or as a path to a Markdown file.
+    /// Human-readable purpose, inline or as a path to a Markdown file — or
+    /// several of either, one per language a route's traffic actually
+    /// arrives in.
     ///
     /// This is documentation *and* the classification corpus: every request,
     /// regardless of what model name the client sent, is classified against
@@ -270,49 +272,116 @@ pub struct RouteConfig {
     pub model: ModelConfig,
 }
 
-/// A `description` value: either the text itself or a path to a file holding it.
+/// A `description` value: either the text itself, a path to a file holding
+/// it, or a list of either. Accepted in `config.json` as a bare string or as
+/// an array; a bare string normalizes to a single-entry list, so an existing
+/// config keeps its exact meaning (see [`Description::deserialize`]).
 ///
-/// Treated as a path when it starts with `./`, `../`, `/` or `~/`. Everything
-/// else is literal text, so ordinary prose can never be mistaken for a filename.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(transparent)]
-pub struct Description(pub String);
+/// More than one entry exists for a route whose traffic mixes languages. The
+/// embedding model behind classification (`potion-multilingual-128M`) aligns
+/// weakly across languages, and writing one description that mixes languages
+/// dilutes each of them rather than covering both — measured: a
+/// Japanese-only description scores 0.550 cosine against a Japanese query,
+/// while appending an English clause to that same description drops it to
+/// 0.433. `crate::semantic::index` embeds every entry separately and scores
+/// a route by the **maximum** cosine to any of them, so each language gets
+/// its own undiluted embedding instead of being averaged away.
+///
+/// Each entry follows the same path-or-text rule individually: treated as a
+/// path when it starts with `./`, `../`, `/` or `~/`, literal text
+/// otherwise, so ordinary prose can never be mistaken for a filename.
+#[derive(Debug, Clone)]
+pub struct Description(pub Vec<String>);
 
 impl Description {
-    pub fn is_path(&self) -> bool {
-        let s = self.0.trim();
-        s.starts_with("./") || s.starts_with("../") || s.starts_with('/') || s.starts_with("~/")
+    /// Every configured variant, in the order they were written.
+    pub fn variants(&self) -> &[String] {
+        &self.0
     }
 
-    /// Resolved filesystem path, if this is a path reference.
+    /// Resolved filesystem paths of every variant that is a path reference —
+    /// what `validate` checks for existence, one per variant.
     ///
     /// Relative paths resolve against the config directory rather than the
     /// process working directory, so config.json stays portable.
-    pub fn path(&self) -> Option<PathBuf> {
-        if !self.is_path() {
-            return None;
-        }
-        let s = self.0.trim();
-        if let Some(rest) = s.strip_prefix("~/") {
-            if let Ok(strategy) = etcetera::choose_base_strategy() {
-                use etcetera::BaseStrategy;
-                return Some(strategy.home_dir().join(rest));
-            }
-        }
-        Some(paths::resolve_relative(s))
+    pub fn paths(&self) -> Vec<PathBuf> {
+        self.0
+            .iter()
+            .filter_map(|variant| variant_path(variant))
+            .collect()
     }
 
-    /// The description text, reading the referenced file when needed.
+    /// The text of every variant, reading any that reference a file.
     ///
-    /// Used by `crate::semantic::index` as the classification corpus; the
-    /// contract it relies on (the referenced file must exist) is already
-    /// checked by `validate`.
-    pub fn text(&self) -> Result<String> {
-        match self.path() {
-            None => Ok(self.0.clone()),
-            Some(path) => {
-                std::fs::read_to_string(&path).map_err(|source| Error::ConfigRead { path, source })
-            }
+    /// Used by `crate::semantic::index` as the classification corpus, one
+    /// embedding per entry; the contract each path entry relies on (the
+    /// referenced file must exist) is already checked by `validate`.
+    pub fn texts(&self) -> Result<Vec<String>> {
+        self.0.iter().map(|variant| variant_text(variant)).collect()
+    }
+}
+
+fn variant_is_path(variant: &str) -> bool {
+    let s = variant.trim();
+    s.starts_with("./") || s.starts_with("../") || s.starts_with('/') || s.starts_with("~/")
+}
+
+fn variant_path(variant: &str) -> Option<PathBuf> {
+    if !variant_is_path(variant) {
+        return None;
+    }
+    let s = variant.trim();
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Ok(strategy) = etcetera::choose_base_strategy() {
+            use etcetera::BaseStrategy;
+            return Some(strategy.home_dir().join(rest));
+        }
+    }
+    Some(paths::resolve_relative(s))
+}
+
+fn variant_text(variant: &str) -> Result<String> {
+    match variant_path(variant) {
+        None => Ok(variant.to_string()),
+        Some(path) => {
+            std::fs::read_to_string(&path).map_err(|source| Error::ConfigRead { path, source })
+        }
+    }
+}
+
+/// Accepts either a bare string or an array of strings, normalizing a bare
+/// string to a single-entry `Vec` — the shape every existing config already
+/// has, so nothing written before this type grew a second variant needs to
+/// change.
+impl<'de> serde::Deserialize<'de> for Description {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            One(String),
+            Many(Vec<String>),
+        }
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::One(s) => Description(vec![s]),
+            Raw::Many(v) => Description(v),
+        })
+    }
+}
+
+/// A single variant serializes as a bare string rather than a one-element
+/// array — what `init` writes for `DescriptionLanguage::English`, and what
+/// keeps a hand-edited single-language config reading exactly as before.
+impl Serialize for Description {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self.0.as_slice() {
+            [one] => serializer.serialize_str(one),
+            many => many.serialize(serializer),
         }
     }
 }
@@ -562,5 +631,70 @@ mod tests {
         let parsed: LoggingConfig =
             json5::from_str(r#"{ "dir": "./logs", "logging": true }"#).unwrap();
         assert!(parsed.logging);
+    }
+
+    /// A bare string is the shape every existing config already has — it
+    /// must normalize to a single-entry list, not be rejected or produce a
+    /// list of characters.
+    #[test]
+    fn description_string_normalizes_to_a_single_variant() {
+        let d: Description = json5::from_str(r#""hello""#).unwrap();
+        assert_eq!(d.variants(), &["hello".to_string()]);
+    }
+
+    #[test]
+    fn description_array_stays_as_written() {
+        let d: Description = json5::from_str(r#"["日本語の説明", "English description"]"#).unwrap();
+        assert_eq!(
+            d.variants(),
+            &[
+                "日本語の説明".to_string(),
+                "English description".to_string()
+            ]
+        );
+    }
+
+    /// The whole point of accepting a bare string on read: a single-variant
+    /// `Description` must write back out as a bare string too, so a config
+    /// hand-edited or regenerated by `init` for `DescriptionLanguage::English`
+    /// reads exactly as it did before this type grew a second variant.
+    #[test]
+    fn single_variant_serializes_as_a_bare_string() {
+        let d = Description(vec!["hello".to_string()]);
+        assert_eq!(serde_json::to_string(&d).unwrap(), "\"hello\"");
+    }
+
+    #[test]
+    fn multi_variant_serializes_as_an_array() {
+        let d = Description(vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(serde_json::to_string(&d).unwrap(), "[\"a\",\"b\"]");
+    }
+
+    #[test]
+    fn texts_reads_a_path_entry_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("desc.md");
+        std::fs::write(&file_path, "file contents").unwrap();
+
+        let d = Description(vec![file_path.to_string_lossy().to_string()]);
+        assert_eq!(d.texts().unwrap(), vec!["file contents".to_string()]);
+    }
+
+    /// A route can mix an inline variant with a path variant — each entry is
+    /// resolved independently.
+    #[test]
+    fn texts_resolves_a_mix_of_inline_and_path_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("desc.md");
+        std::fs::write(&file_path, "from file").unwrap();
+
+        let d = Description(vec![
+            "inline text".to_string(),
+            file_path.to_string_lossy().to_string(),
+        ]);
+        assert_eq!(
+            d.texts().unwrap(),
+            vec!["inline text".to_string(), "from file".to_string()]
+        );
     }
 }

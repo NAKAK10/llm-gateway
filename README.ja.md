@@ -65,8 +65,10 @@ llm-gateway update          # 最新リリースへ更新
 `init` はどの role を設定するか尋ねる前に、もう一つ質問をします:
 「主にどの言語で指示を書きますか?」— English、日本語、中文、한국어、Español の
 5 択です。`default` を含め、生成されるすべての route の `description` は
-選んだ言語で書かれます。理由は[コンテンツ分類ルーティング](#コンテンツ分類ルーティング)
-を参照してください。
+選んだ言語で書かれます — さらに English 以外を選んだ場合は、`[選んだ言語,
+English]` の 2 要素配列として生成され、sub agent やハーネス自身が出す
+英語のみのトラフィックも正しい route に乗るようにします。理由は
+[コンテンツ分類ルーティング](#コンテンツ分類ルーティング)を参照してください。
 
 **破壊的な設定変更:** 旧スキーマからの移行処理はありません。
 `~/.config/llm-gateway/config.json`(または `~/.config/llm-gateway/` 全体)を
@@ -140,6 +142,20 @@ tool_result のターンをまたいでも会話は route を維持しますが�
   ません — なのに対し、同一言語同士なら 0.55〜0.79 あります。`llm-gateway
   init` は主にどの言語で指示を書くか尋ね、`default` を含むすべての route の
   `description` をその言語で生成します。
+- **`description` は文字列の配列も受け付けます — 言語ごとに 1 バリアント。**
+  各要素は個別に埋め込まれ、route のスコアは**全バリアントの中の最大
+  cosine** になります。これが必要な理由は、実際のトラフィックが言語混在
+  だからです: 人間は日本語で書きますが、sub agent のプロンプトやハーネスが
+  注入するテキストは、書き手が何語であっても大半が英語です。両言語を 1 つの
+  `description` に併記しても解決しません — 埋め込みモデルの 64 トークンの
+  mean pooling を通すと、同じ日本語の指示の cosine は**日本語のみ**の
+  description で **0.550** だったのに対し、**日本語 + 英語を 1 つの文字列に
+  併記**すると **0.433** に下がります — 閾値未満です。併記は両言語を
+  互いに薄めて、単独時よりどちらの言語ともマッチしにくい重心へ寄せてしまう
+  ためです。バリアントを分ければ、各言語がフルスコアのまま残ります。
+  従来どおり文字列単体も有効で、1 要素配列と同じ扱いになります。
+  `llm-gateway init` は English 以外を選んだ場合、`[選んだ言語, English]`
+  を生成します。
 - **ワイルドカード route 名は、今や手書き設定向けの上級者用 escape hatch です。**
   `init` は生成せず、`GET /v1/models` にも載らず、分類器も採点しません。
 
@@ -153,7 +169,12 @@ routes: {
   },
 
   "role-anthropic": {
-    description: "慎重な段階的思考と完全なツール対応を必要とする、複雑な推論・コーディング・マルチステップな agent 的タスク。",
+    // 2 バリアントをそれぞれ個別に埋め込み、最大 cosine で採点する —
+    // 日本語話者の人間と、英語の sub agent / ハーネスのトラフィックの両方に一致する。
+    description: [
+      "慎重な段階的思考と完全なツール対応を必要とする、複雑な推論・コーディング・マルチステップな agent 的タスク。",
+      "Complex reasoning, coding, and multi-step agentic tasks that need careful step-by-step thinking and full tool support.",
+    ],
     model: {
       default: "anthropic/*",
       fallbacks: ["openrouter-anthropic/anthropic/*"],
