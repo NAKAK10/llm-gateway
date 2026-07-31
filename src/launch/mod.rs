@@ -48,6 +48,9 @@ pub struct Options {
     pub client: Client,
     pub isolate: bool,
     pub print_only: bool,
+    /// `Some(true/false)` when `--auto`/`--no-auto` answered the
+    /// auto-classify question up front; `None` to ask interactively.
+    pub auto_route: Option<bool>,
     pub forwarded_args: Vec<String>,
 }
 
@@ -104,17 +107,30 @@ fn quote_if_needed(arg: &str) -> String {
 pub async fn run(options: Options) -> Result<()> {
     let config = Config::load()?;
 
+    // "Auto" means the gateway classifies every request by content and
+    // ignores the model name the client sent (the historical, always-on
+    // behaviour). "No" means the model each agent asked for is routed as
+    // sent, unclassified. Asked once per `launch` invocation — i.e. once per
+    // session — rather than read from config, so switching is a keystroke,
+    // not an edit.
+    let auto_route = match options.auto_route {
+        Some(answer) => answer,
+        None => prompt_auto_route()?,
+    };
+
     let invocation = match options.client {
         Client::Claude => claude::build(
             &config,
             crate::config::DEFAULT_ROUTE,
             options.isolate,
+            auto_route,
             &options.forwarded_args,
         )?,
         Client::Codex => codex::build(
             &config,
             crate::config::DEFAULT_ROUTE,
             options.isolate,
+            auto_route,
             &options.forwarded_args,
         )?,
         Client::Opencode => {
@@ -129,6 +145,7 @@ pub async fn run(options: Options) -> Result<()> {
                 crate::config::DEFAULT_ROUTE,
                 &models,
                 options.isolate,
+                auto_route,
                 &options.forwarded_args,
             )?
         }
@@ -207,6 +224,29 @@ pub async fn run(options: Options) -> Result<()> {
         let status = cmd.status()?;
         std::process::exit(status.code().unwrap_or(1));
     }
+}
+
+/// Ask, once per `launch` invocation, whether the gateway should classify
+/// requests automatically for this session ("yes") or route by the model
+/// name each agent actually sent ("no").
+///
+/// Skipped — defaulting to "yes", the historical always-classify behaviour —
+/// when stdin is not a terminal (e.g. piped into a script), since there is
+/// nobody to answer it. `--auto`/`--no-auto` bypass the prompt entirely; see
+/// [`Options::auto_route`].
+fn prompt_auto_route() -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+
+    if !std::io::stdin().is_terminal() {
+        return Ok(true);
+    }
+
+    print!("このセッションではモデルを自動分類しますか？ auto-classify models for this session? [Y/n] ");
+    std::io::stdout().flush().ok();
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(!matches!(input.trim().to_lowercase().as_str(), "n" | "no"))
 }
 
 /// An actionable error for a missing `launch.<client>` block.

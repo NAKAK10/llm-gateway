@@ -7,6 +7,7 @@
 //! ANTHROPIC_AUTH_TOKEN=<server.apiKey>        # "Bearer " is added by the client
 //! ANTHROPIC_MODEL=<route>
 //! ANTHROPIC_CUSTOM_HEADERS=x-gw-client: claude-code
+//! x-gw-auto-route: 1
 //! CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 //! ```
 //!
@@ -33,7 +34,13 @@ use crate::launch::Invocation;
 /// content regardless of what the client sent, so this exists only to give
 /// Claude Code *something* syntactically valid to put in its own UI and
 /// `ANTHROPIC_MODEL` env var.
-pub fn build(config: &Config, model: &str, isolate: bool, args: &[String]) -> Result<Invocation> {
+pub fn build(
+    config: &Config,
+    model: &str,
+    isolate: bool,
+    auto_route: bool,
+    args: &[String],
+) -> Result<Invocation> {
     let mut env = vec![("ANTHROPIC_BASE_URL".to_string(), config.server.base_url())];
     if let Some(api_key) = &config.server.api_key {
         env.push(("ANTHROPIC_AUTH_TOKEN".to_string(), api_key.resolve()?));
@@ -41,7 +48,12 @@ pub fn build(config: &Config, model: &str, isolate: bool, args: &[String]) -> Re
     env.push(("ANTHROPIC_MODEL".to_string(), model.to_string()));
     env.push((
         "ANTHROPIC_CUSTOM_HEADERS".to_string(),
-        "x-gw-client: claude-code".to_string(),
+        // Newline-separated `Key: Value` pairs — the only format Claude Code
+        // accepts for more than one custom header.
+        format!(
+            "x-gw-client: claude-code\nx-gw-auto-route: {}",
+            if auto_route { "1" } else { "0" }
+        ),
     ));
     env.push((
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),

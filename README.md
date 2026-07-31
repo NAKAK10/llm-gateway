@@ -27,6 +27,13 @@ OpenClaw (manual setup)      ─┘        record
 Clients are started with `launch`, which injects the redirect via environment
 variables / CLI overrides — **no client config file is ever modified**.
 
+Each `launch` asks once, per session, whether the gateway should
+auto-classify requests by content ("yes", the default and historical
+behaviour) or route by the model name the agent actually sent ("no").
+Answer non-interactively with `--auto` / `--no-auto`; without either, a
+terminal prompt asks (skipped, defaulting to "yes", when stdin is not a
+terminal).
+
 ## Install
 
 ```sh
@@ -367,7 +374,7 @@ launch: {
 ```
 llm-gateway serve [--debug] [--debug-full] [--port N]
 llm-gateway init
-llm-gateway launch <claude|codex|opencode> [--isolate] [--print] [-- ARGS]
+llm-gateway launch <claude|codex|opencode> [--isolate] [--auto|--no-auto] [--print] [-- ARGS]
 llm-gateway config check|show|gitignore
 llm-gateway stats [--by route|client|provider|model|day] [--since D] [--until D]
 llm-gateway trace [--tail] [--route R] [--client C]

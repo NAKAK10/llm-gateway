@@ -56,6 +56,7 @@ const NOT_FORWARDED: &[&str] = &[
     "transfer-encoding",
     // Ours, not the upstream's business.
     "x-gw-client",
+    "x-gw-auto-route",
 ];
 
 /// Build the header set to send upstream.
