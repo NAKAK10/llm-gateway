@@ -170,7 +170,7 @@ pub fn run() -> Result<()> {
         cliclack::log::info(format!(
             "{}: `{}` route added, run by `{}` on your subscription — no key needed",
             provider.label(),
-            "role-subscription",
+            provider.subscription_route(),
             provider.subscription_cli().unwrap_or("its CLI"),
         ))?;
     }
@@ -458,6 +458,13 @@ impl KnownProvider {
         format!("{}-subscription", self.id())
     }
 
+    /// Route name for the subscription choice. Namespaced by provider id so
+    /// selecting both Anthropic and OpenAI subscriptions scaffolds two routes
+    /// instead of the second silently overwriting the first.
+    pub fn subscription_route(self) -> String {
+        format!("role-{}-subscription", self.id())
+    }
+
     /// A model reference the subscription CLI accepts, for the scaffolded route.
     pub fn subscription_model(self) -> &'static str {
         match self {
@@ -506,7 +513,8 @@ pub fn build_config(
 /// rather than a key.
 ///
 /// A subscription choice adds a *second* provider id (`<id>-subscription`) with
-/// an agent-CLI transport, and a `role-subscription` route pointing at it. It
+/// an agent-CLI transport, and a `role-<id>-subscription` route pointing at
+/// it. It
 /// does not remove the API-key provider: the two are good at different things —
 /// a plan for generation, a key for anything that needs tools — and a config
 /// that holds both lets a route choose per request.
@@ -551,11 +559,17 @@ pub fn build_config_with_auth(
     // OpenRouter can also speak the Anthropic wire protocol under
     // `openrouter/anthropic/*`; expose it under its own id so `claude-*` can
     // fall back to it without crossing `ApiKind`s.
+    //
+    // Its Anthropic-compatible root is `/api`, not `/api/v1` — unlike the
+    // `openai-chat` id, which needs the `/v1` prefix because the gateway
+    // appends `/chat/completions` rather than a version-free path. Reusing
+    // `KnownProvider::OpenRouter.base_url()` here would double up to
+    // `/api/v1/v1/messages`.
     if has(KnownProvider::OpenRouter) {
         config.providers.insert(
             "openrouter-anthropic".to_string(),
             ProviderConfig {
-                base_url: KnownProvider::OpenRouter.base_url().to_string(),
+                base_url: "https://openrouter.ai/api".to_string(),
                 api: ApiKind::AnthropicMessages,
                 api_key: Some(provider_api_key(
                     KnownProvider::OpenRouter,
@@ -640,7 +654,7 @@ pub fn build_config_with_auth(
             },
         );
         config.routes.insert(
-            "role-subscription".to_string(),
+            provider.subscription_route(),
             RouteConfig {
                 description: Some(crate::config::Description(
                     "Runs on a subscription via the provider's own CLI. Generation only — \
@@ -740,7 +754,10 @@ mod tests {
         assert!(provider.base_url.is_empty());
         assert!(provider.api_key.is_none());
 
-        let route = config.routes.get("role-subscription").expect("route");
+        let route = config
+            .routes
+            .get("role-anthropic-subscription")
+            .expect("route");
         assert_eq!(route.model.default, "anthropic-subscription/sonnet");
         assert!(route.description.is_some(), "the route explains its limits");
     }
@@ -759,6 +776,67 @@ mod tests {
         assert!(config.providers.contains_key("anthropic-subscription"));
     }
 
+    /// Choosing subscriptions for both Anthropic and OpenAI used to collide:
+    /// both wrote to the fixed route name `role-subscription`, so the second
+    /// silently overwrote the first. Each now gets its own `role-<id>-subscription`.
+    #[test]
+    fn two_subscriptions_scaffold_two_routes_instead_of_colliding() {
+        let config = build_config_with_auth(
+            &[Client::Claude, Client::Codex],
+            &[
+                (KnownProvider::Anthropic, None),
+                (KnownProvider::OpenAi, None),
+            ],
+            KeyStorage::Keychain,
+            &[KnownProvider::Anthropic, KnownProvider::OpenAi],
+        );
+        assert_eq!(
+            config.routes["role-anthropic-subscription"].model.default,
+            "anthropic-subscription/sonnet"
+        );
+        assert_eq!(
+            config.routes["role-openai-subscription"].model.default,
+            "openai-subscription/default"
+        );
+    }
+
+    /// OpenRouter's Anthropic-compatible root is `/api`, not `/api/v1` — the
+    /// gateway appends `/v1/messages` itself. Reusing the `openai-chat` id's
+    /// base URL here used to double up to `/api/v1/v1/messages`.
+    #[test]
+    fn openrouter_anthropic_base_url_has_no_doubled_v1() {
+        let config = build_config(
+            &[Client::Claude],
+            &[(KnownProvider::OpenRouter, None)],
+            KeyStorage::Keychain,
+        );
+        let provider = &config.providers["openrouter-anthropic"];
+        assert_eq!(provider.base_url, "https://openrouter.ai/api");
+        assert_eq!(
+            crate::upstream::endpoint_url(
+                &crate::route::Target {
+                    transport: provider.transport,
+                    agent_args: provider.agent_args.clone(),
+                    model_ref: crate::config::ModelRef {
+                        provider: "openrouter-anthropic".into(),
+                        model: "anthropic/claude-sonnet-4.6".into(),
+                    },
+                    api: provider.api,
+                    base_url: provider.base_url.clone(),
+                    api_key: None,
+                    headers: provider
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                    inject_usage: provider.inject_usage,
+                },
+                false
+            ),
+            "https://openrouter.ai/api/v1/messages"
+        );
+    }
+
     #[test]
     fn a_codex_subscription_route_defers_the_model_to_the_cli() {
         // Which models a ChatGPT plan allows is not knowable from here.
@@ -773,7 +851,7 @@ mod tests {
         // Codex renders as openai-chat, which is what the most clients reach.
         assert_eq!(provider.api, crate::config::ApiKind::OpenaiChat);
         assert_eq!(
-            config.routes["role-subscription"].model.default,
+            config.routes["role-openai-subscription"].model.default,
             "openai-subscription/default"
         );
     }

@@ -2,6 +2,42 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-07-31 — `init`'s subscription and OpenRouter scaffolding, two bugs fixed
+
+Flagged by the owner as "confusing": a fresh `config.json` can carry
+`anthropic`, `anthropic-subscription`, `openrouter`, `openrouter-anthropic` —
+one upstream's account under several ids. Investigating *why* surfaced two
+real bugs, fixed here, plus one thing that is not a bug.
+
+**Bug: `openrouter-anthropic`'s `baseUrl` doubled `/v1`.** `init` reused
+`KnownProvider::OpenRouter.base_url()` (`https://openrouter.ai/api/v1`, meant
+for the `openai-chat` id) for the Anthropic-protocol id too. `endpoint_url`
+appends `/v1/messages` for any `anthropic-messages` provider, producing
+`https://openrouter.ai/api/v1/v1/messages` — a URL that 404s. OpenRouter's
+Anthropic-compatible root is `/api`, not `/api/v1`; `openrouter-anthropic` now
+gets its own literal base URL instead of borrowing the other id's.
+
+**Bug: two subscriptions collided on one route name.** Choosing both an
+Anthropic and an OpenAI subscription made `init` write `role-subscription`
+twice — the second `Config.routes.insert` silently discarded the first, so
+the Anthropic route vanished from the generated file with no error. Each
+subscription now gets `role-<id>-subscription` (`role-anthropic-subscription`,
+`role-openai-subscription`).
+
+**Not a bug, but worth writing down: why the duplicate ids exist at all.** A
+`ProviderConfig` couples one upstream to exactly one `ApiKind` and one
+`Transport`, by design (`src/config/mod.rs`) — so that
+`route.model.fallbacks` never has to cross either mid-request. OpenRouter
+answers two protocols and Anthropic can be reached by two mechanisms (a key,
+or the subscription's CLI), and neither the code nor the config format has a
+narrower way to say "same account, different shape" than a second id. A
+provider-per-(protocol, transport) model is simpler to reach *from*, but
+folding several shapes into one entry would touch `validate`, `route`,
+`proxy`, `semantic::index`, `usage::tee` and every place that reads
+`ProviderConfig.api` as a single value — a larger change than this pass, and
+not undertaken here. `docs/providers.md` now says this out loud instead of
+leaving the second id to look like an accident.
+
 ## 2026-07-31 — `codex exec` too, rendered as `openai-chat`, with the verification gap recorded
 
 The same reasoning as the entry below, applied to a ChatGPT plan:

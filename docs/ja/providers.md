@@ -84,14 +84,27 @@ openrouter: {
   apiKey: "${OPENROUTER_API_KEY}",
   headers: { "X-Title": "llm-gateway" },   // 任意のアトリビューション
 },
-// 同じアップストリームを Anthropic プロトコルで — `claude-*` が ApiKind を
-// またがずにフォールバックできるようにする:
+// 同じアップストリーム・同じアカウントを Anthropic プロトコルで —
+// `claude-*` が ApiKind をまたがずにフォールバックできるようにする。
+// ルートに注意: `/api/v1` ではなく `/api`。`/v1/messages` はゲートウェイが
+// 自分で付け足すので、openai-chat 側の baseUrl をそのまま流用すると
+// `/api/v1/v1/messages` のように二重になってしまう。
 "openrouter-anthropic": {
-  baseUrl: "https://openrouter.ai/api/v1",
+  baseUrl: "https://openrouter.ai/api",
   api: "anthropic-messages",
   apiKey: "${OPENROUTER_API_KEY}",
 },
 ```
+
+一見、同じアカウントに 2 つの id があるのは冗長に見える。これは設計上の
+制約による: 1 つのプロバイダーエントリは 1 つのアップストリームを
+ちょうど 1 つのワイヤープロトコル(`api`)に結びつける — `route.model.fallbacks`
+がリクエストの途中でプロトコルをまたぐことが決してないようにするためだ
+(`src/config/mod.rs` 参照)。OpenRouter が `openai-chat` と
+`anthropic-messages` のどちらを受け付けるかは認証情報ではなく POST 先の
+パスで決まるので、同じキーを単純に 2 回登録している。`init` は Claude Code
+のフォールバックとして OpenRouter を選んだ場合にのみ `openrouter-anthropic`
+を追加する。
 
 モデル id は `/` を含みます(`anthropic/claude-sonnet-4.6`)。ルートの
 ターゲットは*最初の* `/` でのみ分割されるため、

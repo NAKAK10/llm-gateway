@@ -80,14 +80,26 @@ openrouter: {
   apiKey: "${OPENROUTER_API_KEY}",
   headers: { "X-Title": "llm-gateway" },   // optional attribution
 },
-// Same upstream, Anthropic wire protocol — lets `claude-*` fall back to it
-// without crossing ApiKinds:
+// Same upstream, same account, Anthropic wire protocol instead of
+// openai-chat — lets `claude-*` fall back to it without crossing ApiKinds.
+// Note the root: `/api`, not `/api/v1` — the gateway appends `/v1/messages`
+// itself, and reusing the `openai-chat` id's baseUrl here would double up to
+// `/api/v1/v1/messages`.
 "openrouter-anthropic": {
-  baseUrl: "https://openrouter.ai/api/v1",
+  baseUrl: "https://openrouter.ai/api",
   api: "anthropic-messages",
   apiKey: "${OPENROUTER_API_KEY}",
 },
 ```
+
+Two ids for one account looks redundant at a glance; it exists because a
+provider entry couples one upstream to exactly one wire protocol (`api`) —
+by design, so that `route.model.fallbacks` never has to cross protocols
+mid-request (see `src/config/mod.rs`). Whether OpenRouter itself takes an
+`openai-chat` or an `anthropic-messages` request depends on which path you
+POST to, not on the credential, so the same key is simply registered twice.
+`init` only adds `openrouter-anthropic` when you pick OpenRouter as a
+fallback for Claude Code.
 
 Model ids contain a `/` (`anthropic/claude-sonnet-4.6`); route targets split
 on the *first* `/` only, so `openrouter/anthropic/claude-sonnet-4.6` parses
