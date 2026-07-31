@@ -214,6 +214,128 @@ async fn choose_model(
     }
 }
 
+/// Model aliases the installed `claude` CLI currently understands, read out of
+/// its own `--help` text rather than hardcoded here.
+///
+/// There is no `/models` endpoint (or equivalent CLI command) a Claude
+/// Pro/Max subscription can be probed with — [`fetch_models`] needs an API
+/// key this transport does not have. But the `--model` option's own help
+/// text names a few current aliases as examples (Anthropic updates that text
+/// as new ones ship — a preview alias like `fable` shows up there before it
+/// would in any list this crate could maintain), which is the closest thing
+/// to a live source this wizard can read. See
+/// [`extract_claude_model_aliases`] for the parsing, split out so it can be
+/// tested without running the CLI. An empty result (missing CLI, or help
+/// text in a shape the parser does not recognise) tells the caller to fall
+/// back to a free-text prompt instead of showing an empty menu.
+fn claude_cli_model_aliases() -> Vec<String> {
+    let output = std::process::Command::new(crate::agent::claude_cli::PROGRAM)
+        .arg("--help")
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            extract_claude_model_aliases(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Pulls the alias examples out of `claude --help`'s `--model` option
+/// description, e.g.:
+///
+/// ```text
+/// --model <model>   Model for the current session. Provide an alias for the
+///                   latest model (e.g. 'fable', 'opus', or 'sonnet') or a
+///                   model's full name (e.g. 'claude-fable-5').
+/// ```
+///
+/// Only the *first* `(e.g. ...)` parenthetical is read: the second one is a
+/// full model name example, not an alias, and including it would put a
+/// non-alias entry in the menu. Any help text that does not match this shape
+/// (a different CLI version, or none installed) yields an empty `Vec`.
+fn extract_claude_model_aliases(help_text: &str) -> Vec<String> {
+    let Some(option_start) = help_text.find("--model <model>") else {
+        return Vec::new();
+    };
+    let rest = &help_text[option_start..];
+    // Bounded to this option's own description — the next option's line
+    // (two-space-indented `-`) or a generous cap, whichever comes first — so
+    // a later, unrelated parenthetical is never mistaken for this one's.
+    let window_end = rest[1..].find("\n  -").map_or(rest.len(), |i| i + 1);
+    let window = &rest[..window_end.min(rest.len())];
+
+    let Some(paren_start) = window.find("(e.g.") else {
+        return Vec::new();
+    };
+    let Some(paren_len) = window[paren_start..].find(')') else {
+        return Vec::new();
+    };
+    let parenthetical = &window[paren_start..paren_start + paren_len];
+
+    parenthetical
+        .split('\'')
+        .skip(1)
+        .step_by(2)
+        .map(|alias| alias.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|alias| !alias.is_empty())
+        .collect()
+}
+
+/// Ask which model backs one *subscription*-authenticated role's route.
+///
+/// A subscription CLI's model is generally not knowable from here (which
+/// models a ChatGPT plan allows cannot be probed at all — see
+/// [`KnownProvider::subscription_model`]), so most providers still resolve to
+/// that fixed value with no prompt. `claude` is the exception:
+/// [`claude_cli_model_aliases`] can read the CLI's currently supported
+/// aliases straight from its own help text, so a real choice is offered
+/// there instead, with a "custom" option for anything not in that list (the
+/// help text's examples are illustrative, not exhaustive) and the same
+/// free-text fallback as [`choose_model`] if the CLI could not be read.
+fn choose_subscription_model(role: AgentRole, provider: KnownProvider) -> Result<String> {
+    if provider.subscription_transport() != Some(crate::config::Transport::ClaudeCli) {
+        return Ok(provider.subscription_model().to_string());
+    }
+
+    let prompt = format!(
+        "Model for the `{}` role (via {}, subscription)",
+        role.label(),
+        provider.label()
+    );
+    let aliases = claude_cli_model_aliases();
+    if aliases.is_empty() {
+        cliclack::log::warning(format!(
+            "{}: could not read model aliases from `claude --help`; type one instead",
+            provider.label(),
+        ))?;
+        return Ok(cliclack::input(prompt)
+            .default_input(provider.subscription_model())
+            .interact()?);
+    }
+
+    const CUSTOM: &str = "\0custom";
+    let mut select = cliclack::select(prompt);
+    for alias in &aliases {
+        select = select.item(alias.clone(), alias.clone(), "");
+    }
+    select = select.item(CUSTOM.to_string(), "Custom (type a model id)", "");
+    if aliases.iter().any(|alias| alias == "sonnet") {
+        select = select.initial_value("sonnet".to_string());
+    }
+    let choice = select.interact()?;
+    if choice == CUSTOM {
+        Ok(cliclack::input(format!(
+            "Model for the `{}` role (via {})",
+            role.label(),
+            provider.label()
+        ))
+        .default_input(provider.subscription_model())
+        .interact()?)
+    } else {
+        Ok(choice)
+    }
+}
+
 pub async fn run() -> Result<()> {
     let config_path = paths::config_file();
     cliclack::intro("llm-gateway init")?;
@@ -375,11 +497,12 @@ pub async fn run() -> Result<()> {
             }
             let provider = role_provider_select.interact()?;
 
-            // A subscription CLI's model is not knowable (or, for Claude,
-            // fixed) from here — see `KnownProvider::subscription_model` —
-            // so there is nothing to fetch or ask for that case.
+            // A subscription CLI's model is not knowable from an API — there
+            // is no key to probe `/models` with — so this branch cannot
+            // reuse `choose_model`. `claude` is still asked for real, though:
+            // see `choose_subscription_model`.
             let model = if subscriptions.contains(&provider) {
-                provider.subscription_model().to_string()
+                choose_subscription_model(role, provider)?
             } else {
                 let key = resolve_key_for_fetch(provider, &providers, &discovered);
                 choose_model(role, provider, key.as_deref()).await?
@@ -1120,6 +1243,44 @@ fn provider_api_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A realistic excerpt of `claude --help`'s `--model` option, wrapped the
+    /// way a terminal actually wraps it — this is what
+    /// `extract_claude_model_aliases` has to parse, not a tidy one-liner.
+    const CLAUDE_HELP_MODEL_EXCERPT: &str = "\
+  --mcp-config <configs...>             Load MCP servers from JSON files or
+                                        strings (space-separated)
+  --model <model>                       Model for the current session. Provide
+                                        an alias for the latest model (e.g.
+                                        'fable', 'opus', or 'sonnet') or a
+                                        model's full name (e.g.
+                                        'claude-fable-5').
+  -n, --name <name>                     Set a display name for this session
+";
+
+    #[test]
+    fn extracts_aliases_from_the_models_own_help_text() {
+        let aliases = extract_claude_model_aliases(CLAUDE_HELP_MODEL_EXCERPT);
+        assert_eq!(aliases, vec!["fable", "opus", "sonnet"]);
+    }
+
+    #[test]
+    fn does_not_pick_up_the_full_name_examples_second_parenthetical() {
+        let aliases = extract_claude_model_aliases(CLAUDE_HELP_MODEL_EXCERPT);
+        assert!(!aliases.iter().any(|alias| alias == "claude-fable-5"));
+    }
+
+    #[test]
+    fn a_single_alias_still_parses_without_an_or_clause() {
+        let help = "--model <model>  Model for the session (e.g. 'opus').\n  -n, --name";
+        assert_eq!(extract_claude_model_aliases(help), vec!["opus"]);
+    }
+
+    #[test]
+    fn unrecognised_help_text_yields_no_aliases_rather_than_panicking() {
+        assert!(extract_claude_model_aliases("").is_empty());
+        assert!(extract_claude_model_aliases("--model <model> no parens here").is_empty());
+    }
 
     /// The scaffolded Copilot provider must be reachable from Claude Code,
     /// which means `openai-chat` plus the translation layer — the whole reason
