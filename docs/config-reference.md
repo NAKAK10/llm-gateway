@@ -105,7 +105,7 @@ need launcher-specific overrides.
 | `dir` | `"./logs"` | Relative to the config dir. |
 | `usage` | `true` | `usage-YYYY-MM.jsonl`, one line per proxied request (token-counting requests are not recorded). |
 | `debug` | `false` | `trace-YYYY-MM-DD.jsonl` with full routing decisions **including prompt text** (200-char truncation; `serve --debug-full` disables truncation). CLI `--debug` also enables this. |
-| `logging` | `false` | Console (stderr) diagnostics from `serve` — embedding-model preparation and per-attempt fallback outcomes. Off by default so a plain gateway process stays quiet; set to `true` to see them. Unrelated to the on-disk `usage`/`debug` logs above, and an explicit `RUST_LOG` still overrides it. |
+| `logging` | `false` | Console (stderr) diagnostics from `serve` — which route/provider was picked, embedding-model preparation, and per-attempt fallback outcomes. Off by default so a plain gateway process stays quiet; set to `true` to see them. Unrelated to the on-disk `usage`/`debug` logs above, and an explicit `RUST_LOG` still overrides it. |
 
 ## Record formats
 

@@ -315,10 +315,11 @@ fn warn_if_semantic_routes_are_unusable(_config: &Config) {
 ///
 /// Off by default (`verbose == false`, i.e. `config.logging.logging` unset):
 /// only `warn!`/`error!` reach the console, which hides the routine
-/// diagnostics — embedding-model preparation, per-attempt fallback outcomes —
-/// emitted at `info!` elsewhere in this crate. Setting `logging.logging` to
-/// `true` raises the default level to `info` so those show. An explicit
-/// `RUST_LOG` always wins over both, for whoever wants finer control.
+/// diagnostics — embedding-model preparation, which route/provider was
+/// picked, per-attempt fallback outcomes — emitted at `info!` elsewhere in
+/// this crate. Setting `logging.logging` to `true` raises the default level
+/// to `info` so those show. An explicit `RUST_LOG` always wins over both,
+/// for whoever wants finer control.
 fn init_tracing(verbose: bool) {
     use tracing_subscriber::EnvFilter;
     let default_level = if verbose { "info" } else { "warn" };

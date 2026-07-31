@@ -367,7 +367,7 @@ launch: {
 | `routes.<name>.model.fallbacks` | default と同じプロトコルのみ。最初のレスポンスバイト前に順番に試される。 |
 | `launch` | オプションの上級者用 escape hatch のみ: Claude/Codex/opencode の extra args、Codex の `wireApi`、opencode の `models` / `overrideProviders`。 |
 | `logging.debug` | `--debug` はユーザーテキストを 200 文字に切り詰め、`--debug-full` は全文を残す。プロンプトが平文でディスクに残るため、意図的に有効化すること。 |
-| `logging.logging` | デフォルトは無効。`true` にすると `serve` のコンソール診断ログ(embeddingモデルの準備、フォールバック各試行の結果)が stderr に出力される。明示的な `RUST_LOG` はこれより優先される。 |
+| `logging.logging` | デフォルトは無効。`true` にすると `serve` のコンソール診断ログ(どの route / provider が選ばれたか、embeddingモデルの準備、フォールバック各試行の結果)が stderr に出力される。明示的な `RUST_LOG` はこれより優先される。 |
 
 ## コマンド
 
