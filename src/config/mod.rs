@@ -145,6 +145,8 @@ pub enum Transport {
     Http,
     /// `claude -p`, driven as a subprocess.
     ClaudeCli,
+    /// `codex exec`, driven as a subprocess.
+    CodexCli,
 }
 
 impl Transport {
@@ -152,12 +154,33 @@ impl Transport {
         match self {
             Self::Http => "http",
             Self::ClaudeCli => "claude-cli",
+            Self::CodexCli => "codex-cli",
         }
     }
 
     /// Whether a `baseUrl` means anything for this transport.
     pub fn needs_base_url(self) -> bool {
         matches!(self, Self::Http)
+    }
+
+    /// Whether this transport runs a local agent CLI rather than making a
+    /// request.
+    pub fn is_agent_cli(self) -> bool {
+        matches!(self, Self::ClaudeCli | Self::CodexCli)
+    }
+
+    /// The protocol a transport's output is in. `None` for HTTP, where the
+    /// provider's `api` is whatever it says it is.
+    pub fn fixed_api(self) -> Option<ApiKind> {
+        match self {
+            Self::Http => None,
+            // The CLI emits Anthropic stream events verbatim.
+            Self::ClaudeCli => Some(ApiKind::AnthropicMessages),
+            // Codex emits its own event stream, which the gateway renders as
+            // `openai-chat` — the protocol the most clients can reach, and the
+            // one Claude Code can be translated into.
+            Self::CodexCli => Some(ApiKind::OpenaiChat),
+        }
     }
 }
 

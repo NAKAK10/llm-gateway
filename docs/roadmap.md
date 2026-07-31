@@ -74,8 +74,12 @@ so subscription auth can serve API-shaped traffic. OpenClaw's
 - [x] `transport: "claude-cli"` — `claude -p` as a provider, streaming and
       non-streaming, with the recursion guards and tool denial documented in
       gotchas.md. Verified end to end against a real subscription.
-- [ ] `codex exec` and `opencode run`, for the same reason on those
-      subscriptions.
+- [x] `transport: "codex-cli"` — `codex exec` as a provider, rendered as
+      `openai-chat` so every client can reach it. Plumbing and error paths
+      verified end to end; a *successful* generation could not be verified on
+      the machine at hand, where the ChatGPT account refuses every model id
+      tried (including its own configured default).
+- [ ] `opencode run`, for the same reason on that subscription.
 - [ ] tool passthrough. Today a request's `tools` are dropped, which is what
       makes this a generation upstream rather than an agent one; the CLI would
       need to accept a foreign tool schema and surface `tool_use` blocks for

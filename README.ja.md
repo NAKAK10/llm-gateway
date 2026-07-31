@@ -52,6 +52,7 @@ llm-gateway init            # 対話形式; ~/.config/llm-gateway/config.json �
 llm-gateway serve           # 127.0.0.1:4000 でゲートウェイを起動
 llm-gateway launch claude   # Claude Code をゲートウェイ経由で起動
 llm-gateway stats           # ルートごとの消費量を表示
+llm-gateway update          # 最新リリースへ更新
 ```
 
 ## サポートしているクライアント
@@ -208,25 +209,45 @@ routes: {
 ## サブスクリプションベースのプロバイダー
 
 サブスクリプションは API キーではありません。Claude Pro/Max プランが認証
-するのは *Claude Code* 自身であり、ゲートウェイがどんな認証情報を持って
-いても、そのプランを代理して Anthropic に話すことはできません。だから
-この一点に限り、ゲートウェイは認証情報を持たず、代わりにログイン済みの
-公式クライアントをそのまま実行します:
+するのは *Claude Code* 自身、ChatGPT プランが認証するのは *Codex* 自身で
+あり、ゲートウェイがどんな認証情報を持っていても、それらのプランを代理して
+どちらのプロバイダーにも話すことはできません。だからこれらの場合に限り、
+ゲートウェイは認証情報を持たず、代わりにログイン済みの公式クライアントを
+そのまま実行します。`llm-gateway init` はどちらが欲しいかを尋ねます:
+
+```
+Anthropic: how do you pay for it?
+  API key                    per-token billing; full API features
+  Subscription (via `claude`)  no key; generation only — your tools are not passed through
+```
+
+| transport | 実行するもの | 見え方 | 検証状況 |
+|---|---|---|---|
+| `claude-cli` | `claude -p` | `anthropic-messages` | 済み — ストリーミング、ツール拒否、end to end |
+| `codex-cli` | `codex exec` | `openai-chat` | 配線とエラー経路のみ検証済み; 詳細は後述 |
+
+サブスクリプションを選んでも API キーのプロバイダーが消えることはありません
+— プランは生成向き、キーはツールが要る何にでも向くので、設定は両方を持ち、
+route ごとに使い分けられます。
 
 ```json5
 providers: {
   // baseUrl も apiKey も無し: CLI 自身が認証する。
-  "claude-subscription": { api: "anthropic-messages", transport: "claude-cli" },
+  "anthropic-subscription": { api: "anthropic-messages", transport: "claude-cli" },
+  "openai-subscription": { api: "openai-chat", transport: "codex-cli" },
 },
 routes: {
-  "role-sub": { model: { default: "claude-subscription/sonnet" } },
+  "role-sub": { model: { default: "anthropic-subscription/sonnet" } },
+  // `default` は「CLI が設定されている通りのもの」を意味する — ChatGPT
+  // プランがどのモデルを許すかは、ここからは分からない。
+  "role-codex": { model: { default: "openai-subscription/default" } },
 }
 ```
 
 そこから先は他と変わらないただのプロバイダーです: route、フォールバック、
-`trace`、`stats` すべて動きます。`transport: "claude-cli"` が唯一異例な
-行で、バイナリがインストールされていれば `llm-gateway providers` は
-到達可能と報告します。
+`trace`、`stats` すべて動きます。`transport: "claude-cli"` / `"codex-cli"`
+だけが唯一異例な行で、対応するバイナリがインストールされていれば
+`llm-gateway providers` は到達可能と報告します。
 
 制限は CLI 由来であり、実在するものです:
 
@@ -240,6 +261,10 @@ routes: {
 - **呼び出しごとに ~5 秒のプロセス起動**があり、`temperature` /
   `top_p` / `stop_sequences` / `max_tokens` は破棄されます — CLI に
   対応するものがないためです。
+- **`codex-cli` はトークン単位でストリーミングできません。** Codex の
+  イベントはアイテム単位なので、回答は完成した状態で届きます —
+  ゲートウェイはそれでも整形されたストリームを発行しますが、一度に
+  まとめて届くだけです。`claude-cli` は正しくストリーミングします。
 - リクエストは **API の残高ではなく、あなたのサブスクリプション**の
   制限を消費します。
 
@@ -347,7 +372,16 @@ llm-gateway config check|show|gitignore
 llm-gateway stats [--by route|client|provider|model|day] [--since D] [--until D]
 llm-gateway trace [--tail] [--route R] [--client C]
 llm-gateway providers
+llm-gateway update [--check]
 ```
+
+`update` は GitHub に最新リリースを問い合わせ、このビルドが古ければ
+インストール方法に応じたアップグレードを実行します — Homebrew なら
+`brew upgrade`、`cargo install` なら `cargo install --force`(`semantic`
+feature は維持)。自分のバイナリを上書きすることはありません: それをすると
+パッケージマネージャーが古いバージョンがまだあると思い込むためです。手で
+配置したバイナリの場合はリリースのリンクを表示します。`--check` は何も
+変更せず報告だけします。
 
 ## フォールバックがやること(と、やらないこと)
 

@@ -55,6 +55,33 @@ pub fn run() -> Result<()> {
         .initial_values(vec![KnownProvider::Anthropic, KnownProvider::OpenRouter])
         .interact()?;
 
+    // Asked before the storage question, because a subscription answer means
+    // there is no key to store for that provider at all.
+    let mut subscriptions: Vec<KnownProvider> = Vec::new();
+    for provider in &selected_providers {
+        let Some(cli) = provider.subscription_cli() else {
+            continue;
+        };
+        if !command_exists(cli) {
+            continue;
+        }
+        let choice = cliclack::select(format!("{}: how do you pay for it?", provider.label()))
+            .item(
+                AuthChoice::ApiKey,
+                "API key",
+                "per-token billing; full API features",
+            )
+            .item(
+                AuthChoice::Subscription,
+                format!("Subscription (via `{cli}`)"),
+                "no key; generation only — your tools are not passed through",
+            )
+            .interact()?;
+        if choice == AuthChoice::Subscription {
+            subscriptions.push(*provider);
+        }
+    }
+
     let storage = cliclack::select("How should API keys be stored?")
         .item(
             KeyStorage::Literal,
@@ -85,7 +112,10 @@ pub fn run() -> Result<()> {
     for provider in &selected_providers {
         let already_discovered = discovered
             .iter()
-            .any(|(candidate, _)| candidate == provider);
+            .any(|(candidate, _)| candidate == provider)
+            // …nor for one whose credential is a subscription: there is nothing
+            // to type.
+            || subscriptions.contains(provider);
         let literal =
             if storage == KeyStorage::Literal && provider.needs_key() && !already_discovered {
                 // The hint matters: a subscription user has no API key to paste
@@ -111,7 +141,7 @@ pub fn run() -> Result<()> {
         providers.push((*provider, literal));
     }
 
-    let mut config = build_config(&clients, &providers, storage);
+    let mut config = build_config_with_auth(&clients, &providers, storage, &subscriptions);
     for provider in &env_fallback {
         let key = SecretRef::new(format!("${{{}}}", provider.env_var()));
         if let Some(provider_config) = config.providers.get_mut(provider.id()) {
@@ -133,6 +163,15 @@ pub fn run() -> Result<()> {
             "{}: reading the token from `{}` on each request, so a refresh needs no config change",
             provider.label(),
             key.masked(),
+        ))?;
+    }
+
+    for provider in &subscriptions {
+        cliclack::log::info(format!(
+            "{}: `{}` route added, run by `{}` on your subscription — no key needed",
+            provider.label(),
+            "role-subscription",
+            provider.subscription_cli().unwrap_or("its CLI"),
         ))?;
     }
 
@@ -385,6 +424,62 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+impl KnownProvider {
+    /// The agent-CLI transport that serves this provider's *subscription*, if
+    /// one exists.
+    ///
+    /// This is what makes "API key or subscription?" a real question rather than
+    /// a preference: a Claude Pro/Max or ChatGPT plan authenticates its own CLI,
+    /// so the gateway runs that CLI instead of holding a credential. See
+    /// [`crate::agent`].
+    pub fn subscription_transport(self) -> Option<crate::config::Transport> {
+        use crate::config::Transport;
+        match self {
+            Self::Anthropic => Some(Transport::ClaudeCli),
+            Self::OpenAi => Some(Transport::CodexCli),
+            _ => None,
+        }
+    }
+
+    /// The CLI a subscription choice depends on, for the wizard to check before
+    /// offering it.
+    pub fn subscription_cli(self) -> Option<&'static str> {
+        match self.subscription_transport()? {
+            crate::config::Transport::ClaudeCli => Some(crate::agent::claude_cli::PROGRAM),
+            crate::config::Transport::CodexCli => Some(crate::agent::codex_cli::PROGRAM),
+            crate::config::Transport::Http => None,
+        }
+    }
+
+    /// Provider id used when the subscription option is chosen. Distinct from
+    /// [`Self::id`] so a config can hold both — a plan for interactive routes and
+    /// an API key for the ones that need tools.
+    pub fn subscription_id(self) -> String {
+        format!("{}-subscription", self.id())
+    }
+
+    /// A model reference the subscription CLI accepts, for the scaffolded route.
+    pub fn subscription_model(self) -> &'static str {
+        match self {
+            // The CLI resolves aliases, so this keeps working across releases.
+            Self::Anthropic => "sonnet",
+            // Codex has no alias, and which models a ChatGPT plan allows is
+            // not knowable here — `default` means "whatever the CLI is
+            // configured to use".
+            _ => "default",
+        }
+    }
+}
+
+/// Which credential a provider should use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthChoice {
+    /// An API key, in whatever form [`KeyStorage`] says.
+    ApiKey,
+    /// The provider's own CLI, authenticated by a subscription.
+    Subscription,
+}
+
 /// How keys should be referenced in the generated file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyStorage {
@@ -403,6 +498,23 @@ pub fn build_config(
     clients: &[Client],
     providers: &[(KnownProvider, Option<String>)],
     storage: KeyStorage,
+) -> crate::config::Config {
+    build_config_with_auth(clients, providers, storage, &[])
+}
+
+/// [`build_config`], plus the providers whose credential is a subscription
+/// rather than a key.
+///
+/// A subscription choice adds a *second* provider id (`<id>-subscription`) with
+/// an agent-CLI transport, and a `role-subscription` route pointing at it. It
+/// does not remove the API-key provider: the two are good at different things —
+/// a plan for generation, a key for anything that needs tools — and a config
+/// that holds both lets a route choose per request.
+pub fn build_config_with_auth(
+    clients: &[Client],
+    providers: &[(KnownProvider, Option<String>)],
+    storage: KeyStorage,
+    subscriptions: &[KnownProvider],
 ) -> crate::config::Config {
     use crate::config::{ApiKind, Config, ModelConfig, ProviderConfig, RouteConfig};
 
@@ -505,6 +617,45 @@ pub fn build_config(
         );
     }
 
+    for provider in subscriptions {
+        let Some(transport) = provider.subscription_transport() else {
+            continue;
+        };
+        let Some(api) = transport.fixed_api() else {
+            continue;
+        };
+        let id = provider.subscription_id();
+        config.providers.insert(
+            id.clone(),
+            ProviderConfig {
+                // Both are meaningless for a CLI transport: it has no URL, and
+                // it authenticates itself.
+                base_url: String::new(),
+                api,
+                api_key: None,
+                headers: Default::default(),
+                inject_usage: true,
+                transport,
+                agent_args: Vec::new(),
+            },
+        );
+        config.routes.insert(
+            "role-subscription".to_string(),
+            RouteConfig {
+                description: Some(crate::config::Description(
+                    "Runs on a subscription via the provider's own CLI. Generation only — \
+                     the caller's tools are not passed through."
+                        .to_string(),
+                )),
+                model: ModelConfig {
+                    default: format!("{id}/{}", provider.subscription_model()),
+                    fallbacks: Vec::new(),
+                },
+                ..Default::default()
+            },
+        );
+    }
+
     for client in clients {
         match client {
             Client::Claude => config.launch.claude = Some(launch_claude()),
@@ -569,6 +720,99 @@ mod tests {
     /// The scaffolded Copilot provider must be reachable from Claude Code,
     /// which means `openai-chat` plus the translation layer — the whole reason
     /// it can be offered at all.
+    #[test]
+    fn a_subscription_choice_scaffolds_a_cli_transport_and_a_route() {
+        let config = build_config_with_auth(
+            &[Client::Claude],
+            &[(KnownProvider::Anthropic, None)],
+            KeyStorage::Keychain,
+            &[KnownProvider::Anthropic],
+        );
+
+        let provider = config
+            .providers
+            .get("anthropic-subscription")
+            .expect("subscription provider");
+        assert_eq!(provider.transport, crate::config::Transport::ClaudeCli);
+        assert_eq!(provider.api, crate::config::ApiKind::AnthropicMessages);
+        // Neither means anything for a CLI transport, and validation warns when
+        // they are set.
+        assert!(provider.base_url.is_empty());
+        assert!(provider.api_key.is_none());
+
+        let route = config.routes.get("role-subscription").expect("route");
+        assert_eq!(route.model.default, "anthropic-subscription/sonnet");
+        assert!(route.description.is_some(), "the route explains its limits");
+    }
+
+    /// The API-key provider stays: a plan is good for generation and a key is
+    /// good for tools, so a config that holds both lets routes choose.
+    #[test]
+    fn choosing_a_subscription_does_not_remove_the_api_key_provider() {
+        let config = build_config_with_auth(
+            &[Client::Claude],
+            &[(KnownProvider::Anthropic, None)],
+            KeyStorage::Keychain,
+            &[KnownProvider::Anthropic],
+        );
+        assert!(config.providers.contains_key("anthropic"));
+        assert!(config.providers.contains_key("anthropic-subscription"));
+    }
+
+    #[test]
+    fn a_codex_subscription_route_defers_the_model_to_the_cli() {
+        // Which models a ChatGPT plan allows is not knowable from here.
+        let config = build_config_with_auth(
+            &[Client::Codex],
+            &[(KnownProvider::OpenAi, None)],
+            KeyStorage::Keychain,
+            &[KnownProvider::OpenAi],
+        );
+        let provider = &config.providers["openai-subscription"];
+        assert_eq!(provider.transport, crate::config::Transport::CodexCli);
+        // Codex renders as openai-chat, which is what the most clients reach.
+        assert_eq!(provider.api, crate::config::ApiKind::OpenaiChat);
+        assert_eq!(
+            config.routes["role-subscription"].model.default,
+            "openai-subscription/default"
+        );
+    }
+
+    #[test]
+    fn only_providers_with_a_subscription_cli_offer_the_choice() {
+        assert!(KnownProvider::Anthropic.subscription_transport().is_some());
+        assert!(KnownProvider::OpenAi.subscription_transport().is_some());
+        for provider in KnownProvider::ALL {
+            if matches!(provider, KnownProvider::Anthropic | KnownProvider::OpenAi) {
+                continue;
+            }
+            assert!(
+                provider.subscription_transport().is_none(),
+                "{} has no subscription CLI",
+                provider.id()
+            );
+        }
+    }
+
+    #[test]
+    fn no_subscriptions_generates_exactly_what_it_used_to() {
+        let with = build_config_with_auth(
+            &[Client::Claude],
+            &[(KnownProvider::Anthropic, None)],
+            KeyStorage::Keychain,
+            &[],
+        );
+        let without = build_config(
+            &[Client::Claude],
+            &[(KnownProvider::Anthropic, None)],
+            KeyStorage::Keychain,
+        );
+        assert_eq!(
+            serde_json::to_string(&with).unwrap(),
+            serde_json::to_string(&without).unwrap()
+        );
+    }
+
     #[test]
     fn github_copilot_is_scaffolded_as_an_openai_chat_provider() {
         let config = build_config(

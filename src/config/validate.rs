@@ -149,20 +149,21 @@ pub fn validate(config: &Config, config_path: &Path) -> ValidationReport {
                     ));
                 }
             }
-            Transport::ClaudeCli => {
-                // The CLI's output *is* Anthropic Messages; declaring anything
-                // else would make the gateway translate away from the shape it
-                // already has, or refuse the request outright.
-                if provider.api != ApiKind::AnthropicMessages {
-                    report.error(format!(
-                        "provider `{provider_id}`: transport `claude-cli` speaks {} — set `api: \"anthropic-messages\"` (found {})",
-                        ApiKind::AnthropicMessages,
-                        provider.api
-                    ));
+            transport if transport.is_agent_cli() => {
+                // An agent CLI's output shape is fixed by the CLI, not chosen:
+                // declaring something else would make the gateway translate
+                // away from the shape it already has, or refuse the request.
+                if let Some(expected) = transport.fixed_api() {
+                    if provider.api != expected {
+                        report.error(format!(
+                            "provider `{provider_id}`: transport `{transport}` speaks {expected} — set `api: \"{expected}\"` (found {})",
+                            provider.api
+                        ));
+                    }
                 }
                 if !provider.base_url.trim().is_empty() {
                     report.warn(format!(
-                        "provider `{provider_id}`: baseUrl is ignored by the `claude-cli` transport (it runs a local process)"
+                        "provider `{provider_id}`: baseUrl is ignored by the `{transport}` transport (it runs a local process)"
                     ));
                 }
                 // Worth saying out loud: a user who set a key here believes it
@@ -170,10 +171,12 @@ pub fn validate(config: &Config, config_path: &Path) -> ValidationReport {
                 // its own subscription login.
                 if provider.api_key.is_some() {
                     report.warn(format!(
-                        "provider `{provider_id}`: apiKey is ignored by the `claude-cli` transport; the CLI uses its own login"
+                        "provider `{provider_id}`: apiKey is ignored by the `{transport}` transport; the CLI uses its own login"
                     ));
                 }
             }
+            // Unreachable: `is_agent_cli` covers every non-HTTP transport.
+            Transport::ClaudeCli | Transport::CodexCli => {}
         }
     }
 

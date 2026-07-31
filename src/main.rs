@@ -52,6 +52,16 @@ enum Command {
 
     /// Check that every configured provider is reachable.
     Providers,
+
+    /// Check for a newer release and install it.
+    Update(UpdateArgs),
+}
+
+#[derive(Args)]
+struct UpdateArgs {
+    /// Report what is available without installing anything.
+    #[arg(long)]
+    check: bool,
 }
 
 #[derive(Args)]
@@ -198,6 +208,13 @@ fn run() -> Result<()> {
         Command::Providers => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(cli::providers::run())
+        }
+
+        Command::Update(args) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(cli::update::run(cli::update::Options {
+                check_only: args.check,
+            }))
         }
     }
 }

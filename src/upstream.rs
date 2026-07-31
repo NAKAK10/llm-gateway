@@ -117,7 +117,7 @@ pub async fn send_with_fallback(
         // A local agent CLI: no credential to resolve (the child authenticates
         // itself), no URL, and no first-byte deadline — process startup is the
         // latency, and it is bounded by the binary existing.
-        if target.transport == crate::config::Transport::ClaudeCli {
+        if target.transport.is_agent_cli() {
             match crate::agent::spawn(target, &attempt.payload, attempt.streaming).await {
                 Ok(spawned) => {
                     attempts.push(TraceAttempt {
