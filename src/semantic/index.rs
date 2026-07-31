@@ -32,15 +32,20 @@ pub const CLASSIFICATION_THRESHOLD: f32 = 0.45;
 
 /// One candidate available to the classifier.
 ///
-/// `vector` is already L2-normalized (see `Embedder::load`) and `api` is the
-/// protocol the candidate's own `model.default` speaks, so a candidate the
-/// request cannot reach — not the same protocol, and not translatable to it —
-/// can be excluded before scoring rather than after.
+/// `vector` is already L2-normalized (see `Embedder::load`) and `apis` holds
+/// the protocol the candidate's `model.default` speaks plus one for every
+/// resolvable `model.fallbacks` entry (default first) — a candidate the
+/// request cannot reach through *any* of them — not the same protocol, and
+/// not translatable to it — can be excluded before scoring rather than after.
+/// A route's fallbacks may speak a different protocol than its default now
+/// (cross-protocol fallback), so a candidate whose default the request
+/// cannot reach directly may still be reachable through one of its
+/// fallbacks.
 #[derive(Debug, Clone)]
 struct Candidate {
     name: String,
     vector: Vec<f32>,
-    api: ApiKind,
+    apis: Vec<ApiKind>,
 }
 
 /// Vector table over every classifiable route, built from a single
@@ -89,14 +94,25 @@ fn embed_candidate(
     let description = candidate_route.description.as_ref()?;
     let text = description.text().ok()?;
     let vector = embedder.embed(&text)?;
-    let api = ModelRef::parse(&candidate_route.model.default)
+
+    // The default must resolve — same requirement as before — but a
+    // fallback that does not (which should be unreachable on a validated
+    // config) is simply left out of `apis` rather than sinking the whole
+    // candidate.
+    let default_api = ModelRef::parse(&candidate_route.model.default)
         .and_then(|model_ref| config.provider(&model_ref.provider))
         .map(|provider| provider.api)?;
+    let mut apis = vec![default_api];
+    apis.extend(candidate_route.model.fallbacks.iter().filter_map(|raw| {
+        ModelRef::parse(raw)
+            .and_then(|model_ref| config.provider(&model_ref.provider))
+            .map(|provider| provider.api)
+    }));
 
     Some(Candidate {
         name: candidate_name.to_string(),
         vector,
-        api,
+        apis,
     })
 }
 
@@ -143,13 +159,17 @@ struct Scored {
 /// those the request can actually reach, and decide whether the winner clears
 /// `threshold`.
 ///
-/// Reachable means one of two things: the candidate speaks `expected_api`
-/// itself, or the gateway can translate from `expected_api` to what it speaks
-/// (see [`crate::translate::Translation`]). The second case is what lets an
-/// a request reached over `/v1/messages` pick an `openai-chat` candidate —
-/// "send the cheap requests to local Ollama" is the whole point of semantic
-/// routing for a Claude Code user, and before translation existed that
-/// candidate could never win.
+/// Reachable means: at least one of the candidate's `apis` (its `model.default`
+/// plus any `model.fallbacks`) speaks `expected_api` itself, or the gateway can
+/// translate from `expected_api` to it (see [`crate::translate::Translation`]).
+/// The translation case is what lets a request reached over `/v1/messages` pick
+/// an `openai-chat` candidate — "send the cheap requests to local Ollama" is the
+/// whole point of semantic routing for a Claude Code user, and before
+/// translation existed that candidate could never win. Checking every entry in
+/// `apis`, not just the default's, is what lets a route whose default the
+/// request cannot reach still win through a reachable fallback — the same
+/// cross-protocol fallback `crate::server::proxy` honors once a route is
+/// picked.
 ///
 /// `all` is returned regardless of whether anything clears `threshold` —
 /// unlike an early `None`, this keeps sub-threshold candidates visible to a
@@ -163,8 +183,10 @@ fn rank(vector: &[f32], candidates: &[Candidate], expected_api: ApiKind, thresho
     let mut scored: Vec<(String, f32)> = candidates
         .iter()
         .filter(|c| {
-            c.api == expected_api
-                || crate::translate::Translation::select(expected_api, c.api).is_some()
+            c.apis.iter().any(|&api| {
+                api == expected_api
+                    || crate::translate::Translation::select(expected_api, api).is_some()
+            })
         })
         .map(|c| (c.name.clone(), dot(vector, &c.vector)))
         .collect();
@@ -317,7 +339,7 @@ mod tests {
         Candidate {
             name: name.to_string(),
             vector,
-            api,
+            apis: vec![api],
         }
     }
 
@@ -419,6 +441,27 @@ mod tests {
 
         let (route, _) = scored.winner.expect("a translatable candidate can win");
         assert_eq!(route, "ollama-local");
+    }
+
+    /// The case cross-protocol fallback adds: a route whose *default* speaks a
+    /// protocol nothing translates to or from (`openai-responses`), but whose
+    /// *fallback* speaks one that does. Before `apis` covered fallbacks too,
+    /// this candidate was unreachable and could never win; now the fallback's
+    /// reachability is enough.
+    #[test]
+    fn rank_keeps_a_candidate_reachable_only_through_its_fallback() {
+        let mixed = Candidate {
+            name: "mixed".to_string(),
+            vector: vec![1.0, 0.0],
+            apis: vec![ApiKind::OpenaiResponses, ApiKind::OpenaiChat],
+        };
+
+        let scored = rank(&[1.0, 0.0], &[mixed], ApiKind::AnthropicMessages, 0.5);
+
+        let (route, _) = scored
+            .winner
+            .expect("reachable through the fallback's protocol");
+        assert_eq!(route, "mixed");
     }
 
     #[test]

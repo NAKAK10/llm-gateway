@@ -113,9 +113,11 @@ fn default_port() -> u16 {
 
 /// Wire protocol a provider speaks.
 ///
-/// Fallback targets must stay within one variant for now — crossing variants
-/// needs request/response translation, which is deliberately out of scope until
-/// the passthrough path is proven. `validate` enforces this.
+/// A route's default and fallbacks may speak different variants — crossing
+/// variants needs request/response translation (see `crate::translate`), and
+/// `crate::server::proxy` decides per target whether that translation exists,
+/// dropping the targets it does not reach rather than rejecting the route at
+/// config-validation time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApiKind {

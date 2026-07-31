@@ -68,6 +68,44 @@ async fn spawn_mock() -> (SocketAddr, MockState) {
     (addr, state)
 }
 
+/// A plain `anthropic-messages` upstream — no translation involved, so the
+/// cross-protocol fallback test can assert this response reaches the client
+/// byte-for-byte in its own protocol.
+async fn mock_anthropic_messages(
+    State(state): State<MockState>,
+    body: axum::body::Bytes,
+) -> Response {
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    state.requests.lock().unwrap().push(parsed);
+
+    let body = serde_json::json!({
+        "id": "msg_e2e",
+        "type": "message",
+        "role": "assistant",
+        "model": "haiku-mock",
+        "content": [{"type": "text", "text": "pong from haiku"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 5, "output_tokens": 3},
+    });
+    let mut response = Response::new(Body::from(body.to_string()));
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+async fn spawn_anthropic_mock() -> (SocketAddr, MockState) {
+    let state = MockState::default();
+    let app = Router::new()
+        .route("/v1/messages", post(mock_anthropic_messages))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (addr, state)
+}
+
 /// How the `openai-chat` mock answers, so one handler covers the streaming,
 /// non-streaming and error shapes a translated route has to deal with.
 #[derive(Clone, Copy)]
@@ -145,7 +183,7 @@ fn translated_config(upstream: SocketAddr) -> Config {
     let mut config = Config::default();
     config.providers.insert(
         "chat-mock".into(),
-        provider(&format!("http://{upstream}/v1")),
+        provider(&format!("http://{upstream}/v1"), ApiKind::OpenaiChat),
     );
     config.routes.insert(
         llm_gateway::config::DEFAULT_ROUTE.into(),
@@ -154,10 +192,10 @@ fn translated_config(upstream: SocketAddr) -> Config {
     config
 }
 
-fn provider(base: &str) -> ProviderConfig {
+fn provider(base: &str, api: ApiKind) -> ProviderConfig {
     ProviderConfig {
         base_url: base.to_string(),
-        api: ApiKind::OpenaiChat,
+        api,
         api_key: Some(SecretRef::new("mock-key")),
         headers: Default::default(),
         inject_usage: true,
@@ -209,9 +247,10 @@ async fn streamed_response_reaches_the_client_byte_for_byte() {
     let (upstream, mock) = spawn_mock().await;
 
     let mut config = Config::default();
-    config
-        .providers
-        .insert("mock".into(), provider(&format!("http://{upstream}/v1")));
+    config.providers.insert(
+        "mock".into(),
+        provider(&format!("http://{upstream}/v1"), ApiKind::OpenaiChat),
+    );
     config.routes.insert(
         llm_gateway::config::DEFAULT_ROUTE.into(),
         route_to("mock/real-model", &[]),
@@ -259,12 +298,14 @@ async fn fallback_reaches_the_second_target_when_the_first_is_dead() {
 
     let mut config = Config::default();
     // Port 9 (discard) refuses connections — a permanently dead upstream.
-    config
-        .providers
-        .insert("dead".into(), provider("http://127.0.0.1:9/v1"));
-    config
-        .providers
-        .insert("mock".into(), provider(&format!("http://{upstream}/v1")));
+    config.providers.insert(
+        "dead".into(),
+        provider("http://127.0.0.1:9/v1", ApiKind::OpenaiChat),
+    );
+    config.providers.insert(
+        "mock".into(),
+        provider(&format!("http://{upstream}/v1"), ApiKind::OpenaiChat),
+    );
     config.routes.insert(
         llm_gateway::config::DEFAULT_ROUTE.into(),
         route_to("dead/primary-model", &["mock/backup-model"]),
@@ -287,6 +328,61 @@ async fn fallback_reaches_the_second_target_when_the_first_is_dead() {
     assert_eq!(seen[0]["model"], "backup-model");
 }
 
+/// The point of cross-protocol fallback: a route's default and fallback no
+/// longer have to speak the same protocol. Here the client is Claude Code
+/// (`anthropic-messages`), the dead default is `openai-chat`, and the
+/// fallback that actually answers is `anthropic-messages` — its response
+/// must reach the client byte-for-byte, with no translation applied, exactly
+/// like any other same-protocol passthrough.
+#[tokio::test]
+async fn cross_protocol_fallback_reaches_an_anthropic_fallback_untranslated() {
+    let (anthropic_upstream, anthropic_mock) = spawn_anthropic_mock().await;
+
+    let mut config = Config::default();
+    // Port 9 (discard) refuses connections — a permanently dead upstream.
+    config.providers.insert(
+        "dead-chat".into(),
+        provider("http://127.0.0.1:9/v1", ApiKind::OpenaiChat),
+    );
+    config.providers.insert(
+        "haiku".into(),
+        provider(
+            &format!("http://{anthropic_upstream}"),
+            ApiKind::AnthropicMessages,
+        ),
+    );
+    config.routes.insert(
+        llm_gateway::config::DEFAULT_ROUTE.into(),
+        route_to("dead-chat/primary-model", &["haiku/haiku-mock"]),
+    );
+
+    let addr = spawn_gateway(config, None).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "default",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "ping"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    // Untranslated: the fallback's own Anthropic-shaped body, verbatim.
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["content"][0]["text"], "pong from haiku");
+
+    let seen = anthropic_mock.requests.lock().unwrap();
+    assert_eq!(
+        seen.len(),
+        1,
+        "the anthropic-messages fallback must have been called once"
+    );
+    assert_eq!(seen[0]["model"], "haiku-mock");
+}
+
 #[tokio::test]
 async fn unknown_model_is_a_404_with_a_hint() {
     let addr = spawn_gateway(Config::default(), None).await;
@@ -307,9 +403,10 @@ async fn unknown_model_is_a_404_with_a_hint() {
 #[tokio::test]
 async fn models_endpoint_lists_routes_but_not_wildcards() {
     let mut config = Config::default();
-    config
-        .providers
-        .insert("mock".into(), provider("http://127.0.0.1:9/v1"));
+    config.providers.insert(
+        "mock".into(),
+        provider("http://127.0.0.1:9/v1", ApiKind::OpenaiChat),
+    );
     config
         .routes
         .insert("role-a".into(), route_to("mock/m", &[]));
@@ -373,9 +470,10 @@ async fn inbound_key_gates_every_v1_route_but_not_health() {
 #[tokio::test]
 async fn protocol_mismatch_is_a_400_not_a_confusing_upstream_error() {
     let mut config = Config::default();
-    config
-        .providers
-        .insert("mock".into(), provider("http://127.0.0.1:9/v1")); // openai-chat
+    config.providers.insert(
+        "mock".into(),
+        provider("http://127.0.0.1:9/v1", ApiKind::OpenaiChat),
+    );
     config.routes.insert(
         llm_gateway::config::DEFAULT_ROUTE.into(),
         route_to("mock/m", &[]),

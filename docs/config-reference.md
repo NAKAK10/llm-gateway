@@ -58,7 +58,7 @@ including the reserved `default` route.
 | `title` | *(none)* | Display only. |
 | `description` | *(required on non-wildcard routes)* | Inline text, or a path when it starts with `./` `../` `/` `~/` (relative paths resolve against the config dir). This is the classification corpus: every request's newest user text (walking back through history when the newest scores below the threshold — see "Classification behavior") is embedded and compared against every non-wildcard route's `description`. Write it as "when should this route win?" |
 | `model.default` | *(required)* | `"<provider>/<model>"`, split on the **first** `/` only — `openrouter/anthropic/claude-x` and `ollama-cloud/glm:cloud` both parse. `*` in the model part expands only when a wildcard route is actually resolved. |
-| `model.fallbacks` | `[]` | Tried in order, only before the first response byte, only on connect failure / timeout / 408 / 429 / 5xx. Must use providers with the same `api` as the default. |
+| `model.fallbacks` | `[]` | Tried in order, only before the first response byte, only on connect failure / timeout / 408 / 429 / 5xx. May use a provider with a different `api` than the default — reachability from the client's protocol is checked per attempt at request time (see [Cross-protocol routing](../README.md#cross-protocol-routing)), not by `config check`; a target the client's protocol cannot reach is skipped. |
 
 ### Reserved route: `default`
 
@@ -137,4 +137,6 @@ back to `default`.
 
 `resolved.translation` is present only when the request crossed protocols
 (e.g. `"anthropic-messages->openai-chat"`); its absence means the response was
-forwarded byte-for-byte.
+forwarded byte-for-byte. It always describes the target in `resolved` — i.e.
+whichever attempt actually served the response — not the route's `default`,
+since a fallback may sit on the other side of a protocol boundary.

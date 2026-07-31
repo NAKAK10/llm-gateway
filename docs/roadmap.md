@@ -8,7 +8,8 @@
       reserved `default` route on miss
 - [x] `semantic` as a default cargo feature; `--no-default-features` as the
       small build that always routes to `default`
-- [x] fallback before first byte, same-protocol only
+- [x] fallback before first byte, targets may cross protocols (reachability
+      from the client's protocol is checked per attempt at request time)
 - [x] usage observation without touching the response (`tee`)
 - [x] `usage-*.jsonl` / `trace-*.jsonl` + `stats` / `trace` CLIs
 - [x] hot reload that never takes a bad config live
@@ -62,10 +63,12 @@
       translation at all** — full fidelity, byte-for-byte — but it requires
       Bearer, and an `anthropic-messages` provider currently authenticates with
       `x-api-key`.
-- [ ] cross-protocol *fallbacks* within one route. Still refused by validation:
-      `proxy` derives one translation per route from its first target, so a
-      mixed target list would make the answer depend on which upstream
-      responded. Needs per-target translation selection first.
+- [x] cross-protocol *fallbacks* within one route. `proxy` now selects
+      translation per target (attempt) instead of once per route from the
+      first target, so a route's `default` and `fallbacks` may each speak a
+      different protocol; a target the client's protocol cannot reach is
+      skipped at request time rather than refused by config validation. See
+      decisions.md.
 
 ## Phase 4 — agent CLIs as backends
 

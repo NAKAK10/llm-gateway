@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::config::{ApiKind, Config, ModelRef, Transport, DEFAULT_ROUTE};
+use crate::config::{Config, ModelRef, Transport, DEFAULT_ROUTE};
 use crate::error::ValidationReport;
 
 /// Check a parsed config and return everything that is wrong with it.
@@ -15,12 +15,6 @@ use crate::error::ValidationReport;
 /// Errors (block startup):
 /// - a route references a provider that is not defined
 /// - a `model` string is not `"<provider>/<model>"`
-/// - a route's fallbacks do not all speak the same `ApiKind` as its default.
-///   Cross-protocol translation exists for the *client*-to-provider direction
-///   (`crate::translate`), but a route's own target list is still required to be
-///   uniform: `proxy` picks one translation per route from its first target, and
-///   a mixed list would make which translation ran depend on which upstream
-///   happened to answer
 /// - a route name contains `:` or `/`
 /// - a non-wildcard route has no `description` — every request is classified
 ///   against every route's description now, so a route without one can never
@@ -77,7 +71,7 @@ pub fn validate(config: &Config, config_path: &Path) -> ValidationReport {
             None => {}
         }
 
-        let default_api = resolve_target(
+        resolve_target(
             config,
             route_name,
             "default",
@@ -87,7 +81,7 @@ pub fn validate(config: &Config, config_path: &Path) -> ValidationReport {
         );
 
         for fallback in &route.model.fallbacks {
-            let fallback_api = resolve_target(
+            resolve_target(
                 config,
                 route_name,
                 "fallback",
@@ -95,14 +89,6 @@ pub fn validate(config: &Config, config_path: &Path) -> ValidationReport {
                 &mut used_providers,
                 &mut report,
             );
-
-            if let (Some(default_api), Some(fallback_api)) = (default_api, fallback_api) {
-                if default_api != fallback_api {
-                    report.error(format!(
-                        "route `{route_name}`: fallback `{fallback}` speaks {fallback_api} but default speaks {default_api}; cross-protocol fallback is not supported"
-                    ));
-                }
-            }
         }
     }
 
@@ -176,8 +162,11 @@ pub fn validate(config: &Config, config_path: &Path) -> ValidationReport {
 /// Parse and resolve one model reference (`default` or a `fallback`).
 ///
 /// Records an error for a malformed string or an undefined provider; on
-/// success, marks the provider as used and returns its `ApiKind` so the caller
-/// can cross-check protocols between a route's default and its fallbacks.
+/// success, marks the provider as used. A route's default and fallbacks may
+/// speak different protocols now — `crate::server::proxy` decides per target
+/// whether a translation exists (see `crate::translate::Translation`),
+/// filtering out unreachable targets at request time rather than rejecting
+/// the route here.
 fn resolve_target<'a>(
     config: &'a Config,
     route_name: &str,
@@ -185,14 +174,14 @@ fn resolve_target<'a>(
     raw: &str,
     used_providers: &mut BTreeSet<&'a str>,
     report: &mut ValidationReport,
-) -> Option<ApiKind> {
+) {
     let model_ref = match ModelRef::parse(raw) {
         Some(m) => m,
         None => {
             report.error(format!(
                 "route `{route_name}`: {role} model `{raw}` is not \"<provider>/<model>\""
             ));
-            return None;
+            return;
         }
     };
 
@@ -202,20 +191,18 @@ fn resolve_target<'a>(
              decided purely by content classification now, so a wildcard model can no longer be \
              resolved to anything meaningful — use an explicit \"<provider>/<model>\" instead"
         ));
-        return None;
+        return;
     }
 
     match config.providers.get_key_value(model_ref.provider.as_str()) {
-        Some((id, provider)) => {
+        Some((id, _provider)) => {
             used_providers.insert(id.as_str());
-            Some(provider.api)
         }
         None => {
             report.error(format!(
                 "route `{route_name}`: {role} `{raw}` references undefined provider `{}`",
                 model_ref.provider
             ));
-            None
         }
     }
 }
@@ -250,7 +237,7 @@ fn readable_by_others(_path: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::{
-        Description, ModelConfig, ProviderConfig, RouteConfig, SecretRef, ServerConfig,
+        ApiKind, Description, ModelConfig, ProviderConfig, RouteConfig, SecretRef, ServerConfig,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -374,8 +361,12 @@ mod tests {
         );
     }
 
+    /// The point of the cross-protocol fallback change: a route's default and
+    /// its fallbacks no longer have to speak the same protocol.
+    /// `crate::server::proxy` is what decides per target whether a request
+    /// can actually reach it.
     #[test]
-    fn cross_protocol_fallback_is_rejected() {
+    fn cross_protocol_fallback_is_accepted() {
         let mut c = minimal_config();
         c.providers
             .insert("openai".into(), provider(ApiKind::OpenaiResponses));
@@ -385,15 +376,7 @@ mod tests {
         );
 
         let report = validate(&c, &nonexistent_path());
-        assert!(!report.is_ok());
-        assert!(
-            report
-                .errors
-                .iter()
-                .any(|e| e.contains("cross-protocol fallback is not supported")),
-            "{:?}",
-            report.errors
-        );
+        assert!(report.is_ok(), "{:?}", report.errors);
     }
 
     #[test]

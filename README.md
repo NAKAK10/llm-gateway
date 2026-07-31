@@ -169,28 +169,46 @@ routes: {
 ## Cross-protocol routing
 
 Claude Code only ever speaks Anthropic Messages, and almost every cheap or
-local provider only speaks OpenAI Chat. So one direction is translated:
+local provider only speaks OpenAI Chat. So one direction is translated — and
+the decision is made **per target, not per route**: a route's `default` and
+each of its `fallbacks` can each speak a different protocol, and every attempt
+is translated or passed through independently based on what the client sent.
 
-| client speaks | provider speaks | result |
+| client speaks | target speaks | result |
 |---|---|---|
 | `anthropic-messages` | `openai-chat` | translated — Claude Code reaches Ollama, Groq, DeepSeek, Gemini, Mistral, Together, Sakana AI, PLaMo |
 | same on both sides | — | byte-for-byte passthrough, as before |
-| anything else | — | `400` with an explanation, as before |
+| anything else | — | that target is skipped before the request is sent; `400` only if every target in the route turns out unreachable this way |
+
+Because reachability is decided per target, a route can freely mix a default
+and fallbacks that speak different protocols — for example, a free
+`openai-chat` model as the default with a subscription `anthropic-messages`
+provider as fallback:
 
 ```json5
 providers: {
   "ollama-local": { baseUrl: "http://127.0.0.1:11434/v1", api: "openai-chat" },
+  "anthropic-subscription": { api: "anthropic-messages", transport: "claude-cli" },
 },
 routes: {
   // Reached when classification decides this request fits the route.
   "role-cheap": {
     description: "Short chores: summarizing, formatting, commit messages",
-    model: { default: "ollama-local/qwen3:8b" },
+    model: {
+      default: "ollama-local/qwen3:8b",
+      fallbacks: ["anthropic-subscription/claude-sonnet-4-6"],
+    },
   },
 }
 ```
 
-What a translated route costs you:
+The reverse direction — an `openai-chat` client reaching an
+`anthropic-messages` target — has no translation implemented yet, so that
+target is always skipped for such a client regardless of where it sits in
+`fallbacks` (see `docs/roadmap.md`).
+
+What a translated *attempt* costs you (this is about whichever target
+actually serves the request, not necessarily the route's `default`):
 
 - **Prompt caching, `thinking` blocks, citations and Anthropic server-side
   tools** (`web_search`, `bash`, `text_editor`) are dropped — the target
@@ -202,7 +220,8 @@ What a translated route costs you:
 - **The response is rebuilt**, so it is not byte-identical to what the provider
   sent. `llm-gateway trace` marks those requests with
   `xlat=anthropic-messages->openai-chat` — always check that field first when
-  output looks subtly off.
+  output looks subtly off. On a fallback, `resolved.translation` reflects the
+  target that actually answered, not the route's `default`.
 - Usage accounting is *not* affected: token counts are read from the upstream
   bytes before translation.
 
@@ -342,7 +361,7 @@ For everyday use the schema is just **four top-level keys**:
       description: "General-purpose assistant tasks, coding, and tool use via OpenAI's models.",
       model: {
         default: "openai/gpt-5.1",                     // split on the FIRST `/` only
-        fallbacks: ["openrouter/openai/gpt-5.1"],      // same protocol as default; tried before first byte
+        fallbacks: ["openrouter/openai/gpt-5.1"],      // may cross protocols; tried before first byte
       },
     },
   },
@@ -370,11 +389,11 @@ launch: {
 |---|---|
 | `server.apiKey` | resolved once at startup; changing it needs a restart. Required when `host` is not loopback — one key guards every provider credential. |
 | `providers.<id>.apiKey` | resolved per request attempt, so env/Keychain/`command:` rotation is picked up live. |
-| `providers.<id>.api` | fallbacks may not cross protocols; `config check` enforces it. |
+| `providers.<id>.api` | a route's `default` and `fallbacks` may each use a different `api`; reachability from the client's protocol is checked per attempt at request time, not by `config check`. |
 | `routes.default` | required. It is the reserved catch-all when no route clears the classification threshold, and it also participates as a normal candidate. |
 | `routes.<name>.description` | required on every non-wildcard route. Inline text or `./`/`../`/`/`/`~/` path; this is the classification corpus. |
 | `routes.<name>.model.default` | `"<provider>/<model>"`, split on the first `/` only. |
-| `routes.<name>.model.fallbacks` | same protocol as the default; tried in order before the first response byte. |
+| `routes.<name>.model.fallbacks` | may use a different `api` than the default; tried in order before the first response byte, skipping any target the client's protocol cannot reach (see [Cross-protocol routing](#cross-protocol-routing)). |
 | `launch` | optional advanced escape hatch only: Claude/Codex/opencode extra args, Codex `wireApi`, opencode `models`/`overrideProviders`. |
 | `logging.debug` | `--debug` truncates user text to 200 chars; `--debug-full` keeps everything. Plain-text prompts on disk — enable deliberately. |
 | `logging.logging` | off by default; set `true` to print `serve`'s console diagnostics (which route/provider was picked, embedding-model prep, per-attempt fallback outcomes) to stderr. An explicit `RUST_LOG` still wins. |
@@ -417,9 +436,12 @@ attached) answers as if you said `No` rather than guessing.
 
 Fallback triggers on connection failure, header timeout, 408, 429 and 5xx —
 **before the first response byte**. Once a response starts streaming it is
-committed; a mid-generation failure cannot switch providers. Same-protocol
-fallbacks only; for cross-vendor redundancy on the Anthropic protocol, point a
-fallback at OpenRouter's Anthropic-compatible endpoint.
+committed; a mid-generation failure cannot switch providers. A fallback may
+speak a different protocol than the default (see [Cross-protocol
+routing](#cross-protocol-routing)); a target the client's protocol cannot
+reach is skipped rather than tried. For cross-vendor redundancy on the
+Anthropic protocol without any translation involved, point a fallback at
+OpenRouter's Anthropic-compatible endpoint.
 
 ## Manual client setup
 

@@ -14,6 +14,14 @@
 //! the request is rebuilt and the response is rebuilt on the way back (see
 //! `crate::translate`). Both paths live side by side in this file, and which
 //! one a request took is recorded in the trace log's `resolved.translation`.
+//!
+//! Translation is decided **per target**, not once for the whole route: a
+//! route's default and its fallbacks may speak different protocols
+//! (cross-protocol fallback), so which translation — if any — applies can
+//! differ from one attempt to the next. [`filter_reachable_targets`] drops
+//! whatever the client's protocol cannot reach (directly or through
+//! translation) before `upstream::send_with_fallback` ever sees the target
+//! list.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -73,6 +81,23 @@ fn auto_route_requested(headers: &HeaderMap) -> bool {
         Some(v) => !matches!(v.trim(), "0" | "false" | "no" | "off"),
         None => true,
     }
+}
+
+/// Drop every target `expected_api` cannot reach, in place: reachable means
+/// the target speaks `expected_api` itself, or `Translation::select` finds a
+/// translation from `expected_api` to it. Returns how many targets were
+/// dropped, so the caller can log the outcome or bail out with a 400 when the
+/// count equals the resolution's original length.
+///
+/// A route's default and its fallbacks may each speak a different protocol
+/// now (cross-protocol fallback), so this runs once per request, over the
+/// whole target list, rather than the old single check against `targets[0]`.
+fn filter_reachable_targets(resolution: &mut route::Resolution, expected_api: ApiKind) -> usize {
+    let before = resolution.targets.len();
+    resolution
+        .targets
+        .retain(|t| t.api == expected_api || Translation::select(expected_api, t.api).is_some());
+    before - resolution.targets.len()
 }
 
 /// Proxy one request. `endpoint` must be one of the four POST paths.
@@ -148,35 +173,47 @@ pub async fn proxy(
         }
     };
 
-    // Protocol check. Validation guarantees a route's targets all share one
-    // ApiKind, so checking the first is checking them all.
+    // Reachability filter. A route's default and its fallbacks may each speak
+    // a different protocol now (cross-protocol fallback), so which targets
+    // this request can even reach is decided per target rather than once for
+    // the whole route.
     //
     // Equal protocols are the passthrough path and stay byte-for-byte. When
     // they differ, a translation may exist — that is what lets Claude Code
-    // (`anthropic-messages` only) reach the many `openai-chat` providers. Only
-    // a direction nothing can translate is still refused, because forwarding a
-    // request in the wrong protocol produces a confusing upstream 400 instead
-    // of an explanation.
-    let route_api = resolution.targets[0].api;
-    let translation = if route_api == expected_api {
-        None
-    } else {
-        match Translation::select(expected_api, route_api) {
-            Some(translation) => Some(translation),
-            None => {
-                return error_response(
-                    http::StatusCode::BAD_REQUEST,
-                    &format!(
-                        "route `{}` is backed by {route_api} providers but {endpoint} speaks \
-                         {expected_api}, and this gateway cannot translate {expected_api} → \
-                         {route_api}; use the matching endpoint or point the route at a \
-                         {expected_api} provider",
-                        resolution.route_name,
-                    ),
-                );
-            }
-        }
-    };
+    // (`anthropic-messages` only) reach the many `openai-chat` providers. A
+    // target neither the same protocol nor translatable to reaches is dropped
+    // here, before `upstream::send_with_fallback` ever sees it, because
+    // forwarding a request in the wrong protocol produces a confusing
+    // upstream 400 instead of an explanation.
+    let target_apis: Vec<ApiKind> = resolution.targets.iter().map(|t| t.api).collect();
+    let total_targets = resolution.targets.len();
+    let unreachable = filter_reachable_targets(&mut resolution, expected_api);
+    if unreachable > 0 {
+        tracing::debug!(
+            route = %resolution.route_name,
+            client_api = %expected_api,
+            unreachable,
+            total = total_targets,
+            "route `{}`: {unreachable} of {total_targets} target(s) unreachable from {expected_api} \
+             (no translation), skipped",
+            resolution.route_name,
+        );
+    }
+    if resolution.targets.is_empty() {
+        let spoken: std::collections::BTreeSet<&str> =
+            target_apis.iter().map(|a| a.as_str()).collect();
+        return error_response(
+            http::StatusCode::BAD_REQUEST,
+            &format!(
+                "route `{}` is backed by providers speaking {} but {endpoint} speaks \
+                 {expected_api}, and this gateway cannot translate {expected_api} → any of them; \
+                 use the matching endpoint or point the route (default or a fallback) at a \
+                 {expected_api} provider",
+                resolution.route_name,
+                spoken.into_iter().collect::<Vec<_>>().join(", "),
+            ),
+        );
+    }
 
     let streaming = payload
         .get("stream")
@@ -195,13 +232,16 @@ pub async fn proxy(
 
     // Token counting is a question, not a generation: the answer is
     // model-specific, so falling back to a different provider would return a
-    // confidently wrong number. First target only.
+    // confidently wrong number. First (already filtered-to-reachable) target
+    // only.
     if count_tokens {
+        let first_target = &resolution.targets[0];
+        let first_translation = Translation::select(expected_api, first_target.api);
         // Neither an untranslatable pair nor an agent CLI can answer this
         // question: `openai-chat` has no counting endpoint, and `claude -p`
         // would run a whole generation to answer it.
-        let cannot_forward = translation.is_some_and(|t| !t.can_forward_count_tokens())
-            || resolution.targets[0].transport == crate::config::Transport::ClaudeCli;
+        let cannot_forward = first_translation.is_some_and(|t| !t.can_forward_count_tokens())
+            || first_target.transport == crate::config::Transport::ClaudeCli;
         if cannot_forward {
             return count_tokens_locally(
                 &state,
@@ -210,7 +250,7 @@ pub async fn proxy(
                 &requested_model,
                 trace_input,
                 &resolution,
-                translation,
+                expected_api,
                 &payload,
                 semantic_attempt,
             );
@@ -222,10 +262,18 @@ pub async fn proxy(
     let mut attempts = Vec::new();
 
     let build = |target: &route::Target| -> crate::error::Result<Attempt> {
-        // One translation for the whole resolution, not one per target:
-        // validation guarantees every target of a route speaks the same
-        // protocol, so the pair decided above holds for each attempt.
-        let mut request = match translation {
+        // Translation is decided per target, not once for the whole
+        // resolution: a route's default and its fallbacks may speak
+        // different protocols now. `resolution.targets` was already filtered
+        // to reachable-only, so `None` here means "same protocol,
+        // passthrough" — never "unreachable".
+        //
+        // A `claude-cli` fallback that stays `anthropic-messages` gets this
+        // same untranslated (already Anthropic-shaped) body handed straight
+        // to `crate::agent::spawn`, which expects `messages`/`system` as the
+        // client sent them.
+        let target_translation = Translation::select(expected_api, target.api);
+        let mut request = match target_translation {
             Some(translation) => translation.request(&payload),
             None => payload.clone(),
         };
@@ -287,7 +335,7 @@ pub async fn proxy(
                         &requested_model,
                         input,
                         &resolution,
-                        intended_resolved(&resolution, translation),
+                        intended_resolved(&resolution, expected_api),
                         attempts,
                         None,
                         semantic_attempt,
@@ -328,6 +376,11 @@ pub async fn proxy(
 
     let status = accepted.status;
     let upstream_headers = accepted.headers.clone();
+
+    // Which target actually answered decides the translation, not which one
+    // was first: a cross-protocol fallback may have answered instead of the
+    // default, and its own protocol is what `Translation::select` needs here.
+    let translation = Translation::select(expected_api, accepted.api);
 
     // Everything the report closure needs, captured before the stream starts.
     let recorder: Arc<Recorder> = state.recorder.clone();
@@ -451,7 +504,7 @@ fn count_tokens_locally(
     requested_model: &str,
     trace_input: Option<TraceInput>,
     resolution: &route::Resolution,
-    translation: Option<Translation>,
+    expected_api: ApiKind,
     payload: &serde_json::Value,
     semantic_attempt: SemanticAttempt,
 ) -> Response {
@@ -465,7 +518,7 @@ fn count_tokens_locally(
             requested_model,
             input,
             resolution,
-            intended_resolved(resolution, translation),
+            intended_resolved(resolution, expected_api),
             vec![crate::record::trace_log::TraceAttempt {
                 n: 1,
                 target: target.to_string(),
@@ -484,12 +537,12 @@ fn count_tokens_locally(
 }
 
 /// The `resolved` block for a request no upstream ever answered — the first
-/// target is the one that would have served it, so that is what gets recorded.
-fn intended_resolved(
-    resolution: &route::Resolution,
-    translation: Option<Translation>,
-) -> TraceResolved {
+/// (already filtered-to-reachable) target is the one that would have served
+/// it, so that is what gets recorded; its translation is derived the same
+/// way every other target's is, from its own protocol and the client's.
+fn intended_resolved(resolution: &route::Resolution, expected_api: ApiKind) -> TraceResolved {
     let target = &resolution.targets[0];
+    let translation = Translation::select(expected_api, target.api);
     TraceResolved {
         provider: target.model_ref.provider.clone(),
         model: target.model_ref.model.clone(),
@@ -936,6 +989,80 @@ fn has_image(api: ApiKind, messages: Option<&serde_json::Value>) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn test_target(api: ApiKind) -> route::Target {
+        route::Target {
+            model_ref: crate::config::ModelRef {
+                provider: "p".to_string(),
+                model: "m".to_string(),
+            },
+            api,
+            transport: Default::default(),
+            agent_args: Vec::new(),
+            base_url: "https://example.test".to_string(),
+            api_key: None,
+            headers: Vec::new(),
+            inject_usage: true,
+        }
+    }
+
+    fn test_resolution(targets: Vec<route::Target>) -> route::Resolution {
+        route::Resolution {
+            route_name: "r".to_string(),
+            kind: route::MatchKind::Exact,
+            targets,
+        }
+    }
+
+    /// The Claude Code shape from the config that motivated this change: an
+    /// `anthropic-messages` client can reach both an `openai-chat` default
+    /// (through translation) and an `anthropic-messages` fallback (directly),
+    /// so neither is dropped.
+    #[test]
+    fn filter_reachable_targets_keeps_both_when_each_is_reachable_a_different_way() {
+        let mut res = test_resolution(vec![
+            test_target(ApiKind::OpenaiChat),
+            test_target(ApiKind::AnthropicMessages),
+        ]);
+
+        let dropped = filter_reachable_targets(&mut res, ApiKind::AnthropicMessages);
+
+        assert_eq!(dropped, 0);
+        assert_eq!(res.targets.len(), 2);
+    }
+
+    /// The reverse client: `openai-chat` has no translation back to
+    /// `anthropic-messages`, so the fallback is unreachable and dropped while
+    /// the same-protocol default survives.
+    #[test]
+    fn filter_reachable_targets_drops_the_untranslatable_fallback() {
+        let mut res = test_resolution(vec![
+            test_target(ApiKind::OpenaiChat),
+            test_target(ApiKind::AnthropicMessages),
+        ]);
+
+        let dropped = filter_reachable_targets(&mut res, ApiKind::OpenaiChat);
+
+        assert_eq!(dropped, 1);
+        assert_eq!(res.targets.len(), 1);
+        assert_eq!(res.targets[0].api, ApiKind::OpenaiChat);
+    }
+
+    /// Every target unreachable: the caller is expected to treat `dropped`
+    /// equal to the original length as "refuse the request", not to forward
+    /// to nothing.
+    #[test]
+    fn filter_reachable_targets_can_drop_every_target() {
+        let mut res = test_resolution(vec![
+            test_target(ApiKind::OpenaiChat),
+            test_target(ApiKind::AnthropicMessages),
+        ]);
+
+        let dropped = filter_reachable_targets(&mut res, ApiKind::OpenaiResponses);
+
+        assert_eq!(dropped, 2);
+        assert!(res.targets.is_empty());
+    }
 
     #[test]
     fn anthropic_input_summary() {
