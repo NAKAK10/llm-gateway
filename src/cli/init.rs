@@ -504,8 +504,7 @@ pub async fn run() -> Result<()> {
                 } else {
                     ""
                 };
-                role_provider_select =
-                    role_provider_select.item(*provider, provider.label(), hint);
+                role_provider_select = role_provider_select.item(*provider, provider.label(), hint);
             }
             let provider = role_provider_select.interact()?;
 
@@ -989,15 +988,11 @@ impl AgentRole {
                 "Operating a web browser to interact with pages: clicking, filling forms, and \
                  navigating sites on the user's behalf."
             }
-            Self::Implementer => {
-                "Writing or editing code to implement a feature or fix a bug."
-            }
+            Self::Implementer => "Writing or editing code to implement a feature or fix a bug.",
             Self::Reviewer => {
                 "Reviewing a diff or pull request for bugs, security issues, and logic errors."
             }
-            Self::Tester => {
-                "Writing or running tests, and diagnosing test failures."
-            }
+            Self::Tester => "Writing or running tests, and diagnosing test failures.",
         }
     }
 
