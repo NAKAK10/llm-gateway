@@ -133,6 +133,14 @@ the route of the last instruction that classified confidently, because
 classification walks back through the conversation's own history. Claude's
 `/model` UI does **not** force this route.
 
+One thing worth knowing if you write descriptions that could plausibly match
+Claude Code's own harness text: Claude Code injects a `<system-reminder>`
+block (project `CLAUDE.md` and the like) into the first user message of every
+session, and that block is stripped out of the classification input before
+any comparison happens — so a description will not keep winning on the
+strength of that boilerplate just because the walk-back reached all the way
+back to message one.
+
 What you give up on such a route is listed in the README
 ([Cross-protocol routing](../../README.md#cross-protocol-routing)); the short
 version is prompt caching, thinking blocks, Anthropic server-side tools, and an

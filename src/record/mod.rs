@@ -239,6 +239,8 @@ mod tests {
                 score: None,
                 threshold: None,
                 embed_ms: None,
+                decided_by_text: None,
+                walk: None,
             },
             resolved: trace_log::TraceResolved {
                 provider: "anthropic".to_string(),
