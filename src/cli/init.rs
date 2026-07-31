@@ -240,16 +240,33 @@ async fn choose_model(
 /// tested without running the CLI. An empty result (missing CLI, or help
 /// text in a shape the parser does not recognise) tells the caller to fall
 /// back to a free-text prompt instead of showing an empty menu.
+///
+/// The help text's examples are illustrative rather than exhaustive, and
+/// Anthropic has trimmed `haiku` from them even though it remains a working
+/// alias (`claude --model haiku` still resolves) — it is stitched back in
+/// here so the cheapest tier stays selectable without waiting on Anthropic
+/// to re-add it to the example list.
 fn claude_cli_model_aliases() -> Vec<String> {
     let output = std::process::Command::new(crate::agent::claude_cli::PROGRAM)
         .arg("--help")
         .output();
-    match output {
+    let aliases = match output {
         Ok(output) if output.status.success() => {
             extract_claude_model_aliases(&String::from_utf8_lossy(&output.stdout))
         }
         _ => Vec::new(),
+    };
+    with_haiku_restored(aliases)
+}
+
+/// Appends `haiku` to a non-empty alias list if the help text's parse did
+/// not already surface it. Split out from [`claude_cli_model_aliases`] so
+/// this can be tested without shelling out to the real CLI.
+fn with_haiku_restored(mut aliases: Vec<String>) -> Vec<String> {
+    if !aliases.is_empty() && !aliases.iter().any(|alias| alias == "haiku") {
+        aliases.push("haiku".to_string());
     }
+    aliases
 }
 
 /// Pulls the alias examples out of `claude --help`'s `--model` option
@@ -1269,6 +1286,33 @@ mod tests {
     fn extracts_aliases_from_the_models_own_help_text() {
         let aliases = extract_claude_model_aliases(CLAUDE_HELP_MODEL_EXCERPT);
         assert_eq!(aliases, vec!["fable", "opus", "sonnet"]);
+    }
+
+    /// `extract_claude_model_aliases` only reflects what `--help` prints, so
+    /// `haiku` reappearing is exercised on [`with_haiku_restored`] instead —
+    /// this test just documents that the raw parse still omits it, the gap
+    /// the wrapper fills in.
+    #[test]
+    fn the_raw_help_text_parse_no_longer_lists_haiku() {
+        let aliases = extract_claude_model_aliases(CLAUDE_HELP_MODEL_EXCERPT);
+        assert!(!aliases.iter().any(|alias| alias == "haiku"));
+    }
+
+    #[test]
+    fn restores_haiku_when_the_help_text_omitted_it() {
+        let aliases = with_haiku_restored(vec!["fable".to_string(), "opus".to_string()]);
+        assert_eq!(aliases, vec!["fable", "opus", "haiku"]);
+    }
+
+    #[test]
+    fn does_not_duplicate_haiku_if_help_text_already_lists_it() {
+        let aliases = with_haiku_restored(vec!["opus".to_string(), "haiku".to_string()]);
+        assert_eq!(aliases, vec!["opus", "haiku"]);
+    }
+
+    #[test]
+    fn leaves_an_empty_alias_list_empty() {
+        assert!(with_haiku_restored(Vec::new()).is_empty());
     }
 
     #[test]
