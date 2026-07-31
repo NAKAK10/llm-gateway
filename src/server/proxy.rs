@@ -148,7 +148,12 @@ pub async fn proxy(
     // model-specific, so falling back to a different provider would return a
     // confidently wrong number. First target only.
     if count_tokens {
-        if let Some(translation) = translation.filter(|t| !t.can_forward_count_tokens()) {
+        // Neither an untranslatable pair nor an agent CLI can answer this
+        // question: `openai-chat` has no counting endpoint, and `claude -p`
+        // would run a whole generation to answer it.
+        let cannot_forward = translation.is_some_and(|t| !t.can_forward_count_tokens())
+            || resolution.targets[0].transport == crate::config::Transport::ClaudeCli;
+        if cannot_forward {
             return count_tokens_locally(
                 &state,
                 &client,
@@ -190,8 +195,10 @@ pub async fn proxy(
 
         Ok(Attempt {
             body: serde_json::to_vec(&request)?,
+            payload: request,
             headers: passthrough::upstream_headers(&headers, &target.headers),
             count_tokens,
+            streaming,
         })
     };
 
@@ -235,9 +242,8 @@ pub async fn proxy(
             }
         };
 
-    let status = http::StatusCode::from_u16(accepted.response.status().as_u16())
-        .unwrap_or(http::StatusCode::BAD_GATEWAY);
-    let upstream_headers = convert_headers(accepted.response.headers());
+    let status = accepted.status;
+    let upstream_headers = accepted.headers.clone();
 
     // Everything the report closure needs, captured before the stream starts.
     let recorder: Arc<Recorder> = state.recorder.clone();
@@ -308,12 +314,7 @@ pub async fn proxy(
     // Usage is observed on the *upstream* bytes, in the upstream's protocol,
     // before any translation — which is what keeps token accounting correct on
     // a translated route (`usage::parse` never sees a rebuilt body).
-    let observed = tee::observe(
-        accepted.response.bytes_stream(),
-        accepted.api,
-        streaming,
-        report,
-    );
+    let observed = tee::observe(accepted.body, accepted.api, streaming, report);
 
     match translation {
         // The passthrough path: nothing at all between the upstream stream and
@@ -366,7 +367,7 @@ fn count_tokens_locally(
     requested_model: &str,
     trace_input: Option<TraceInput>,
     resolution: &route::Resolution,
-    translation: Translation,
+    translation: Option<Translation>,
     payload: &serde_json::Value,
     semantic_attempt: Option<SemanticAttempt>,
 ) -> Response {
@@ -380,7 +381,7 @@ fn count_tokens_locally(
             requested_model,
             input,
             resolution,
-            intended_resolved(resolution, Some(translation)),
+            intended_resolved(resolution, translation),
             vec![crate::record::trace_log::TraceAttempt {
                 n: 1,
                 target: target.to_string(),
@@ -595,12 +596,6 @@ fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| String::from("1970-01-01T00:00:00Z"))
-}
-
-/// reqwest and axum currently agree on `http` 1.x header types, but going
-/// through an explicit copy keeps that an implementation detail.
-fn convert_headers(headers: &http::HeaderMap) -> http::HeaderMap {
-    headers.clone()
 }
 
 /// Best-effort summary of the request for the trace log.
@@ -918,6 +913,8 @@ mod tests {
                 api_key: Some(SecretRef::new("k")),
                 headers: Default::default(),
                 inject_usage: true,
+                transport: Default::default(),
+                agent_args: Vec::new(),
             },
         );
         config.routes.insert(

@@ -37,6 +37,63 @@ Claude Code が解決した id をそのまま転送するため、Anthropic が
 - トークンをファイルに書きたくない場合は、`"apiKeyHelper"` にトークンを
   出力するスクリプトを指定してください。
 
+## 「API キーではなく Claude のサブスクリプションを持っている」場合
+
+モードは 3 つあり、起動ごとに選ぶことになります。
+
+| 実行するもの | 認証するのは | 得られるもの |
+|---|---|---|
+| `claude` | Claude Code 自身(サブスクリプションのログイン) | 自分のプランで Anthropic のモデル。ゲートウェイは関与しないので、ルーティング・フォールバック・集計はなし |
+| `llm-gateway launch claude` | ゲートウェイ(プロバイダーの認証情報) | 設定した全プロバイダー、ルーティング、フォールバック、コスト集計 |
+| 同じコマンドを `claude-cli` route で | **ローカルの `claude` バイナリ**(サブスクリプションのログイン) | ゲートウェイ*経由*で自分のプランを使う — ルーティングと集計込み、CLI が運べない分だけ差し引かれる |
+
+3 つ目は「自分のサブスクリプションを使いたいが、ゲートウェイも使いたい」への
+答えです。Claude Pro/Max のプランは Claude Code のための認証情報であって
+API キーではないので、ゲートウェイはそれを上流に提示できません — ですが、
+ログイン済みの公式クライアントを実行することはできます:
+
+```json5
+providers: {
+  // baseUrl も apiKey も無し: CLI 自身が認証する。
+  "claude-subscription": { api: "anthropic-messages", transport: "claude-cli" },
+},
+routes: {
+  "role-sub": { model: { default: "claude-subscription/sonnet" } },
+}
+```
+
+```sh
+llm-gateway launch claude --model role-sub
+```
+
+この route ができないのは、**あなたの**ツールを実行することです: `claude -p`
+が持つのは Claude Code 自身のツールであり、リクエストに含まれるツールでは
+ありません。ゲートウェイはそれらすべてを拒否する(`--allowedTools ""`)ので、
+プロバイダー呼び出しがあなたのファイルに触れることはできません。つまり
+これは agent ループではなく、生成を一段上流で行っているだけです — 書く・
+要約するといった `role-*` route には良いが、あなたのエディタセッションが
+走る route には向きません。残りは `docs/ja/gotchas.md` に一覧があります
+(マルチターンのフラット化、呼び出しごとの ~5 秒のプロセス起動、サンプリング
+パラメータの破棄)。
+
+代わりに**フル API 忠実度でゲートウェイ経由の Claude モデル**に届きたいなら
+— ツール、マルチターン、API 定義どおりのストリーミング込みで — API
+アクセスを売っているプロバイダーから買うことになります:
+
+- **OpenRouter** — `openrouter-anthropic/anthropic/*`。Anthropic のワイヤー
+  プロトコルなので変換なし(`init` はこれを `claude-*` ルートのフォールバック
+  として雛形に書きます)。
+- **GitHub Copilot** — 公式の API を持つサブスクリプションなので、Copilot の
+  プランはゲートウェイのトラフィックを実際に処理できます。`docs/ja/providers.md`
+  を参照。モデルは Copilot の設定で有効化しておく必要があります。
+
+`init` で Anthropic のキーを空のままにするのは問題なく、壊れ方も予測可能です:
+参照は `${ANTHROPIC_API_KEY}` のまま残り、認証情報が解決できないターゲットは
+リクエストを失敗させるのではなく**次のフォールバックに読み飛ばされます**
+(`llm-gateway trace` に `key_unresolved` として出ます)。`init` が Anthropic +
+OpenRouter 構成で書き出す設定なら、変数を設定するまで Claude Code の
+トラフィックは OpenRouter に着地します。
+
 ## Claude Code を Anthropic 以外のプロバイダーへルーティングする
 
 Claude Code は Anthropic Messages しか話しませんが、ゲートウェイは

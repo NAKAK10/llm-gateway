@@ -160,6 +160,8 @@ fn provider(base: &str) -> ProviderConfig {
         api_key: Some(SecretRef::new("mock-key")),
         headers: Default::default(),
         inject_usage: true,
+        transport: Default::default(),
+        agent_args: Vec::new(),
     }
 }
 

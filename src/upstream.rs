@@ -46,16 +46,38 @@ pub fn client() -> Result<reqwest::Client> {
 pub struct Attempt {
     /// Request body with `model` already rewritten for this target.
     pub body: Vec<u8>,
+    /// The same body, still parsed. An HTTP target sends the bytes; an agent CLI
+    /// needs the fields (`messages`, `system`), and re-parsing what we just
+    /// serialised would be silly.
+    pub payload: serde_json::Value,
     /// Headers copied from the inbound request, minus hop-by-hop ones, plus
     /// provider extras. Auth is added here, per target, at send time.
     pub headers: http::HeaderMap,
     /// Route to `/v1/messages/count_tokens` instead of `/v1/messages`.
     pub count_tokens: bool,
+    /// Whether the client asked for a stream. HTTP forwards the flag inside the
+    /// body; an agent CLI needs it as a command-line decision.
+    pub streaming: bool,
 }
+
+/// A response body on its way to the client.
+///
+/// Boxed so an HTTP response and a subprocess's output can be held by the same
+/// field. The item type keeps `reqwest::Error` even for a local body — a
+/// process-backed upstream simply never produces one, and reporting its failures
+/// as an error *body* (which the client can read) beats a stream error (which it
+/// cannot). That choice is what lets `usage::tee`, `translate::adapter` and
+/// `server::passthrough` stay exactly as they were.
+pub type BodyStream = std::pin::Pin<
+    Box<dyn futures_util::Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>> + Send>,
+>;
 
 /// A successful (or final) upstream response, not yet forwarded.
 pub struct Accepted {
-    pub response: reqwest::Response,
+    pub status: http::StatusCode,
+    /// Upstream response headers, already copied out.
+    pub headers: http::HeaderMap,
+    pub body: BodyStream,
     /// 1-based index into the resolution's target list.
     pub attempt: u32,
     pub target_provider: String,
@@ -91,6 +113,48 @@ pub async fn send_with_fallback(
         let started = Instant::now();
 
         let attempt = build(target)?;
+
+        // A local agent CLI: no credential to resolve (the child authenticates
+        // itself), no URL, and no first-byte deadline — process startup is the
+        // latency, and it is bounded by the binary existing.
+        if target.transport == crate::config::Transport::ClaudeCli {
+            match crate::agent::spawn(target, &attempt.payload, attempt.streaming).await {
+                Ok(spawned) => {
+                    attempts.push(TraceAttempt {
+                        n,
+                        target: target.to_string(),
+                        result: if spawned.status.is_success() {
+                            "ok_first_byte".to_string()
+                        } else {
+                            format!("http_{}", spawned.status.as_u16())
+                        },
+                        ms: started.elapsed().as_millis() as u64,
+                    });
+                    return Ok(Accepted {
+                        status: spawned.status,
+                        headers: spawned.headers,
+                        body: spawned.body,
+                        attempt: n,
+                        target_provider: target.model_ref.provider.clone(),
+                        target_model: target.model_ref.model.clone(),
+                        api: target.api,
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(target = %target, "agent transport unavailable: {err}");
+                    attempts.push(TraceAttempt {
+                        n,
+                        target: target.to_string(),
+                        result: "spawn_error".to_string(),
+                        ms: started.elapsed().as_millis() as u64,
+                    });
+                    if is_last {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
 
         // Resolve the credential per attempt so a rotated env var or Keychain
         // entry is picked up without a reload. An unresolvable key skips the
@@ -174,7 +238,10 @@ pub async fn send_with_fallback(
                     ms,
                 });
                 return Ok(Accepted {
-                    response,
+                    status: http::StatusCode::from_u16(response.status().as_u16())
+                        .unwrap_or(http::StatusCode::BAD_GATEWAY),
+                    headers: response.headers().clone(),
+                    body: Box::pin(response.bytes_stream()),
                     attempt: n,
                     target_provider: target.model_ref.provider.clone(),
                     target_model: target.model_ref.model.clone(),
@@ -249,6 +316,8 @@ mod tests {
 
     fn target(api: ApiKind, base: &str) -> Target {
         Target {
+            transport: Default::default(),
+            agent_args: Vec::new(),
             model_ref: ModelRef {
                 provider: "p".into(),
                 model: "m".into(),
@@ -332,6 +401,8 @@ mod tests {
             |_t| {
                 Ok(Attempt {
                     body: b"{}".to_vec(),
+                    payload: serde_json::json!({}),
+                    streaming: false,
                     headers: http::HeaderMap::new(),
                     count_tokens: false,
                 })
