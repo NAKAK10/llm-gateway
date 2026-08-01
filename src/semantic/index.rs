@@ -350,11 +350,7 @@ impl Classifier {
         expected_api: ApiKind,
         threshold: f32,
     ) -> Verdict {
-        self.stale_check.sync(self.shared.generation(), || {
-            let config = self.shared.get();
-            self.index
-                .store(Arc::new(RouteIndex::build(&config, &self.embedder)));
-        });
+        self.refresh_if_stale();
 
         let index = self.index.load();
 
@@ -378,6 +374,42 @@ impl Classifier {
             candidates: scored.all,
             embed_ms,
         }
+    }
+
+    /// Embed arbitrary text with the same model every route was embedded
+    /// with, for a caller that wants to compare the two in the same vector
+    /// space rather than just read a cosine score — e.g. `serve --ui`'s
+    /// live map of where an incoming request landed. `None` for the same
+    /// reason `classify_with_threshold` can find no vector: a tokenizer
+    /// panic or an empty result.
+    pub fn embed(&self, text: &str) -> Option<Vec<f32>> {
+        self.embedder.embed(text)
+    }
+
+    /// Every candidate route's embedding vector(s), labeled by route name —
+    /// one vector per `description` language variant, same as
+    /// [`Candidate::vectors`]. Rebuilds the index first if config changed,
+    /// same as [`Self::classify_with_threshold`], so this always reflects
+    /// the live route set.
+    pub fn route_vectors(&self) -> Vec<(String, Vec<Vec<f32>>)> {
+        self.refresh_if_stale();
+        self.index
+            .load()
+            .candidates
+            .iter()
+            .map(|c| (c.name.clone(), c.vectors.clone()))
+            .collect()
+    }
+
+    /// Rebuild the index if `shared`'s config generation has moved past what
+    /// it was last built from. Split out of `classify_with_threshold` so
+    /// [`Self::route_vectors`] can share it without also embedding a query.
+    fn refresh_if_stale(&self) {
+        self.stale_check.sync(self.shared.generation(), || {
+            let config = self.shared.get();
+            self.index
+                .store(Arc::new(RouteIndex::build(&config, &self.embedder)));
+        });
     }
 }
 

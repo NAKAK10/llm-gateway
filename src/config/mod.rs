@@ -67,6 +67,12 @@ pub struct Config {
 
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    /// The optional local dashboard `serve --ui` exposes. Off unless either
+    /// this or `--ui` is set — a dashboard nobody asked for is one more
+    /// thing to explain if it's ever found running.
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -534,6 +540,20 @@ impl Default for LoggingConfig {
 
 fn default_log_dir() -> String {
     "./logs".to_string()
+}
+
+/// `serve --ui`'s local dashboard: a live feed of routing decisions, a map of
+/// where each route sits in embedding space, and a usage view — all served
+/// from the same listener as the proxy, behind the same `server.apiKey` (see
+/// `crate::server::router`). Reachable only from wherever `server.host`
+/// already reaches, nothing new to expose.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UiConfig {
+    /// `--ui` on the command line ORs with this — either turns the dashboard
+    /// on for that run.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// A parsed `"<provider>/<model>"` reference.

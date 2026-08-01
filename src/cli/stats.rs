@@ -10,7 +10,7 @@
 //! timezone — otherwise a JST evening looks like it happened "the next day".
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
 
@@ -53,7 +53,7 @@ pub struct Options {
 }
 
 /// One aggregated row.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Row {
     pub key: String,
     pub calls: u64,
@@ -114,46 +114,7 @@ pub fn run(options: Options) -> Result<()> {
         eprintln!("warning: failed to prune old logs: {err}");
     }
 
-    let mut records = Vec::new();
-    let mut skipped = 0u64;
-
-    if let Ok(entries) = std::fs::read_dir(&logs_dir) {
-        let mut paths: Vec<PathBuf> = entries
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .map(|name| name.starts_with("usage-") && name.ends_with(".jsonl"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        paths.sort();
-
-        for path in paths {
-            // One unreadable file should not abort `stats` entirely — the
-            // directory listing above already tolerates unreadable entries
-            // the same way; a file that vanishes or loses permissions
-            // between listing and reading deserves the same treatment.
-            let text = match std::fs::read_to_string(&path) {
-                Ok(text) => text,
-                Err(err) => {
-                    eprintln!("warning: failed to read {}: {err}", path.display());
-                    continue;
-                }
-            };
-            for line in text.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<UsageRecord>(line) {
-                    Ok(record) => records.push(record),
-                    Err(_) => skipped += 1,
-                }
-            }
-        }
-    }
+    let (records, skipped) = read_usage_records(&logs_dir);
 
     if skipped > 0 {
         eprintln!("skipped {skipped} malformed lines");
@@ -216,6 +177,56 @@ pub fn run(options: Options) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Read every `usage-*.jsonl` file in `logs_dir`, oldest month first.
+///
+/// Shared between the `stats` CLI and `serve --ui`'s `GET /api/usage` — both
+/// want the same "read what's on disk, tolerate what's missing or
+/// unreadable" behavior. Returns the parsed records plus a count of lines
+/// that failed to parse (kept rather than logged here, since a CLI caller
+/// wants that on stderr and an HTTP caller does not).
+pub fn read_usage_records(logs_dir: &Path) -> (Vec<UsageRecord>, u64) {
+    let mut records = Vec::new();
+    let mut skipped = 0u64;
+
+    let Ok(entries) = std::fs::read_dir(logs_dir) else {
+        return (records, skipped);
+    };
+
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("usage-") && name.ends_with(".jsonl"))
+                .unwrap_or(false)
+        })
+        .collect();
+    paths.sort();
+
+    for path in paths {
+        // One unreadable file should not abort reading the rest — the
+        // directory listing above already tolerates unreadable entries the
+        // same way; a file that vanishes or loses permissions between
+        // listing and reading deserves the same treatment.
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<UsageRecord>(line) {
+                Ok(record) => records.push(record),
+                Err(_) => skipped += 1,
+            }
+        }
+    }
+
+    (records, skipped)
 }
 
 /// Render one grouped table plus its `TOTAL` row, sharing the same shape for
