@@ -55,6 +55,17 @@ use crate::semantic::index::CLASSIFICATION_THRESHOLD;
 #[cfg(not(feature = "semantic"))]
 const CLASSIFICATION_THRESHOLD: f32 = 0.45;
 
+/// The system-prompt classification threshold, mirrored here the same way
+/// `CLASSIFICATION_THRESHOLD` is above, for the same reason — available (for
+/// trace-log text and tests) even in a `--no-default-features` build that
+/// never compiles `crate::semantic`. Must stay equal to
+/// `crate::semantic::index::SYSTEM_CLASSIFICATION_THRESHOLD` when that module
+/// is compiled in.
+#[cfg(feature = "semantic")]
+use crate::semantic::index::SYSTEM_CLASSIFICATION_THRESHOLD;
+#[cfg(not(feature = "semantic"))]
+const SYSTEM_CLASSIFICATION_THRESHOLD: f32 = 0.50;
+
 /// How many of the request's user texts (newest first) classification tries
 /// before falling back to the reserved `default` route.
 ///
@@ -165,6 +176,7 @@ pub async fn proxy(
             embed_ms: 0,
             decided_by_text: None,
             walk: Vec::new(),
+            system_score: None,
         }
     };
 
@@ -644,6 +656,15 @@ struct SemanticAttempt {
     /// Every text the walk tried and its top candidate score, newest text
     /// first — empty unless the walk actually ran.
     walk: Vec<TraceWalkStep>,
+    /// The system prompt's top candidate score, recorded whenever
+    /// system-prompt classification was *attempted* — even when it missed
+    /// [`SYSTEM_CLASSIFICATION_THRESHOLD`] and the outcome fell through to
+    /// the ordinary user-text walk below. `None` when the request carried no
+    /// system prompt (`system_prompt_text` returned `None`), or no
+    /// classifier was loaded to score it. Mirrors `TraceRouting`'s
+    /// `system_score` field, which is why this is worth keeping even on a
+    /// miss — it doubles as tuning data for the threshold.
+    system_score: Option<f32>,
 }
 
 /// Why `resolve_as` ended up being what it is — one variant per
@@ -674,6 +695,16 @@ enum SemanticOutcome {
     /// newest `n` texts scored below the threshold and an earlier one
     /// matched (`routing.mode = "semantic_history"`).
     Matched { texts_back: usize },
+    /// The request's *system prompt* — an agent definition, e.g. a Claude
+    /// Code subagent's `.claude/agents/*.md` prompt — cleared
+    /// [`SYSTEM_CLASSIFICATION_THRESHOLD`] on its own; `routing.mode =
+    /// "semantic_system"`. User texts were never consulted: a system prompt
+    /// is the strongest available signal for "what role is this agent
+    /// playing," and this is tried before the user-text walk below (see the
+    /// 2026-08-01 entry in `docs/decisions.md` for the misroute this fixes —
+    /// a subagent's own investigation prompt getting pulled toward whatever
+    /// object the user's instruction happened to mention).
+    MatchedSystem,
     /// User texts existed but none of the `texts_tried` newest ones cleared
     /// the threshold: fall back to `default`.
     BelowThreshold { texts_tried: usize },
@@ -745,6 +776,13 @@ fn routing_from(resolution: &route::Resolution, attempt: SemanticAttempt) -> Tra
                 if texts_back == 1 { "" } else { "s" },
             ),
         ),
+        SemanticOutcome::MatchedSystem => (
+            "semantic_system",
+            format!(
+                "the request's system prompt (agent definition) cleared the system-prompt \
+                 threshold {SYSTEM_CLASSIFICATION_THRESHOLD:.2}; user texts were not consulted"
+            ),
+        ),
         SemanticOutcome::BelowThreshold { texts_tried } => (
             "semantic",
             format!(
@@ -778,37 +816,60 @@ fn routing_from(resolution: &route::Resolution, attempt: SemanticAttempt) -> Tra
         ),
     };
 
-    let ran = matches!(
-        attempt.outcome,
-        SemanticOutcome::Matched { .. } | SemanticOutcome::BelowThreshold { .. }
-    );
+    // The threshold to report differs by *which* classification step ran:
+    // the ordinary user-text walk always applies `CLASSIFICATION_THRESHOLD`,
+    // `MatchedSystem` applies the stricter `SYSTEM_CLASSIFICATION_THRESHOLD`
+    // instead — reporting the wrong one would make a system-prompt match
+    // look like it barely cleared the bar (or didn't) when it actually
+    // cleared a higher one.
+    let threshold = match attempt.outcome {
+        SemanticOutcome::Matched { .. } | SemanticOutcome::BelowThreshold { .. } => {
+            Some(CLASSIFICATION_THRESHOLD)
+        }
+        SemanticOutcome::MatchedSystem => Some(SYSTEM_CLASSIFICATION_THRESHOLD),
+        _ => None,
+    };
+    let embed_ms = threshold.is_some().then_some(attempt.embed_ms);
     TraceRouting {
         mode: mode.to_string(),
         matched_route: resolution.route_name.clone(),
         reason,
         candidates: attempt.candidates,
         score: attempt.score,
-        threshold: ran.then_some(CLASSIFICATION_THRESHOLD),
-        embed_ms: ran.then_some(attempt.embed_ms),
+        threshold,
+        embed_ms,
         decided_by_text: attempt.decided_by_text,
         walk: (!attempt.walk.is_empty()).then_some(attempt.walk),
+        system_score: attempt.system_score,
     }
 }
 
-/// Classify the request's content against every candidate route.
+/// Classify the request against every candidate route.
 ///
 /// Always attempted, regardless of what model name the client sent — the
 /// requested model name plays no part in route selection anymore.
 ///
-/// The newest user text is tried first, so a genuine topic change always
-/// wins immediately. When it scores below the threshold — or the newest
-/// user message carries no text at all, the normal state of an agentic
-/// turn whose last message is a `tool_result` — the walk continues to
-/// earlier user texts (bounded by [`HISTORY_WALK_LIMIT`]) and takes the
-/// first that clears the bar. The conversation history that arrives with
-/// every request is the only state this needs: the same request always
-/// classifies the same way, no matter which gateway process sees it or
-/// when.
+/// Three steps, in order, the first to decide wins:
+///
+/// 1. The `<transcript>` bypass (unchanged by this doc's other two steps —
+///    see the comment at its call site for why it must stay first).
+/// 2. The request's **system prompt**, at the stricter
+///    [`SYSTEM_CLASSIFICATION_THRESHOLD`] — see [`system_prompt_text`]. An
+///    agent definition (a Claude Code subagent's own system prompt, say) is
+///    the strongest available signal for "what role is this agent playing,"
+///    stronger than anything the user's own text says; a request whose
+///    system prompt clears the bar never even looks at user text.
+/// 3. The ordinary **user-text history walk**: the newest user text is tried
+///    first, so a genuine topic change always wins immediately. When it
+///    scores below [`CLASSIFICATION_THRESHOLD`] — or the newest user message
+///    carries no text at all, the normal state of an agentic turn whose last
+///    message is a `tool_result` — the walk continues to earlier user texts
+///    (bounded by [`HISTORY_WALK_LIMIT`]) and takes the first that clears the
+///    bar.
+///
+/// The conversation history that arrives with every request is the only
+/// state any of this needs: the same request always classifies the same
+/// way, no matter which gateway process sees it or when.
 #[cfg(feature = "semantic")]
 fn classify_request(
     state: &AppState,
@@ -817,7 +878,7 @@ fn classify_request(
     expected_api: ApiKind,
     requested_model: &str,
 ) -> SemanticAttempt {
-    let fallback = |outcome: SemanticOutcome| SemanticAttempt {
+    let fallback = |outcome: SemanticOutcome, system_score: Option<f32>| SemanticAttempt {
         resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
         outcome,
         resolved_targets: None,
@@ -826,6 +887,17 @@ fn classify_request(
         embed_ms: 0,
         decided_by_text: None,
         walk: Vec::new(),
+        system_score,
+    };
+
+    let as_trace = |candidates: &[(String, f32)]| -> Vec<TraceCandidate> {
+        candidates
+            .iter()
+            .map(|(route, score)| TraceCandidate {
+                route: route.clone(),
+                score: *score,
+            })
+            .collect()
     };
 
     // Texts before classifier: a textless request falls back no matter
@@ -868,6 +940,7 @@ fn classify_request(
                         embed_ms: 0,
                         decided_by_text: None,
                         walk: Vec::new(),
+                        system_score: None,
                     };
                 }
                 Err(err) => {
@@ -909,24 +982,66 @@ fn classify_request(
             embed_ms: 0,
             decided_by_text: None,
             walk: Vec::new(),
+            system_score: None,
         };
     }
 
+    // System-prompt classification: tried before the user-text walk below,
+    // at the stricter `SYSTEM_CLASSIFICATION_THRESHOLD` — see this
+    // function's doc comment for why a system prompt takes priority over
+    // user text when it clears that bar. Requires a loaded classifier, same
+    // as the walk does; when one is not available this simply contributes
+    // nothing (`system_score` stays `None`) and the `NoText`/`NoClassifier`
+    // fallbacks below behave exactly as they did before this step existed.
+    let mut system_score = None;
+    if let Some(classifier) = state.classifier.as_ref() {
+        if let Some(system_text) = system_prompt_text(expected_api, payload) {
+            let verdict = classifier.classify_with_threshold(
+                &system_text,
+                expected_api,
+                SYSTEM_CLASSIFICATION_THRESHOLD,
+            );
+            system_score = verdict.candidates.first().map(|(_, score)| *score);
+
+            if let Some((route, matched_score)) = verdict.matched.clone() {
+                tracing::info!(
+                    route = %route,
+                    score = matched_score,
+                    embed_ms = verdict.embed_ms,
+                    "classified request to route `{route}` from its system prompt \
+                     (score {matched_score:.3}, embed {}ms); user texts were not consulted",
+                    verdict.embed_ms,
+                );
+                return SemanticAttempt {
+                    resolve_as: route,
+                    outcome: SemanticOutcome::MatchedSystem,
+                    resolved_targets: None,
+                    candidates: as_trace(&verdict.candidates),
+                    score: system_score,
+                    embed_ms: verdict.embed_ms,
+                    decided_by_text: Some(crate::record::truncate(&system_text, Some(200))),
+                    walk: Vec::new(),
+                    system_score,
+                };
+            }
+
+            tracing::info!(
+                score = system_score,
+                embed_ms = verdict.embed_ms,
+                "system prompt scored below the system-prompt threshold \
+                 {SYSTEM_CLASSIFICATION_THRESHOLD:.2} (closest {}), falling through to user texts",
+                system_score
+                    .map(|s| format!("{s:.3}"))
+                    .unwrap_or_else(|| "n/a".to_string()),
+            );
+        }
+    }
+
     if texts.is_empty() {
-        return fallback(SemanticOutcome::NoText);
+        return fallback(SemanticOutcome::NoText, system_score);
     }
     let Some(classifier) = state.classifier.as_ref() else {
-        return fallback(SemanticOutcome::NoClassifier);
-    };
-
-    let as_trace = |candidates: &[(String, f32)]| -> Vec<TraceCandidate> {
-        candidates
-            .iter()
-            .map(|(route, score)| TraceCandidate {
-                route: route.clone(),
-                score: *score,
-            })
-            .collect()
+        return fallback(SemanticOutcome::NoClassifier, system_score);
     };
 
     let mut embed_ms_total = 0;
@@ -982,6 +1097,7 @@ fn classify_request(
                 embed_ms: embed_ms_total,
                 decided_by_text: Some(crate::record::truncate(text, Some(200))),
                 walk,
+                system_score,
             };
         }
         if texts_back == 0 {
@@ -1015,6 +1131,7 @@ fn classify_request(
         embed_ms: embed_ms_total,
         decided_by_text: None,
         walk,
+        system_score,
     }
 }
 
@@ -1035,6 +1152,7 @@ fn classify_request(
         embed_ms: 0,
         decided_by_text: None,
         walk: Vec::new(),
+        system_score: None,
     }
 }
 
@@ -1092,7 +1210,8 @@ fn classification_texts(api: ApiKind, payload: &serde_json::Value) -> Vec<String
 }
 
 /// Remove every `<system-reminder>...</system-reminder>` block from `text`,
-/// for [`classification_texts`] — see that function's doc comment for why.
+/// for [`classification_texts`] and [`system_prompt_text`] — see their doc
+/// comments for why.
 ///
 /// A plain string scan rather than a regex: the tags are literal and never
 /// nested, so `find` on each half is enough and this stays dependency-free.
@@ -1101,7 +1220,6 @@ fn classification_texts(api: ApiKind, payload: &serde_json::Value) -> Vec<String
 /// into classification is worse than losing whatever real text might follow
 /// it — the harness always closes its own blocks, so this only fires on
 /// malformed or adversarial input.
-#[cfg_attr(not(feature = "semantic"), allow(dead_code))]
 fn strip_system_reminders(text: &str) -> String {
     const OPEN: &str = "<system-reminder>";
     const CLOSE: &str = "</system-reminder>";
@@ -1119,6 +1237,74 @@ fn strip_system_reminders(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The request's system prompt — an agent's own definition of its role,
+/// independent of anything the user's own text says. Where it lives differs
+/// by protocol: Anthropic Messages has a dedicated `system` field, OpenAI
+/// Chat carries it as the first `system`/`developer` message, and OpenAI
+/// Responses has a dedicated `instructions` field, falling back to the first
+/// `system`/`developer` item in `input` when `instructions` is empty or
+/// absent (some clients — opencode, notably — send it that way instead).
+///
+/// `<system-reminder>...</system-reminder>` blocks are stripped the same way
+/// [`classification_texts`] strips them from user turns (see
+/// [`strip_system_reminders`]) before the result is checked for blankness,
+/// so a system prompt that is nothing but harness boilerplate counts as
+/// absent rather than as a classification input.
+///
+/// Only the *beginning* of whatever this returns ever reaches the
+/// classifier: `Embedder::embed` truncates its input to 800 characters / 64
+/// tokens (see that function's doc comment). This is exactly the shape a
+/// subagent definition has — Claude Code's `.claude/agents/*.md` prompts
+/// (and the equivalent in other harnesses) put the role description first,
+/// so it survives the truncation — while a harness's own generic preamble
+/// ("You are Claude Code, an interactive CLI tool...") does not reliably
+/// distinguish one role from another even within its first 800 characters.
+/// That is part of why system-prompt classification uses a stricter
+/// threshold than user-text classification does — see
+/// `SYSTEM_CLASSIFICATION_THRESHOLD`'s doc comment.
+///
+/// `None` when there is nothing to classify: the field/message is absent,
+/// present but empty, or strips down to blank.
+fn system_prompt_text(api: ApiKind, payload: &serde_json::Value) -> Option<String> {
+    let raw = match api {
+        ApiKind::AnthropicMessages => {
+            crate::translate::request::system_text(payload.get("system")?)
+        }
+        ApiKind::OpenaiChat => {
+            let messages = payload.get("messages")?.as_array()?;
+            let system = messages.iter().find(|m| {
+                matches!(
+                    m.get("role").and_then(|r| r.as_str()),
+                    Some("system") | Some("developer")
+                )
+            })?;
+            crate::translate::request::message_text(system)
+        }
+        ApiKind::OpenaiResponses => {
+            let instructions = payload
+                .get("instructions")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            match instructions {
+                Some(instructions) => instructions.to_string(),
+                None => {
+                    let items = payload.get("input")?.as_array()?;
+                    let system = items.iter().find(|m| {
+                        matches!(
+                            m.get("role").and_then(|r| r.as_str()),
+                            Some("system") | Some("developer")
+                        )
+                    })?;
+                    content_text(api, system.get("content")?)?
+                }
+            }
+        }
+    };
+
+    let stripped = strip_system_reminders(&raw);
+    (!stripped.trim().is_empty()).then_some(stripped)
 }
 
 fn now_rfc3339() -> String {
@@ -1152,10 +1338,13 @@ fn extract_input(
 
     let last_user_text =
         last_user_text(api, messages).map(|t| crate::record::truncate(&t, truncate_at));
+    let system_text =
+        system_prompt_text(api, payload).map(|t| crate::record::truncate(&t, truncate_at));
 
     TraceInput {
         messages_n,
         last_user_text,
+        system_text,
         // Bytes-per-token is model-dependent; /4 is close enough to spot a
         // long-context request, which is all this is for.
         tokens_est: (body_len / 4) as u64,
@@ -1489,6 +1678,132 @@ mod tests {
         assert_eq!(texts, vec!["the real ask"]);
     }
 
+    #[test]
+    fn system_prompt_text_reads_an_anthropic_system_string() {
+        let payload = json!({
+            "system": "You are a read-only exploration subagent.",
+            "messages": [],
+        });
+        assert_eq!(
+            system_prompt_text(ApiKind::AnthropicMessages, &payload).as_deref(),
+            Some("You are a read-only exploration subagent.")
+        );
+    }
+
+    #[test]
+    fn system_prompt_text_joins_an_anthropic_system_block_array() {
+        let payload = json!({
+            "system": [
+                {"type": "text", "text": "part one"},
+                {"type": "text", "text": "part two"},
+            ],
+            "messages": [],
+        });
+        assert_eq!(
+            system_prompt_text(ApiKind::AnthropicMessages, &payload).as_deref(),
+            Some("part one\n\npart two")
+        );
+    }
+
+    #[test]
+    fn system_prompt_text_reads_the_leading_chat_system_message() {
+        let payload = json!({ "messages": [
+            {"role": "system", "content": "be terse"},
+            {"role": "user", "content": "hi"},
+        ]});
+        assert_eq!(
+            system_prompt_text(ApiKind::OpenaiChat, &payload).as_deref(),
+            Some("be terse")
+        );
+    }
+
+    #[test]
+    fn system_prompt_text_reads_a_chat_developer_message_too() {
+        let payload = json!({ "messages": [
+            {"role": "developer", "content": "be terse"},
+            {"role": "user", "content": "hi"},
+        ]});
+        assert_eq!(
+            system_prompt_text(ApiKind::OpenaiChat, &payload).as_deref(),
+            Some("be terse")
+        );
+    }
+
+    #[test]
+    fn system_prompt_text_reads_responses_instructions() {
+        let payload = json!({
+            "instructions": "You are a read-only exploration subagent.",
+            "input": "go explore",
+        });
+        assert_eq!(
+            system_prompt_text(ApiKind::OpenaiResponses, &payload).as_deref(),
+            Some("You are a read-only exploration subagent.")
+        );
+    }
+
+    /// opencode sends its system prompt as a leading `input[]` item rather
+    /// than the dedicated `instructions` field — this is the fallback path.
+    #[test]
+    fn system_prompt_text_falls_back_to_a_responses_input_system_item() {
+        let payload = json!({
+            "input": [
+                {
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": "be terse"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+            ],
+        });
+        assert_eq!(
+            system_prompt_text(ApiKind::OpenaiResponses, &payload).as_deref(),
+            Some("be terse")
+        );
+    }
+
+    /// Empty `instructions` must not win over a real system item in `input`.
+    #[test]
+    fn system_prompt_text_prefers_input_system_item_when_instructions_is_empty() {
+        let payload = json!({
+            "instructions": "",
+            "input": [{
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "be terse"}],
+            }],
+        });
+        assert_eq!(
+            system_prompt_text(ApiKind::OpenaiResponses, &payload).as_deref(),
+            Some("be terse")
+        );
+    }
+
+    #[test]
+    fn system_prompt_text_is_none_without_a_system_field() {
+        let payload = json!({ "messages": [{"role": "user", "content": "hi"}] });
+        assert!(system_prompt_text(ApiKind::AnthropicMessages, &payload).is_none());
+        assert!(system_prompt_text(ApiKind::OpenaiChat, &payload).is_none());
+
+        let responses_payload = json!({ "input": "hi" });
+        assert!(system_prompt_text(ApiKind::OpenaiResponses, &responses_payload).is_none());
+    }
+
+    /// Same reasoning as `classification_texts_skip_a_message_that_is_only_a_system_reminder`,
+    /// applied to the system prompt: harness boilerplate must count as no
+    /// system prompt at all, not as a classification input.
+    #[test]
+    fn system_prompt_text_is_none_when_it_strips_down_to_only_a_system_reminder() {
+        let payload = json!({
+            "system": "<system-reminder>CLAUDE.md contents here</system-reminder>",
+            "messages": [],
+        });
+        assert!(system_prompt_text(ApiKind::AnthropicMessages, &payload).is_none());
+    }
+
     fn resolution(route_name: &str) -> route::Resolution {
         route::Resolution {
             route_name: route_name.to_string(),
@@ -1508,6 +1823,7 @@ mod tests {
             embed_ms: 0,
             decided_by_text: None,
             walk: Vec::new(),
+            system_score: None,
         };
         let routing = routing_from(&res, attempt);
 
@@ -1533,6 +1849,7 @@ mod tests {
             embed_ms: 0,
             decided_by_text: None,
             walk: Vec::new(),
+            system_score: None,
         };
         let routing = routing_from(&res, attempt);
 
@@ -1571,6 +1888,7 @@ mod tests {
                 texts_back: 0,
                 score: Some(0.8),
             }],
+            system_score: None,
         };
 
         let routing = routing_from(&res, attempt);
@@ -1614,6 +1932,7 @@ mod tests {
                     score: Some(0.7),
                 },
             ],
+            system_score: None,
         };
 
         let routing = routing_from(&res, attempt);
@@ -1632,6 +1951,63 @@ mod tests {
             Some("now write the tests")
         );
         assert_eq!(routing.walk.as_ref().map(Vec::len), Some(3));
+    }
+
+    /// `MatchedSystem`'s own trace shape: `mode` is `semantic_system`, the
+    /// threshold reported is the stricter system-prompt one (not the
+    /// ordinary `CLASSIFICATION_THRESHOLD`), and the reason says outright
+    /// that user texts were never consulted — the whole point of trying the
+    /// system prompt first.
+    #[test]
+    fn routing_from_reports_a_system_prompt_match() {
+        let res = resolution("role-explorer");
+        let attempt = SemanticAttempt {
+            resolve_as: "role-explorer".to_string(),
+            outcome: SemanticOutcome::MatchedSystem,
+            resolved_targets: None,
+            candidates: vec![
+                TraceCandidate {
+                    route: "role-explorer".to_string(),
+                    score: 0.65,
+                },
+                TraceCandidate {
+                    route: "role-implementer".to_string(),
+                    score: 0.4,
+                },
+            ],
+            score: Some(0.65),
+            embed_ms: 2,
+            decided_by_text: Some("You are a read-only exploration subagent.".to_string()),
+            walk: Vec::new(),
+            system_score: Some(0.65),
+        };
+
+        let routing = routing_from(&res, attempt);
+
+        assert_eq!(routing.mode, "semantic_system");
+        assert_eq!(routing.matched_route, "role-explorer");
+        assert_eq!(routing.score, Some(0.65));
+        assert_eq!(routing.threshold, Some(SYSTEM_CLASSIFICATION_THRESHOLD));
+        assert_eq!(routing.embed_ms, Some(2));
+        assert_eq!(routing.candidates.len(), 2);
+        assert_eq!(routing.system_score, Some(0.65));
+        assert!(
+            routing.reason.contains("system prompt"),
+            "{}",
+            routing.reason
+        );
+        assert!(
+            routing.reason.contains("user texts were not consulted"),
+            "{}",
+            routing.reason
+        );
+        assert_eq!(
+            routing.decided_by_text.as_deref(),
+            Some("You are a read-only exploration subagent.")
+        );
+        // No user-text walk ran at all — the system prompt decided this on
+        // its own.
+        assert!(routing.walk.is_none());
     }
 
     #[test]
@@ -1662,6 +2038,12 @@ mod tests {
                     score: Some(0.1),
                 },
             ],
+            // A system prompt was present and attempted but missed
+            // `SYSTEM_CLASSIFICATION_THRESHOLD`, so the user-text walk ran
+            // (and produced the rest of this attempt) — `system_score` must
+            // still reach the trace record even though it played no part in
+            // the final decision.
+            system_score: Some(0.3),
         };
 
         let routing = routing_from(&res, attempt);
@@ -1671,6 +2053,11 @@ mod tests {
         assert_eq!(routing.score, Some(0.2));
         assert_eq!(routing.threshold, Some(CLASSIFICATION_THRESHOLD));
         assert_eq!(routing.candidates.len(), 1);
+        assert_eq!(
+            routing.system_score,
+            Some(0.3),
+            "system-prompt attempts are recorded even on a miss, for threshold tuning"
+        );
         assert!(
             routing.reason.contains("0.45"),
             "reason should mention the threshold: {}",
@@ -1703,6 +2090,7 @@ mod tests {
             embed_ms: 0,
             decided_by_text: None,
             walk: Vec::new(),
+            system_score: None,
         };
 
         let routing = routing_from(&res, attempt);
@@ -1729,6 +2117,7 @@ mod tests {
             embed_ms: 0,
             decided_by_text: None,
             walk: Vec::new(),
+            system_score: None,
         };
 
         let routing = routing_from(&res, attempt);
@@ -1760,6 +2149,7 @@ mod tests {
             embed_ms: 0,
             decided_by_text: None,
             walk: Vec::new(),
+            system_score: None,
         };
 
         let routing = routing_from(&res, attempt);
@@ -1795,6 +2185,7 @@ mod tests {
             embed_ms: 0,
             decided_by_text: None,
             walk: Vec::new(),
+            system_score: None,
         };
 
         let routing = routing_from(&res, attempt);
@@ -1953,6 +2344,33 @@ mod tests {
         assert_eq!(attempt.resolve_as, crate::config::DEFAULT_ROUTE);
     }
 
+    /// A request that *does* carry a system prompt must behave exactly like
+    /// one that doesn't when no classifier is loaded — system-prompt
+    /// classification needs a classifier the same way the user-text walk
+    /// does, so its presence contributes nothing (`system_score` stays
+    /// `None`) rather than changing the outcome or panicking.
+    #[cfg(feature = "semantic")]
+    #[tokio::test]
+    async fn classify_request_with_a_system_prompt_but_no_classifier_behaves_like_no_classifier() {
+        let (_dir, state) = test_state(classifiable_config());
+        let config = state.config.get();
+        let payload = json!({
+            "system": "You are a read-only exploration subagent.",
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+
+        let attempt = classify_request(
+            &state,
+            &config,
+            &payload,
+            ApiKind::AnthropicMessages,
+            "opus",
+        );
+        assert_eq!(attempt.outcome, SemanticOutcome::NoClassifier);
+        assert_eq!(attempt.resolve_as, crate::config::DEFAULT_ROUTE);
+        assert!(attempt.system_score.is_none());
+    }
+
     /// The bug this feature fixes: Claude Code's auto-mode permission
     /// classifier sends its internal yes/no prompt (a `<transcript>...`
     /// body) through the same gateway endpoint a real turn would use. It
@@ -1986,6 +2404,44 @@ mod tests {
         assert_eq!(attempt.embed_ms, 0);
         assert!(attempt.decided_by_text.is_none());
         assert!(attempt.walk.is_empty());
+    }
+
+    /// System-prompt classification must never even be attempted on a
+    /// `<transcript>`-prefixed utility request, no matter how strongly its
+    /// system prompt might otherwise match a route — the `<transcript>`
+    /// bypass has to stay the first check `classify_request` makes. A
+    /// present-but-irrelevant `system` field is enough to prove the check
+    /// order: if system-prompt classification ran before the bypass, this
+    /// request (whose only text is the `<transcript>` yes/no prompt) would
+    /// still resolve as a bypass here since there is no loaded classifier —
+    /// but `system_score` being `None` shows the system-prompt step was
+    /// never reached at all, not merely that it found nothing.
+    #[cfg(feature = "semantic")]
+    #[tokio::test]
+    async fn classify_request_transcript_bypass_wins_over_a_system_prompt() {
+        let (_dir, state) = test_state(classifiable_config());
+        let config = state.config.get();
+        let payload = json!({
+            "system": "You are a read-only exploration subagent.",
+            "messages": [
+                {"role": "user", "content": "<transcript>\nsome tool call history\n</transcript>\nis this safe?"},
+            ],
+        });
+
+        let attempt = classify_request(
+            &state,
+            &config,
+            &payload,
+            ApiKind::AnthropicMessages,
+            "role-writer",
+        );
+
+        assert_eq!(
+            attempt.outcome,
+            SemanticOutcome::UtilityBypass(UtilityBypassResolution::RequestedModel)
+        );
+        assert_eq!(attempt.resolve_as, "role-writer");
+        assert!(attempt.system_score.is_none());
     }
 
     /// When the requested model name matches no configured route,

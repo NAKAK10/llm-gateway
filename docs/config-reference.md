@@ -84,8 +84,30 @@ If classification cannot run at all — for example a build without the default
   kept only for client-side UX and trace logs' `requested_model` field.
 - Similarity uses static `model2vec-rs` embeddings with a fixed cosine
   threshold `0.45` (`src/semantic/index.rs`). There is no per-route threshold.
-- The newest user text is classified first; a match routes the request and a
-  genuine topic change always wins immediately. When it scores below the
+- Before any user text is looked at, the request's **system prompt** — if it
+  has one — is classified on its own, at a stricter cosine threshold `0.50`
+  (`SYSTEM_CLASSIFICATION_THRESHOLD`, `src/semantic/index.rs`). Extraction is
+  per `ApiKind`: Anthropic Messages' `system` field, OpenAI Chat's leading
+  `system`/`developer` message, or OpenAI Responses' `instructions` field
+  (falling back to a leading `system`/`developer` item in `input` when
+  `instructions` is empty — see `system_prompt_text`,
+  `src/server/proxy.rs`). A match short-circuits the newest-user-text walk
+  below entirely — `routing.mode = "semantic_system"` — because a system
+  prompt (an agent's own role definition, e.g. a Claude Code subagent's
+  `.claude/agents/*.md` prompt) is a stronger signal than user text, which
+  can be pulled toward an unrelated route by whatever object the
+  instruction happens to mention. The same 800-character / 64-token
+  embedding bound as user text applies (see `Embedder::embed`), so only the
+  *beginning* of a long system prompt ever reaches the classifier — the
+  threshold is stricter than the user-text one specifically so that a
+  harness's own generic preamble ("You are Claude Code, ...") does not
+  clear it and hijack every request of a session. No system prompt, an
+  empty one, one that strips down to blank after
+  `<system-reminder>...</system-reminder>` removal (see below), or a miss
+  against `0.50` all fall through unaffected to the newest-user-text walk.
+- Among user texts, the newest is classified first; a match routes the
+  request and a genuine topic change always wins immediately. When it scores
+  below the
   threshold — or the newest user message has no text at all (an agentic
   `tool_result` turn) — classification walks back through up to 8 earlier user
   texts and takes the most recent one that clears the bar, so a conversation
@@ -99,16 +121,21 @@ If classification cannot run at all — for example a build without the default
 - A request whose newest user text begins with `<transcript>` — Claude Code's
   own internal auto-mode judgment call, not a real user turn — skips
   classification entirely rather than being scored against `description`s;
-  see "autoMode" above for where it resolves instead.
+  see "autoMode" above for where it resolves instead. This check runs
+  **before** system-prompt classification too, so it is checked first
+  overall: `<transcript>` bypass, then system prompt, then the user-text
+  walk.
 - Before any text is embedded, `<system-reminder>...</system-reminder>` blocks
-  are stripped from it (`src/server/proxy.rs`, `classification_texts`) — this
-  is harness-injected context, not the user's own words, and it would
+  are stripped from it (`src/server/proxy.rs`, `classification_texts` for user
+  text, `system_prompt_text` for the system prompt) — this is harness-injected
+  context, not the user's (or agent definition's) own words, and it would
   otherwise skew both the newest-text score and every text the walk-back
-  tries. A user message left blank after stripping counts as no text and is
-  skipped exactly like a textless `tool_result` turn. This only changes the
-  classification input: the payload forwarded to the provider is never
-  modified. A block with no closing tag has everything from `<system-reminder>`
-  to the end of the text removed.
+  tries. A user message (or a system prompt) left blank after stripping
+  counts as no text and is skipped — exactly like a textless `tool_result`
+  turn for user text, or "no system prompt at all" for the system prompt.
+  This only changes the classification input: the payload forwarded to the
+  provider is never modified. A block with no closing tag has everything
+  from `<system-reminder>` to the end of the text removed.
 
 ## autoMode (optional)
 
@@ -175,12 +202,16 @@ cache_write_tok, dur_ms, status(success|aborted|error), stream, error?`
 
 `trace-*.jsonl`:
 `ts, req_id, client, endpoint, requested_model, input{messages_n,
-last_user_text?, tokens_est, tools, has_image, stream}, routing{mode,
-matched_route, reason, decided_by_text?, walk?, …scores when semantic}, resolved{provider, model, api, translation?},
+last_user_text?, system_text?, tokens_est, tools, has_image, stream},
+routing{mode, matched_route, reason, decided_by_text?, walk?, system_score?,
+…scores when semantic}, resolved{provider, model, api, translation?},
 attempts[{n, target, result, ms}], usage?{in_tok, out_tok, cache_read_tok,
 cache_write_tok}`
 
-`routing.mode` is `semantic` when the newest user text decided the route
+`routing.mode` is `semantic_system` when the request's **system prompt**
+decided the route on its own — cleared the stricter system-prompt threshold
+`0.50` before any user text was consulted at all (see "Classification
+behavior" above) — `semantic` when the newest user text decided the route
 (match or below-threshold fallback), `semantic_history` when the newest text
 scored below the threshold and an earlier user text matched instead (the
 `reason` says how far back), `no_text` when the request carried no classifiable
@@ -193,14 +224,21 @@ pinned to the configured `autoMode` target (see "autoMode" above, in which
 case `matched_route` reads `<auto-mode>`, a display-only label rather than a
 real route name), resolved by the requested model name when `autoMode` is
 unset but that name matches a route, or falling back to `default` when
-neither applies. Every mode except `semantic`'s match, `semantic_history`,
-and a `manual`/`utility_bypass` resolved by name or `autoMode` means the
-request fell back to `default`.
+neither applies. Every mode except `semantic_system`, `semantic`'s match,
+`semantic_history`, and a `manual`/`utility_bypass` resolved by name or
+`autoMode` means the request fell back to `default`.
 
 `routing.decided_by_text` is the first 200 characters of whichever text
-actually decided the route — present only on a match (`semantic` or
-`semantic_history`), absent on a `default` fallback. `routing.walk` lists
-every text the history walk tried, in order, as `{texts_back, top_score}`
+actually decided the route — present only on a match (`semantic_system`,
+`semantic`, or `semantic_history`), absent on a `default` fallback. For
+`semantic_system` this is the system prompt itself, not a user message.
+`routing.system_score` is the system prompt's top candidate score, recorded
+whenever system-prompt classification was *attempted* — even when it missed
+`0.50` and the request fell through to the user-text walk (`system_score` is
+then still present, but `mode` will be `semantic`/`semantic_history`/etc.
+instead) — so it doubles as tuning data for the threshold; absent when the
+request carried no system prompt or no classifier was loaded. `routing.walk`
+lists every text the history walk tried, in order, as `{texts_back, top_score}`
 pairs, so a single trace line shows which text won and how the walk got there
 without having to re-derive it from scores alone.
 
