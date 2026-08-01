@@ -1154,7 +1154,6 @@ mod tests {
     fn test_resolution(targets: Vec<route::Target>) -> route::Resolution {
         route::Resolution {
             route_name: "r".to_string(),
-            kind: route::MatchKind::Exact,
             targets,
         }
     }
@@ -1387,17 +1386,16 @@ mod tests {
         assert_eq!(texts, vec!["the real ask"]);
     }
 
-    fn resolution(route_name: &str, kind: route::MatchKind) -> route::Resolution {
+    fn resolution(route_name: &str) -> route::Resolution {
         route::Resolution {
             route_name: route_name.to_string(),
-            kind,
             targets: Vec::new(),
         }
     }
 
     #[test]
     fn routing_from_reports_no_classifier() {
-        let res = resolution(crate::config::DEFAULT_ROUTE, route::MatchKind::Exact);
+        let res = resolution(crate::config::DEFAULT_ROUTE);
         let attempt = SemanticAttempt {
             resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
             outcome: SemanticOutcome::NoClassifier,
@@ -1421,7 +1419,7 @@ mod tests {
 
     #[test]
     fn routing_from_reports_no_text_distinct_from_no_classifier() {
-        let res = resolution(crate::config::DEFAULT_ROUTE, route::MatchKind::Exact);
+        let res = resolution(crate::config::DEFAULT_ROUTE);
         let attempt = SemanticAttempt {
             resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
             outcome: SemanticOutcome::NoText,
@@ -1446,7 +1444,7 @@ mod tests {
 
     #[test]
     fn routing_from_reports_a_semantic_match() {
-        let res = resolution("role-writer", route::MatchKind::Exact);
+        let res = resolution("role-writer");
         let attempt = SemanticAttempt {
             resolve_as: "role-writer".to_string(),
             outcome: SemanticOutcome::Matched { texts_back: 0 },
@@ -1484,7 +1482,7 @@ mod tests {
 
     #[test]
     fn routing_from_reports_a_history_match_with_its_distance() {
-        let res = resolution("role-tester", route::MatchKind::Exact);
+        let res = resolution("role-tester");
         let attempt = SemanticAttempt {
             resolve_as: "role-tester".to_string(),
             outcome: SemanticOutcome::Matched { texts_back: 2 },
@@ -1531,7 +1529,7 @@ mod tests {
 
     #[test]
     fn routing_from_explains_a_fallback_below_threshold() {
-        let res = resolution(crate::config::DEFAULT_ROUTE, route::MatchKind::Exact);
+        let res = resolution(crate::config::DEFAULT_ROUTE);
         let attempt = SemanticAttempt {
             resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
             outcome: SemanticOutcome::BelowThreshold { texts_tried: 3 },
@@ -1587,7 +1585,7 @@ mod tests {
 
     #[test]
     fn routing_from_reports_manual_mode_with_the_sent_model_name() {
-        let res = resolution("gpt-5-codex", route::MatchKind::Exact);
+        let res = resolution("gpt-5-codex");
         let attempt = SemanticAttempt {
             resolve_as: "gpt-5-codex".to_string(),
             outcome: SemanticOutcome::Manual,
@@ -1612,7 +1610,7 @@ mod tests {
 
     #[test]
     fn routing_from_reports_utility_bypass_resolved_to_the_requested_model() {
-        let res = resolution("role-writer", route::MatchKind::Exact);
+        let res = resolution("role-writer");
         let attempt = SemanticAttempt {
             resolve_as: "role-writer".to_string(),
             outcome: SemanticOutcome::UtilityBypass {
@@ -1644,7 +1642,7 @@ mod tests {
 
     #[test]
     fn routing_from_reports_utility_bypass_falling_back_to_default() {
-        let res = resolution(crate::config::DEFAULT_ROUTE, route::MatchKind::Exact);
+        let res = resolution(crate::config::DEFAULT_ROUTE);
         let attempt = SemanticAttempt {
             resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
             outcome: SemanticOutcome::UtilityBypass {

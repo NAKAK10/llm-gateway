@@ -45,25 +45,24 @@ upstream may be registered under several ids to expose different protocols.
 
 ## routes.<name>
 
-The name is what clients send as `model`. Must not contain `:` or `/`.
-A trailing `*` is still accepted as a prefix wildcard, but wildcard routes are
-an advanced hand-written escape hatch now: `init` does not generate them,
-`GET /v1/models` does not list them, and classification never scores them.
+The name is what clients send as `model`. Must not contain `*`, `:`, or `/` —
+route names are matched exactly; a `*` anywhere in the name (a wildcard route
+name, e.g. `claude-*`) fails config validation.
 
-Every **non-wildcard** route participates as a classification candidate,
-including the reserved `default` route.
+Every route participates as a classification candidate, including the
+reserved `default` route.
 
 | field | default | notes |
 |---|---|---|
 | `title` | *(none)* | Display only. |
-| `description` | *(required on non-wildcard routes)* | `string` or `string[]`. Each entry is inline text, or a path when it starts with `./` `../` `/` `~/` (relative paths resolve against the config dir). This is the classification corpus: every request's newest user text (walking back through history when the newest scores below the threshold — see "Classification behavior") is embedded and compared against every non-wildcard route's `description`. Write it as "when should this route win?" Write it **in the language you give instructions in** — the embedding model aligns meaning weakly across languages, so a description in a different language than the request scores far lower (see the README's [Content-classified routing](../README.md#content-classified-routing)). A `string[]` embeds each entry separately and scores the route by the **max cosine across all variants** — the typical use is one variant per language, so mixed-language traffic (a human writing Japanese, a sub-agent or harness sending English) matches whichever variant fits, instead of diluting both in one mean-pooled string. `llm-gateway init` generates every `description`, including `default`'s, in whichever language you tell it you write instructions in — and as a two-entry array (`[that language, English]`) whenever the chosen language isn't English. |
-| `model.default` | *(required)* | `"<provider>/<model>"`, split on the **first** `/` only — `openrouter/anthropic/claude-x` and `ollama-cloud/glm:cloud` both parse. `*` in the model part expands only when a wildcard route is actually resolved. |
+| `description` | *(required)* | `string` or `string[]`. Each entry is inline text, or a path when it starts with `./` `../` `/` `~/` (relative paths resolve against the config dir). This is the classification corpus: every request's newest user text (walking back through history when the newest scores below the threshold — see "Classification behavior") is embedded and compared against every route's `description`. Write it as "when should this route win?" Write it **in the language you give instructions in** — the embedding model aligns meaning weakly across languages, so a description in a different language than the request scores far lower (see the README's [Content-classified routing](../README.md#content-classified-routing)). A `string[]` embeds each entry separately and scores the route by the **max cosine across all variants** — the typical use is one variant per language, so mixed-language traffic (a human writing Japanese, a sub-agent or harness sending English) matches whichever variant fits, instead of diluting both in one mean-pooled string. `llm-gateway init` generates every `description`, including `default`'s, in whichever language you tell it you write instructions in — and as a two-entry array (`[that language, English]`) whenever the chosen language isn't English. |
+| `model.default` | *(required)* | `"<provider>/<model>"`, split on the **first** `/` only — `openrouter/anthropic/claude-x` and `ollama-cloud/glm:cloud` both parse. No `*` allowed in the model part; every model must be explicit. |
 | `model.fallbacks` | `[]` | Tried in order, only before the first response byte, only on connect failure / timeout / 408 / 429 / 5xx. May use a provider with a different `api` than the default — reachability from the client's protocol is checked per attempt at request time (see [Cross-protocol routing](../README.md#cross-protocol-routing)), not by `config check`; a target the client's protocol cannot reach is skipped. |
 
 ### Reserved route: `default`
 
 A route literally named `default` is **required**. Validation rejects configs
-that omit it or try to make it a wildcard.
+that omit it.
 
 `default` has two jobs:
 
@@ -116,7 +115,7 @@ need launcher-specific overrides.
 |---|---|---|
 | `extraArgs` | claude / codex / opencode | Inserted before user-supplied arguments. |
 | `wireApi` | codex | `"responses"` (default) or `"chat"`. The gateway serves both endpoints; which one your Codex accepts depends on its version — Codex CLI 0.145+ removed `"chat"` entirely and requires `"responses"`, and the gateway now translates `openai-responses → openai-chat` per attempt so an `openai-chat`-only provider is still reachable with `wireApi` left at the default. |
-| `models` | opencode | Route names to expose. Empty = every non-wildcard route. Verified against the live gateway before starting. |
+| `models` | opencode | Route names to expose. Empty = every route. Verified against the live gateway before starting. |
 | `overrideProviders` | opencode | Built-in opencode provider ids whose `baseURL` is redirected to the gateway. Default: `["openai", "anthropic"]`. |
 
 ## logging

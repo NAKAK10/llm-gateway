@@ -2,6 +2,35 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-08-01 — Wildcard route names abolished
+
+Route-*name* wildcards (`claude-*` → longest-prefix match, see the
+2026-07-31 entry below) are gone. Model-string wildcards were already
+rejected — this closes the other half.
+
+**Not a bug fix — an owner policy decision.** A hand-written `claude-*`
+route is an easy way to intercept far more traffic than intended: it wins
+on the raw client-sent model string for any request routed via
+`x-gw-auto-route: 0` or the `<transcript>` utility bypass (the only two
+places that ever resolved a wildcard route name — everything else routes by
+content classification, which never scored wildcard routes), and a slightly
+too-broad prefix silently swallows requests it was never meant to catch.
+Banning it in `docs/` or a code comment is not enforcement; the owner asked
+for the mechanism itself to be gone so the risk cannot resurface by a future
+hand-edit of `config.json`.
+
+**`src/config/validate.rs` now hard-errors on any route name containing
+`*`**, at both `config check` and `serve`/hot-reload startup — a config with
+a wildcard route name never becomes live. With wildcard route names
+impossible in a validated `Config`, the matching logic that made them work
+was dead weight and is deleted, not just unreachable: `route::find_route`
+(`src/route.rs`) is exact-match only now, and `Resolution`/`MatchKind`
+shrank to drop the `Wildcard` variant and the `kind` field entirely (nothing
+outside tests ever read it). `Config::listable_routes`
+(`src/config/mod.rs`) and `RouteIndex::build` (`src/semantic/index.rs`) both
+lose their now-permanently-no-op `!name.contains('*')` filters for the same
+reason.
+
 ## 2026-08-01 — Cache observability before cache transfer
 
 Record of where prompt caching stands today: a client's cache hints

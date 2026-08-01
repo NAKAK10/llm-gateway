@@ -312,7 +312,6 @@ pub fn endpoint_url(target: &Target, count_tokens: bool) -> String {
 mod tests {
     use super::*;
     use crate::config::{ModelRef, SecretRef};
-    use crate::route::MatchKind;
 
     fn target(api: ApiKind, base: &str) -> Target {
         Target {
@@ -390,7 +389,6 @@ mod tests {
 
         let resolution = Resolution {
             route_name: "r".into(),
-            kind: MatchKind::Exact,
             targets: vec![bad, also_bad],
         };
         let http = client().unwrap();

@@ -12,7 +12,7 @@ pub struct UsageRecord {
     pub ts: String,
     /// From the `x-gw-client` header, falling back to `user-agent`.
     pub client: String,
-    /// Route key that matched (may be a wildcard pattern).
+    /// Route key that matched.
     pub route: String,
     pub provider: String,
     /// Model actually sent upstream, after `*` expansion.

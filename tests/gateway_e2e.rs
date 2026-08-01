@@ -401,7 +401,7 @@ async fn unknown_model_is_a_404_with_a_hint() {
 }
 
 #[tokio::test]
-async fn models_endpoint_lists_routes_but_not_wildcards() {
+async fn models_endpoint_lists_every_route() {
     let mut config = Config::default();
     config.providers.insert(
         "mock".into(),
@@ -410,9 +410,6 @@ async fn models_endpoint_lists_routes_but_not_wildcards() {
     config
         .routes
         .insert("role-a".into(), route_to("mock/m", &[]));
-    config
-        .routes
-        .insert("claude-*".into(), route_to("mock/*", &[]));
 
     let addr = spawn_gateway(config, None).await;
     let body: serde_json::Value = reqwest::get(format!("http://{addr}/v1/models"))
@@ -427,7 +424,7 @@ async fn models_endpoint_lists_routes_but_not_wildcards() {
         .iter()
         .map(|m| m["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, vec!["role-a"], "wildcards must not be advertised");
+    assert_eq!(ids, vec!["role-a"]);
 }
 
 #[tokio::test]

@@ -104,9 +104,9 @@ client needs to stay happy.
 ## Content-classified routing
 
 Classification is now always on. For every inbound request, the gateway embeds
-the **newest user text**, compares it against every non-wildcard route's
-`description` with static `model2vec-rs` embeddings, and picks the top match if
-it clears the fixed cosine threshold **0.45**.
+the **newest user text**, compares it against every route's `description`
+with static `model2vec-rs` embeddings, and picks the top match if it clears
+the fixed cosine threshold **0.45**.
 
 When the newest user text does not clear the bar — or the newest user message
 carries no text at all, which is the normal state of an agentic turn whose last
@@ -135,9 +135,9 @@ Important consequences:
   skips classification entirely and always routes to `default`.
 - **`llm-gateway init` always downloads the embedding model** (roughly 500 MB)
   before it writes `config.json`.
-- **Every non-wildcard route needs a real `description`.** That text is both
-  documentation and the classification corpus; boilerplate descriptions produce
-  boilerplate routing.
+- **Every route needs a real `description`.** That text is both documentation
+  and the classification corpus; boilerplate descriptions produce boilerplate
+  routing.
 - **Write `description` in the language you give instructions in.** The
   embedding model (`potion-multilingual-128M`) aligns meaning weakly across
   languages: measured cosine similarity between a Japanese instruction and an
@@ -163,9 +163,9 @@ Important consequences:
   A model string can no longer borrow the client's requested model name: since
   routing is decided purely by content classification, there is nothing left
   for a `*` to substitute at request time, and one now fails config validation.
-- **Wildcard route names are now an advanced hand-written escape hatch only.**
-  `init` does not generate them, `GET /v1/models` does not list them, and the
-  classifier never scores them.
+- **Wildcard route names (`claude-*` and the like) are rejected outright.**
+  Every route name is matched exactly; a `*` anywhere in a route name fails
+  config validation.
 
 ```json5
 routes: {
@@ -454,7 +454,7 @@ launch: {
 | `providers.<id>.apiKey` | resolved per request attempt, so env/Keychain/`command:` rotation is picked up live. |
 | `providers.<id>.api` | a route's `default` and `fallbacks` may each use a different `api`; reachability from the client's protocol is checked per attempt at request time, not by `config check`. |
 | `routes.default` | required. It is the reserved catch-all when no route clears the classification threshold, and it also participates as a normal candidate. |
-| `routes.<name>.description` | required on every non-wildcard route. Inline text or `./`/`../`/`/`/`~/` path; this is the classification corpus. |
+| `routes.<name>.description` | required on every route. Inline text or `./`/`../`/`/`/`~/` path; this is the classification corpus. |
 | `routes.<name>.model.default` | `"<provider>/<model>"`, split on the first `/` only. |
 | `routes.<name>.model.fallbacks` | may use a different `api` than the default; tried in order before the first response byte, skipping any target the client's protocol cannot reach (see [Cross-protocol routing](#cross-protocol-routing)). |
 | `launch` | optional advanced escape hatch only: Claude/Codex/opencode extra args, Codex `wireApi`, opencode `models`/`overrideProviders`. |

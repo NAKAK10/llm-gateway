@@ -62,10 +62,11 @@ assigns this provider to (e.g. `role-architect`, `role-implementer` — see
 and an explicit `model: { default: "anthropic/claude-sonnet-4-6" }` — the
 wizard fetches the provider's model list over its API where possible and lets
 you pick one, falling back to a pre-filled text prompt when it can't. Route
-*selection* is done by classification against that description, not by a
-`claude-*` wildcard being the normal path, and the model itself can no longer
-be a `*` wildcard either: since routing no longer looks at the client's
-requested model string, there is nothing left for one to substitute.
+*selection* is done by classification against that description — a `claude-*`
+wildcard route name is not an alternative, it fails config validation — and
+the model itself can no longer be a `*` wildcard either: since routing no
+longer looks at the client's requested model string, there is nothing left
+for one to substitute.
 
 ### OpenAI
 

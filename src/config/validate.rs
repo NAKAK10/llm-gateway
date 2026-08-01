@@ -15,13 +15,14 @@ use crate::error::ValidationReport;
 /// Errors (block startup):
 /// - a route references a provider that is not defined
 /// - a `model` string is not `"<provider>/<model>"`
-/// - a route name contains `:` or `/`
-/// - a non-wildcard route has no `description` — every request is classified
-///   against every route's description now, so a route without one can never
-///   win and is effectively unreachable
-/// - no route named `default` exists, or it is a wildcard — this is the
-///   reserved catch-all used when nothing clears the classification
-///   threshold (see `crate::semantic::index`)
+/// - a route name contains `*`, `:`, or `/` — wildcard route names are not
+///   supported (see the 2026-08-01 entry in `docs/decisions.md`)
+/// - a route has no `description` — every request is classified against
+///   every route's description now, so a route without one can never win
+///   and is effectively unreachable
+/// - no route named `default` exists — this is the reserved catch-all used
+///   when nothing clears the classification threshold (see
+///   `crate::semantic::index`)
 /// - `server.host` is not loopback and `server.api_key` is unset
 /// - a `description` has no variants (an empty array), or one of its
 ///   variants is empty
@@ -40,14 +41,16 @@ pub fn validate(config: &Config, config_path: &Path) -> ValidationReport {
     let mut used_providers: BTreeSet<&str> = BTreeSet::new();
 
     for (route_name, route) in &config.routes {
-        let name_without_wildcard: String = route_name.chars().filter(|&c| c != '*').collect();
-        if name_without_wildcard.contains(':') || name_without_wildcard.contains('/') {
+        if route_name.contains('*') {
             report.error(format!(
-                "route `{route_name}`: name contains `:` or `/` outside the wildcard `*`, which is not allowed"
+                "route `{route_name}`: route names may not contain `*`; wildcard route names are not supported"
             ));
         }
-
-        let is_wildcard = route_name.contains('*');
+        if route_name.contains(':') || route_name.contains('/') {
+            report.error(format!(
+                "route `{route_name}`: name contains `:` or `/`, which is not allowed"
+            ));
+        }
 
         match &route.description {
             Some(description) => {
@@ -73,17 +76,15 @@ pub fn validate(config: &Config, config_path: &Path) -> ValidationReport {
                     }
                 }
             }
-            // Every request is classified against every non-wildcard route's
-            // description now (see `crate::semantic::index`) — a route
-            // without one can never win and its `model` is unreachable.
-            None if !is_wildcard => {
+            // Every request is classified against every route's description
+            // now (see `crate::semantic::index`) — a route without one can
+            // never win and its `model` is unreachable.
+            None => {
                 report.error(format!(
                     "route `{route_name}` has no description; it can never be picked by \
-                     classification and its model is unreachable — add one, or make the route \
-                     a wildcard forwarding rule instead"
+                     classification and its model is unreachable — add one"
                 ));
             }
-            None => {}
         }
 
         resolve_target(
@@ -107,15 +108,11 @@ pub fn validate(config: &Config, config_path: &Path) -> ValidationReport {
         }
     }
 
-    match config.routes.get(DEFAULT_ROUTE) {
-        None => {
-            report.error(format!(
-                "no route named `{DEFAULT_ROUTE}` is defined; it is the reserved catch-all used \
-                 when no candidate clears the classification threshold — every config needs one"
-            ));
-        }
-        Some(_) if DEFAULT_ROUTE.contains('*') => unreachable!("the constant has no wildcard"),
-        Some(_) => {}
+    if !config.routes.contains_key(DEFAULT_ROUTE) {
+        report.error(format!(
+            "no route named `{DEFAULT_ROUTE}` is defined; it is the reserved catch-all used \
+             when no candidate clears the classification threshold — every config needs one"
+        ));
     }
 
     if !config.server.is_loopback() && config.server.api_key.is_none() {
@@ -424,25 +421,32 @@ mod tests {
         );
     }
 
-    /// A wildcard route needs no `description` — it can never be a
-    /// classification candidate, so one would do nothing.
+    /// Wildcard route names are banned outright: a hand-written `claude-*`
+    /// risks silently intercepting requests it was never meant to catch, so
+    /// the mechanism that made it work is gone, not just discouraged.
     #[test]
-    fn wildcard_route_name_is_allowed_without_a_description() {
+    fn wildcard_route_name_is_rejected() {
         let mut c = minimal_config();
-        let mut wildcard = route("anthropic/sonnet-pinned", &[]);
-        wildcard.description = None;
-        c.routes.insert("claude-*".into(), wildcard);
+        c.routes
+            .insert("claude-*".into(), route("anthropic/sonnet-pinned", &[]));
 
         let report = validate(&c, &nonexistent_path());
-        assert!(report.is_ok(), "{:?}", report.errors);
+        assert!(!report.is_ok());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("claude-*") && e.contains("wildcard")),
+            "{:?}",
+            report.errors
+        );
     }
 
     #[test]
     fn wildcard_model_is_rejected() {
         let mut c = minimal_config();
-        let mut wildcard = route("anthropic/*", &[]);
-        wildcard.description = None;
-        c.routes.insert("claude-*".into(), wildcard);
+        c.routes
+            .insert("role-claude".into(), route("anthropic/*", &[]));
 
         let report = validate(&c, &nonexistent_path());
         assert!(!report.is_ok());
