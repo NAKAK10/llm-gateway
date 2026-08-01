@@ -226,6 +226,7 @@ mod tests {
             input: trace_log::TraceInput {
                 messages_n: 1,
                 last_user_text: None,
+                system_text: None,
                 tokens_est: 1,
                 tools: vec![],
                 has_image: false,
@@ -241,6 +242,7 @@ mod tests {
                 embed_ms: None,
                 decided_by_text: None,
                 walk: None,
+                system_score: None,
             },
             resolved: trace_log::TraceResolved {
                 provider: "anthropic".to_string(),

@@ -134,10 +134,15 @@ pub fn format_line(record: &TraceRecord) -> String {
     };
     // `semantic_history` is the one mode where "which text won" is not
     // obvious from the route alone — the newest text didn't clear threshold,
-    // an older one did. Shown only there; every other mode either has no
-    // decided-by text or it is unambiguously the newest message already
-    // implied by `input.last_user_text`.
-    let decided_by_suffix = if record.routing.mode == "semantic_history" {
+    // an older one did. `semantic_system` is the other: the winning text is
+    // the system prompt, never shown anywhere else on the line. Both modes
+    // show it; every other mode either has no decided-by text or it is
+    // unambiguously the newest message already implied by
+    // `input.last_user_text`.
+    let decided_by_suffix = if matches!(
+        record.routing.mode.as_str(),
+        "semantic_history" | "semantic_system"
+    ) {
         match &record.routing.decided_by_text {
             Some(text) => format!(" decided_by={text:?}"),
             None => String::new(),
@@ -172,6 +177,7 @@ mod tests {
             input: TraceInput {
                 messages_n: 1,
                 last_user_text: None,
+                system_text: None,
                 tokens_est: 10,
                 tools: Vec::new(),
                 has_image: false,
@@ -187,6 +193,7 @@ mod tests {
                 embed_ms: None,
                 decided_by_text: None,
                 walk: None,
+                system_score: None,
             },
             resolved: TraceResolved {
                 provider: "anthropic".to_string(),
@@ -310,6 +317,21 @@ mod tests {
             format_line(&record),
             "12:34:56 claude-code→role-tester score=0.70 [anthropic/claude-sonnet-4-6] \
              ok_first_byte decided_by=\"now write the tests\""
+        );
+    }
+
+    #[test]
+    fn semantic_system_shows_which_system_prompt_decided_it() {
+        let mut record = base_record();
+        record.routing.mode = "semantic_system".to_string();
+        record.routing.matched_route = "role-explorer".to_string();
+        record.routing.score = Some(0.62);
+        record.routing.decided_by_text =
+            Some("You are a read-only exploration subagent.".to_string());
+        assert_eq!(
+            format_line(&record),
+            "12:34:56 claude-code→role-explorer score=0.62 [anthropic/claude-sonnet-4-6] \
+             ok_first_byte decided_by=\"You are a read-only exploration subagent.\""
         );
     }
 

@@ -103,10 +103,15 @@ client needs to stay happy.
 
 ## Content-classified routing
 
-Classification is now always on. For every inbound request, the gateway embeds
-the **newest user text**, compares it against every route's `description`
-with static `model2vec-rs` embeddings, and picks the top match if it clears
-the fixed cosine threshold **0.45**.
+Classification is now always on. For every inbound request — before the
+newest user text is even looked at — the gateway first tries the request's
+**system prompt** (see [System-prompt classification](#system-prompt-classification)
+below); only when that does not decide the route does it fall through to the
+newest user text.
+
+For that fallback, the gateway embeds the **newest user text**, compares it
+against every route's `description` with static `model2vec-rs` embeddings,
+and picks the top match if it clears the fixed cosine threshold **0.45**.
 
 When the newest user text does not clear the bar — or the newest user message
 carries no text at all, which is the normal state of an agentic turn whose last
@@ -172,6 +177,10 @@ Important consequences:
   endpoint, not real user turns — classifying them against `description`s
   would route them arbitrarily. See `autoMode` below for where they resolve
   instead.
+- **The request's system prompt is tried before any user text.** See
+  [System-prompt classification](#system-prompt-classification) below —
+  this is what lets a Claude Code subagent's own role definition decide
+  the route instead of whatever the user's instruction happens to mention.
 
 ```json5
 routes: {
@@ -212,6 +221,42 @@ routes: {
   },
 }
 ```
+
+### System-prompt classification
+
+Some requests carry a stronger routing signal than anything the user typed:
+the **system prompt** — an agent's own definition of its role. A Claude Code
+Task subagent (Explore, a custom `.claude/agents/*.md` agent, …), Codex CLI,
+and opencode all send one, and for a subagent it usually *is* the role
+definition, verbatim. The gateway tries this before it ever looks at user
+text — see `routing.mode = "semantic_system"` in [Record formats](docs/config-reference.md#record-formats).
+
+Where it comes from depends on protocol: Anthropic Messages' dedicated
+`system` field, OpenAI Chat's leading `system`/`developer` message, or OpenAI
+Responses' `instructions` field (falling back to a leading `system`/
+`developer` item in `input` when `instructions` is empty — opencode sends it
+that way). Only the *beginning* of it ever reaches the classifier — the same
+800-character / 64-token embedding limit that applies to user text (see
+above) applies here too — which is exactly the shape a subagent definition
+has: the role description comes first.
+
+**The threshold is stricter: 0.50, not 0.45.** A genuine role definition
+scores in the same range a same-language `description` match does
+(0.55–0.79); a harness's own generic system-prompt preamble ("You are Claude
+Code, an interactive CLI tool...") must not clear this bar, or every
+ordinary main-loop request of a session would get pinned to whatever route
+that preamble happens to resemble. If the system prompt does not clear 0.50
+— or the request has none, or no classifier is loaded — routing falls
+through to the newest-user-text walk described above, unaffected.
+
+This was built after a real misroute: a Claude Code Explore subagent's own
+investigation prompt ("コードベースを調査してください(LP作成タスクに向けて)")
+scored 0.501 against `role-implementer` — pulled there by the object
+("LP作成", a landing-page build) the *user's* instruction mentioned — while
+the correct `role-explorer` scored only 0.331. The subagent's system prompt
+(a read-only-exploration-agent definition) is unambiguous about which role
+it is; the user's text, taken out of context, is not. See the 2026-08-01
+entry in `docs/decisions.md` for the full writeup.
 
 ### `autoMode`: a fast, dedicated target for Claude Code's own internal judgment
 

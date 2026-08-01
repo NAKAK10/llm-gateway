@@ -30,6 +30,16 @@ use crate::semantic::embed::Embedder;
 /// `potion-multilingual-128M` embedding model.
 pub const CLASSIFICATION_THRESHOLD: f32 = 0.45;
 
+/// Stricter threshold for classifying a request's *system prompt* (agent
+/// definition) — deliberately higher than [`CLASSIFICATION_THRESHOLD`]. A
+/// subagent's system prompt that genuinely describes a role scores in the
+/// same-language description range (0.55-0.79, see `src/cli/init.rs`'s
+/// docs), while a harness's generic boilerplate ("You are Claude Code, ...")
+/// must NOT clear this bar — a false positive here would pin every main-loop
+/// request of a session to one role. Tune against trace logs (the
+/// `system_text` input field records what clients actually send).
+pub const SYSTEM_CLASSIFICATION_THRESHOLD: f32 = 0.50;
+
 /// One candidate available to the classifier.
 ///
 /// `vectors` holds one already-L2-normalized embedding (see `Embedder::load`)
@@ -313,16 +323,33 @@ impl Classifier {
         }
     }
 
-    /// Classify `text` against every candidate route.
+    /// Classify `text` against every candidate route, at
+    /// [`CLASSIFICATION_THRESHOLD`].
     ///
     /// Always returns a `Verdict`: `matched` is `None` when embedding `text`
     /// fails, no candidate is reachable from `expected_api`, or the best
-    /// score misses [`CLASSIFICATION_THRESHOLD`] — and in all of those
-    /// cases the caller should fall back to the reserved `default` route
+    /// score misses the threshold — and in all of those cases the caller
+    /// should fall back to the reserved `default` route
     /// (`crate::config::DEFAULT_ROUTE`). `candidates` is still populated
     /// where possible, for a caller that wants to record what was
     /// considered (e.g. tracing).
     pub fn classify(&self, text: &str, expected_api: ApiKind) -> Verdict {
+        self.classify_with_threshold(text, expected_api, CLASSIFICATION_THRESHOLD)
+    }
+
+    /// Same as [`Classifier::classify`], but against a caller-supplied
+    /// `threshold` instead of the fixed [`CLASSIFICATION_THRESHOLD`].
+    ///
+    /// Exists for system-prompt classification (`src/server/proxy.rs`),
+    /// which applies the stricter [`SYSTEM_CLASSIFICATION_THRESHOLD`] instead
+    /// — the embedding, index lookup, and scoring machinery is identical,
+    /// only the bar a winner must clear differs.
+    pub fn classify_with_threshold(
+        &self,
+        text: &str,
+        expected_api: ApiKind,
+        threshold: f32,
+    ) -> Verdict {
         self.stale_check.sync(self.shared.generation(), || {
             let config = self.shared.get();
             self.index
@@ -345,12 +372,7 @@ impl Classifier {
             };
         };
 
-        let scored = rank(
-            &vector,
-            &index.candidates,
-            expected_api,
-            CLASSIFICATION_THRESHOLD,
-        );
+        let scored = rank(&vector, &index.candidates, expected_api, threshold);
         Verdict {
             matched: scored.winner,
             candidates: scored.all,
@@ -576,6 +598,48 @@ mod tests {
             .expect("an English-shaped query clears threshold via the en variant");
         assert_eq!(route, "role-writer");
         assert!((score - 1.0).abs() < 1e-6, "{score}");
+    }
+
+    /// `Classifier::classify_with_threshold` differs from `classify` only in
+    /// which threshold it hands `rank` — this exercises that mechanism at the
+    /// `rank` level (no loaded embedding model needed, same reasoning as
+    /// every other test in this module) by picking a score that clears
+    /// `CLASSIFICATION_THRESHOLD` but misses the stricter
+    /// `SYSTEM_CLASSIFICATION_THRESHOLD`. This is exactly the gap
+    /// system-prompt classification relies on: harness boilerplate that
+    /// would win ordinary user-text classification must not win
+    /// system-prompt classification.
+    #[test]
+    fn a_score_between_the_two_thresholds_wins_at_the_lower_one_only() {
+        let candidates = vec![candidate(
+            "role-x",
+            vec![1.0, 0.0],
+            ApiKind::AnthropicMessages,
+        )];
+        // Dot product with [1.0, 0.0] is exactly 0.475 — between 0.45 and 0.50.
+        let query = [0.475, 0.88];
+
+        let at_user_threshold = rank(
+            &query,
+            &candidates,
+            ApiKind::AnthropicMessages,
+            CLASSIFICATION_THRESHOLD,
+        );
+        assert!(
+            at_user_threshold.winner.is_some(),
+            "0.475 clears the 0.45 user-text threshold"
+        );
+
+        let at_system_threshold = rank(
+            &query,
+            &candidates,
+            ApiKind::AnthropicMessages,
+            SYSTEM_CLASSIFICATION_THRESHOLD,
+        );
+        assert!(
+            at_system_threshold.winner.is_none(),
+            "0.475 misses the stricter 0.50 system-prompt threshold"
+        );
     }
 
     #[test]

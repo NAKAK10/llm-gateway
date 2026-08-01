@@ -2,6 +2,101 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-08-01 — System-prompt classification: an agent's own role definition decides routing before user text does
+
+Semantic classification (the entries below, from "Always classify" onward)
+only ever looked at the *user's* text. That is the wrong signal for an
+agentic sub-request whose "user" turn is really an instruction from another
+agent. Real example that surfaced this: a Claude Code Explore subagent's own
+investigation prompt —
+
+> コードベースを調査してください(LP作成タスクに向けて)
+> ("Please investigate the codebase, for an LP [landing page] creation task")
+
+— scored **0.501** against `role-implementer`, pulled there by the object
+("LP作成", the landing-page task) the *user's* original instruction mentioned
+several turns earlier, while the correct `role-explorer` scored only
+**0.331**. The Explore subagent's own system prompt — a definition of a
+read-only exploration agent, sent by Claude Code's Task tool on every
+subagent invocation — was never consulted, even though it unambiguously
+names the role. User text, taken out of the conversation it belongs to, is
+an unreliable signal for "what role is this particular sub-request playing";
+an agent's own system prompt is not.
+
+**Built: system-prompt classification, tried before the user-text walk.**
+`system_prompt_text` (`src/server/proxy.rs`) extracts the system prompt per
+`ApiKind` — Anthropic Messages' dedicated `system` field (flattened via
+`translate::request::system_text`, already `pub(crate)` for
+`agent::claude_cli`'s benefit), OpenAI Chat's leading `system`/`developer`
+message (`translate::request::message_text`), or OpenAI Responses'
+`instructions` field, falling back to a leading `system`/`developer` item in
+`input` when `instructions` is empty (opencode sends it that way) — then
+strips `<system-reminder>...</system-reminder>` blocks the same way
+`classification_texts` does for user text, on the same reasoning (see the
+2026-07-31 entry below). `classify_request` tries this extracted text,
+if any, immediately after the `<transcript>` bypass and before the
+newest-user-text walk; a match short-circuits the walk entirely —
+`SemanticOutcome::MatchedSystem`, `routing.mode = "semantic_system"` — and
+user text is never even embedded for that request.
+
+**A stricter, separate threshold: `SYSTEM_CLASSIFICATION_THRESHOLD = 0.50`,**
+not the ordinary `CLASSIFICATION_THRESHOLD = 0.45`. A genuine role
+definition scores in the same range a same-language `description` match does
+(0.55–0.79, per the 2026-07-31 language-matching entry below) — comfortably
+clearing 0.50 — while a harness's own generic system-prompt preamble ("You
+are Claude Code, an interactive CLI tool...") must not clear it: that text is
+identical across essentially every request of a session regardless of what
+the session is actually doing, so a false positive here would pin an entire
+session to one role instead of just one mis-scored turn (the failure mode
+the 2026-07-31 `<system-reminder>`-stripping entry already fixed once for
+user text). `Classifier::classify` is now a thin wrapper over the new
+`Classifier::classify_with_threshold(text, expected_api, threshold)`, which
+`rank` (already threshold-parameterized and unit-tested independently of any
+loaded embedding model) takes the caller's threshold directly rather than
+the fixed constant.
+
+**The 800-character / 64-token embedding bound (`Embedder::embed`) applies
+here exactly as it does to user text — this is deliberate, not a side
+effect to work around.** Only the *beginning* of a system prompt ever
+reaches the classifier. This is why the feature targets subagent
+definitions specifically: a Claude Code subagent's `.claude/agents/*.md`
+prompt (or the Task tool's built-in agents, like Explore) puts the role
+description first, so it survives truncation intact; a harness's own long
+preamble does not reliably distinguish itself from another harness's within
+the first 800 characters, which is a second, independent reason the
+threshold has to be strict — truncation alone does not guarantee the
+boilerplate stays below it.
+
+**Trace log gained two fields for observing this, both intentionally
+"always attempted" rather than "only on a match."** `TraceInput.system_text`
+(`src/record/trace_log.rs`) records the system prompt's first 200 characters
+whenever one is present, regardless of outcome — the same truncation
+`last_user_text` already gets. `TraceRouting.system_score` records the
+system prompt's top candidate score whenever classification was
+*attempted*, even on a miss that fell through to the user-text walk — so a
+trace file becomes tuning data for `SYSTEM_CLASSIFICATION_THRESHOLD` without
+needing `serve --debug-full`, the same design intent `walk` already served
+for the user-text threshold. Both are `#[serde(default)]` so old trace files
+without them still deserialize. `llm-gateway trace`'s `format_line` shows
+`decided_by_text` for `semantic_system` the same way it already did for
+`semantic_history` — the winning text is never otherwise visible on the
+line.
+
+**Not tested end-to-end with a real embedding model, same limitation the
+user-text walk already has.** No test anywhere in this codebase — not the
+existing `classify_request` tests, not `tests/gateway_e2e.rs` — loads the
+real `potion-multilingual-128M` model; `AppState.classifier` is `None` in
+every one of them, and `rank`'s pure, model-independent design (see its own
+doc comment) exists specifically so classification logic can be unit-tested
+without it. Coverage here follows the same split: `system_prompt_text`'s
+per-protocol extraction is fully unit-tested, `classify_with_threshold`'s
+threshold enforcement is tested at the `rank` level, and `routing_from`'s
+`semantic_system` trace shape is tested directly — but "does a real
+subagent system prompt actually clear 0.50 against a real route
+description" rests on the same reasoning already applied to the
+`description` language-matching numbers below (0.55–0.79 measured
+same-language), not a new automated check.
+
 ## 2026-08-01 — `Config::auto_mode`: Claude Code's internal auto-mode judgment gets its own, route-independent target
 
 A prior fix (`classify_request`'s `<transcript>` bypass, `src/server/proxy.rs`)

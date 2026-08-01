@@ -38,6 +38,15 @@ pub struct TraceInput {
     /// Truncated to 200 characters unless `--debug-full`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_user_text: Option<String>,
+    /// The request's system prompt (agent definition), truncated the same
+    /// way `last_user_text` is. `None` when the request carries no system
+    /// prompt at all, or what it carries strips down to blank — see
+    /// `system_prompt_text` (`src/server/proxy.rs`). Recorded regardless of
+    /// whether system-prompt classification matched, fell back, or never ran
+    /// (no classifier loaded), so a trace file has this for every request
+    /// that carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_text: Option<String>,
     /// Rough estimate — this is for spotting long-context requests, not billing.
     pub tokens_est: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -81,6 +90,17 @@ pub struct TraceRouting {
     /// Omitted when the walk never ran (same conditions as `candidates`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub walk: Option<Vec<TraceWalkStep>>,
+    /// The system prompt's top candidate score, recorded whenever
+    /// system-prompt classification was *attempted* — even when it missed
+    /// the system-prompt threshold and the request fell through to ordinary
+    /// user-text classification. `None` when the request carried no system
+    /// prompt, or no classifier was available to score it. Unlike `score`
+    /// (which reflects whichever classification step actually decided
+    /// `matched_route`), this is always populated on an attempt, so it can
+    /// double as tuning data for the system-prompt threshold without
+    /// `--debug-full`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_score: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +194,7 @@ mod tests {
             input: TraceInput {
                 messages_n: 3,
                 last_user_text: Some("hello".to_string()),
+                system_text: None,
                 tokens_est: 42,
                 tools: vec![],
                 has_image: false,
@@ -189,6 +210,7 @@ mod tests {
                 embed_ms: None,
                 decided_by_text: None,
                 walk: None,
+                system_score: None,
             },
             resolved: TraceResolved {
                 provider: "anthropic".to_string(),
@@ -244,5 +266,25 @@ mod tests {
         assert_eq!(usage.out_tok, 34);
         assert_eq!(usage.cache_read_tok, 0);
         assert_eq!(usage.cache_write_tok, 0);
+    }
+
+    /// A trace file written before system-prompt classification existed has
+    /// `routing` objects with no `system_score` key at all — those must
+    /// still parse, with the field defaulting to `None`.
+    #[test]
+    fn old_trace_routing_without_system_score_still_deserializes() {
+        let json = r#"{"mode":"semantic","matched_route":"role-writer","reason":"r",
+            "candidates":[],"score":null,"threshold":null,"embed_ms":null,
+            "decided_by_text":null,"walk":null}"#;
+        let routing: TraceRouting = serde_json::from_str(json).unwrap();
+        assert!(routing.system_score.is_none());
+    }
+
+    /// Same backward-compatibility guarantee for `TraceInput.system_text`.
+    #[test]
+    fn old_trace_input_without_system_text_still_deserializes() {
+        let json = r#"{"messages_n":1,"tokens_est":1,"tools":[],"has_image":false,"stream":false}"#;
+        let input: TraceInput = serde_json::from_str(json).unwrap();
+        assert!(input.system_text.is_none());
     }
 }
