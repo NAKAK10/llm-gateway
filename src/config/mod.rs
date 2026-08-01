@@ -25,8 +25,8 @@ pub use secret::SecretRef;
 /// The reserved route name used when a request's content does not clear the
 /// classification threshold for any other route (or is not classified at
 /// all — a build without the `semantic` feature, an unloaded classifier).
-/// `validate` requires this route to exist and forbids it from being a
-/// wildcard; every other route is an ordinary classification candidate.
+/// `validate` requires this route to exist; every other route is an ordinary
+/// classification candidate.
 pub const DEFAULT_ROUTE: &str = "default";
 
 /// Root of `config.json`.
@@ -42,10 +42,21 @@ pub struct Config {
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
 
-    /// Names that clients ask for. Either an exact name or a `*`-suffixed
-    /// wildcard such as `claude-*`.
+    /// Names that clients ask for. Wildcard names (a `*` anywhere in the
+    /// key) are rejected by `validate` — every route name matches exactly.
     #[serde(default)]
     pub routes: BTreeMap<String, RouteConfig>,
+
+    /// The target for Claude Code's own internal `<transcript>`-prefixed
+    /// auto-mode judgment requests — see `crate::server::proxy::classify_request`.
+    /// Deliberately separate from `routes`: it never depends on a route name or
+    /// the client's requested model string, only on what the operator pins here,
+    /// so it can be pointed at a fast target regardless of what model name the
+    /// client's internal classifier happens to ask for. `None` falls back to
+    /// resolving by the requested model name, then `default`, same as before
+    /// this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_mode: Option<ModelConfig>,
 
     /// Per-client launch tweaks (`llm-gateway launch claude|codex|opencode`).
     /// Every field has a sane built-in default, so a normal `config.json`
@@ -265,7 +276,7 @@ pub struct RouteConfig {
     /// regardless of what model name the client sent, is classified against
     /// every route's `description` and dispatched to whichever route's text
     /// is the closest match. A route with no description cannot win — see
-    /// `validate`, which requires one on every non-wildcard route.
+    /// `validate`, which requires one on every route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<Description>,
 
@@ -453,7 +464,7 @@ fn default_wire_api() -> String {
 pub struct LaunchOpencode {
     /// Route names exposed to opencode. Each must appear in `GET /v1/models`
     /// verbatim — opencode fails silently on a mismatch rather than erroring.
-    /// Empty means "every non-wildcard route".
+    /// Empty means "every route".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
 
@@ -592,17 +603,9 @@ impl Config {
         self.providers.get(id)
     }
 
-    /// Route names that are safe to advertise in `GET /v1/models`.
-    ///
-    /// Wildcards are excluded: they are forwarding rules, not selectable
-    /// models, and listing them would let a client pick the literal string
-    /// `claude-*`.
+    /// Route names, for advertising in `GET /v1/models`.
     pub fn listable_routes(&self) -> Vec<&str> {
-        self.routes
-            .keys()
-            .filter(|k| !k.contains('*'))
-            .map(|k| k.as_str())
-            .collect()
+        self.routes.keys().map(|k| k.as_str()).collect()
     }
 }
 

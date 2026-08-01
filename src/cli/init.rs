@@ -181,20 +181,21 @@ async fn fetch_models(provider: KnownProvider, key: Option<&str>) -> Result<Vec<
 /// models, so this keeps the prompt within a typical terminal height.
 const MODEL_SELECT_MAX_ROWS: usize = 10;
 
-/// Ask which model backs one role's route, presenting a fetched model list as
-/// a single-choice (radio) prompt when the wizard could reach the provider's
+/// Ask which model backs one route, presenting a fetched model list as a
+/// single-choice (radio) prompt when the wizard could reach the provider's
 /// `/models` endpoint, and falling back to a free-text prompt — pre-filled
 /// with [`KnownProvider::default_model`] — when it could not.
+///
+/// `for_what` names what the model is for, already phrased to read naturally
+/// as `"Model for {for_what} (via {provider})"` — `` the `role-writer` role ``
+/// for a role's route, or a plainer phrase like `Claude Code's auto-mode`
+/// for `Config::auto_mode`, which is not a role at all.
 async fn choose_model(
-    role: AgentRole,
+    for_what: &str,
     provider: KnownProvider,
     key: Option<&str>,
 ) -> Result<String> {
-    let prompt = format!(
-        "Model for the `{}` role (via {})",
-        role.label(),
-        provider.label()
-    );
+    let prompt = format!("Model for {for_what} (via {})", provider.label());
     match fetch_models(provider, key).await {
         Ok(models) => {
             let default = provider.default_model().to_string();
@@ -310,7 +311,7 @@ fn extract_claude_model_aliases(help_text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Ask which model backs one *subscription*-authenticated role's route.
+/// Ask which model backs one *subscription*-authenticated route.
 ///
 /// A subscription CLI's model is generally not knowable from here (which
 /// models a ChatGPT plan allows cannot be probed at all — see
@@ -321,14 +322,22 @@ fn extract_claude_model_aliases(help_text: &str) -> Vec<String> {
 /// there instead, with a "custom" option for anything not in that list (the
 /// help text's examples are illustrative, not exhaustive) and the same
 /// free-text fallback as [`choose_model`] if the CLI could not be read.
-fn choose_subscription_model(role: AgentRole, provider: KnownProvider) -> Result<String> {
+///
+/// `for_what` is the same display phrase [`choose_model`] takes. `preferred`
+/// is the alias pre-selected when the list is shown — `sonnet` for an
+/// ordinary role's route, `haiku` for `Config::auto_mode`, where the whole
+/// point is picking the fastest available model rather than the strongest.
+fn choose_subscription_model(
+    for_what: &str,
+    provider: KnownProvider,
+    preferred: &str,
+) -> Result<String> {
     if provider.subscription_transport() != Some(crate::config::Transport::ClaudeCli) {
         return Ok(provider.subscription_model().to_string());
     }
 
     let prompt = format!(
-        "Model for the `{}` role (via {}, subscription)",
-        role.label(),
+        "Model for {for_what} (via {}, subscription)",
         provider.label()
     );
     let aliases = claude_cli_model_aliases();
@@ -348,18 +357,16 @@ fn choose_subscription_model(role: AgentRole, provider: KnownProvider) -> Result
         select = select.item(alias.clone(), alias.clone(), "");
     }
     select = select.item(CUSTOM.to_string(), "Custom (type a model id)", "");
-    if aliases.iter().any(|alias| alias == "sonnet") {
-        select = select.initial_value("sonnet".to_string());
+    if aliases.iter().any(|alias| alias == preferred) {
+        select = select.initial_value(preferred.to_string());
     }
     let choice = select.interact()?;
     if choice == CUSTOM {
-        Ok(cliclack::input(format!(
-            "Model for the `{}` role (via {})",
-            role.label(),
-            provider.label()
-        ))
-        .default_input(provider.subscription_model())
-        .interact()?)
+        Ok(
+            cliclack::input(format!("Model for {for_what} (via {})", provider.label()))
+                .default_input(provider.subscription_model())
+                .interact()?,
+        )
     } else {
         Ok(choice)
     }
@@ -546,18 +553,75 @@ pub async fn run() -> Result<()> {
             // is no key to probe `/models` with — so this branch cannot
             // reuse `choose_model`. `claude` is still asked for real, though:
             // see `choose_subscription_model`.
+            let for_what = format!("the `{}` role", role.label());
             let model = if subscriptions.contains(&provider) {
-                choose_subscription_model(role, provider)?
+                choose_subscription_model(&for_what, provider, "sonnet")?
             } else {
                 let key = resolve_key_for_fetch(provider, &providers, &discovered);
-                choose_model(role, provider, key.as_deref()).await?
+                choose_model(&for_what, provider, key.as_deref()).await?
             };
             roles.push((role, provider, model));
         }
     }
 
-    let mut config =
-        build_config_with_auth(&clients, &providers, storage, &subscriptions, &roles, lang);
+    // Asked once every role is assigned, not before: it needs to know which
+    // providers are already configured so it can offer them, same as a role's
+    // own provider question. Claude Code's own internal auto-mode judgment
+    // (whether an action needs the user's approval) calls back through this
+    // same gateway — see `crate::server::proxy::classify_request` — and
+    // sharing a slow, generation-heavy route with it was observed to make
+    // Claude Code time out and reject the action outright (see the
+    // 2026-08-01 entry in `docs/decisions.md`). Recommended by default: most
+    // setups benefit from pinning this to something fast, and the prompt can
+    // simply be declined.
+    let auto_mode = if selected_providers.is_empty() {
+        None
+    } else {
+        let want_auto_mode = cliclack::confirm(
+            "Configure a fast dedicated model for Claude Code's auto-mode (its internal \
+             approve/reject judgment calls)? Recommended — otherwise those calls share \
+             whatever route `default` points at, which may be too slow for Claude Code's \
+             own timeout.",
+        )
+        .initial_value(true)
+        .interact()?;
+
+        if want_auto_mode {
+            let mut auto_mode_provider_select =
+                cliclack::select("Which provider should answer auto-mode's judgment calls?");
+            for provider in &selected_providers {
+                let hint = if subscriptions.contains(provider) {
+                    "subscription"
+                } else {
+                    ""
+                };
+                auto_mode_provider_select =
+                    auto_mode_provider_select.item(*provider, provider.label(), hint);
+            }
+            let provider = auto_mode_provider_select.interact()?;
+
+            const FOR_WHAT: &str = "Claude Code's auto-mode";
+            let model = if subscriptions.contains(&provider) {
+                choose_subscription_model(FOR_WHAT, provider, "haiku")?
+            } else {
+                let key = resolve_key_for_fetch(provider, &providers, &discovered);
+                choose_model(FOR_WHAT, provider, key.as_deref()).await?
+            };
+            Some((provider, model))
+        } else {
+            None
+        }
+    };
+
+    let mut config = build_config_with_auth(
+        &clients,
+        &providers,
+        storage,
+        &subscriptions,
+        &roles,
+        lang,
+        auto_mode.as_ref(),
+    );
     for provider in &env_fallback {
         let key = SecretRef::new(format!("${{{}}}", provider.env_var()));
         if let Some(provider_config) = config.providers.get_mut(provider.id()) {
@@ -1294,11 +1358,11 @@ pub fn build_config(
     roles: &[(AgentRole, KnownProvider, String)],
     lang: DescriptionLanguage,
 ) -> crate::config::Config {
-    build_config_with_auth(clients, providers, storage, &[], roles, lang)
+    build_config_with_auth(clients, providers, storage, &[], roles, lang, None)
 }
 
 /// [`build_config`], plus the providers whose credential is a subscription
-/// rather than a key.
+/// rather than a key, and an optional `Config::auto_mode` assignment.
 ///
 /// A subscription choice replaces the API-key provider entirely: it adds a
 /// *different* provider id (`<id>-subscription`) with an agent-CLI transport,
@@ -1306,6 +1370,12 @@ pub fn build_config(
 /// key to hold for it, so a provider entry for one would always fail with an
 /// empty credential. A role assigned to that provider resolves its route to
 /// the `<id>-subscription` provider automatically.
+///
+/// `auto_mode` is `(provider, model)` for `Config::auto_mode`, resolved the
+/// same way a role's `(provider, model)` is — through the same subscription-id
+/// or plain-id `target_for` mapping — or `None` to leave `Config::auto_mode`
+/// unset (the wizard's "skip" answer, and every existing caller from before
+/// this field existed).
 pub fn build_config_with_auth(
     _clients: &[Client],
     providers: &[(KnownProvider, Option<String>)],
@@ -1313,6 +1383,7 @@ pub fn build_config_with_auth(
     subscriptions: &[KnownProvider],
     roles: &[(AgentRole, KnownProvider, String)],
     lang: DescriptionLanguage,
+    auto_mode: Option<&(KnownProvider, String)>,
 ) -> crate::config::Config {
     use crate::config::{ApiKind, Config, ModelConfig, ProviderConfig, RouteConfig};
 
@@ -1448,6 +1519,17 @@ pub fn build_config_with_auth(
                 ..Default::default()
             },
         );
+    }
+
+    // Independent of `routes` — see the doc comment on `Config::auto_mode` —
+    // but resolved to a provider id the same way a role's `(provider, model)`
+    // is: the subscription id when that provider was chosen as one, its
+    // plain id otherwise.
+    if let Some((provider, model)) = auto_mode {
+        config.auto_mode = Some(ModelConfig {
+            default: format!("{}/{model}", target_for(*provider)),
+            fallbacks: Vec::new(),
+        });
     }
 
     // The subscription provider entry itself — not a route, since a role
@@ -1593,6 +1675,7 @@ mod tests {
                 "claude-sonnet-5".to_string(),
             )],
             DescriptionLanguage::English,
+            None,
         );
 
         let provider = config
@@ -1631,6 +1714,7 @@ mod tests {
                 "claude-sonnet-5".to_string(),
             )],
             DescriptionLanguage::English,
+            None,
         );
         assert!(!config.providers.contains_key("anthropic"));
         assert!(config.providers.contains_key("anthropic-subscription"));
@@ -1667,6 +1751,7 @@ mod tests {
                 ),
             ],
             DescriptionLanguage::English,
+            None,
         );
         assert_eq!(
             config.routes["role-manager"].model.default,
@@ -1731,6 +1816,7 @@ mod tests {
                 "default".to_string(),
             )],
             DescriptionLanguage::English,
+            None,
         );
         let provider = &config.providers["openai-subscription"];
         assert_eq!(provider.transport, crate::config::Transport::CodexCli);
@@ -1772,6 +1858,7 @@ mod tests {
             &[],
             &roles,
             DescriptionLanguage::English,
+            None,
         );
         let without = build_config(
             &[Client::Claude],
@@ -1784,6 +1871,89 @@ mod tests {
             serde_json::to_string(&with).unwrap(),
             serde_json::to_string(&without).unwrap()
         );
+    }
+
+    /// `build_config` never passes an `auto_mode` — every caller from before
+    /// this field existed must keep producing a config with it unset.
+    #[test]
+    fn build_config_leaves_auto_mode_unset() {
+        let config = build_config(
+            &[Client::Claude],
+            &[(KnownProvider::Anthropic, None)],
+            KeyStorage::Keychain,
+            &[(
+                AgentRole::Manager,
+                KnownProvider::Anthropic,
+                "claude-sonnet-5".to_string(),
+            )],
+            DescriptionLanguage::English,
+        );
+        assert!(config.auto_mode.is_none());
+    }
+
+    /// Declining the wizard's `autoMode` prompt (`None`) must leave the field
+    /// unset, same as omitting it in hand-written `config.json`.
+    #[test]
+    fn declining_auto_mode_leaves_it_unset() {
+        let config = build_config_with_auth(
+            &[Client::Claude],
+            &[(KnownProvider::Anthropic, None)],
+            KeyStorage::Keychain,
+            &[],
+            &[(
+                AgentRole::Manager,
+                KnownProvider::Anthropic,
+                "claude-sonnet-5".to_string(),
+            )],
+            DescriptionLanguage::English,
+            None,
+        );
+        assert!(config.auto_mode.is_none());
+    }
+
+    /// Accepting it scaffolds `Config::auto_mode` in the same
+    /// `"<provider>/<model>"` shape a route's `model.default` uses, resolved
+    /// through the plain provider id — the API-key path, not a subscription.
+    #[test]
+    fn accepting_auto_mode_scaffolds_it_via_the_plain_provider_id() {
+        let config = build_config_with_auth(
+            &[Client::Claude],
+            &[(KnownProvider::Anthropic, None)],
+            KeyStorage::Keychain,
+            &[],
+            &[(
+                AgentRole::Manager,
+                KnownProvider::Anthropic,
+                "claude-sonnet-5".to_string(),
+            )],
+            DescriptionLanguage::English,
+            Some(&(KnownProvider::Anthropic, "claude-haiku-fast".to_string())),
+        );
+        let auto_mode = config.auto_mode.expect("auto_mode was accepted");
+        assert_eq!(auto_mode.default, "anthropic/claude-haiku-fast");
+        assert!(auto_mode.fallbacks.is_empty());
+    }
+
+    /// A provider chosen as a subscription resolves `auto_mode.default`
+    /// through the `<id>-subscription` provider id, same as a role's route
+    /// does — there is no plain-key provider entry to point at instead.
+    #[test]
+    fn auto_mode_via_a_subscription_provider_uses_its_subscription_id() {
+        let config = build_config_with_auth(
+            &[Client::Claude],
+            &[(KnownProvider::Anthropic, None)],
+            KeyStorage::Keychain,
+            &[KnownProvider::Anthropic],
+            &[(
+                AgentRole::Manager,
+                KnownProvider::Anthropic,
+                "claude-sonnet-5".to_string(),
+            )],
+            DescriptionLanguage::English,
+            Some(&(KnownProvider::Anthropic, "haiku".to_string())),
+        );
+        let auto_mode = config.auto_mode.expect("auto_mode was accepted");
+        assert_eq!(auto_mode.default, "anthropic-subscription/haiku");
     }
 
     #[test]

@@ -1,14 +1,15 @@
 //! Turning a route name into an ordered list of upstreams.
 //!
-//! Resolution itself stays boring: exact route name first, then the
-//! longest-prefix wildcard. What changed is *which* route name gets resolved
-//! — `crate::server::proxy::classify_request` always decides that first, by
-//! classifying the request's content against every route's `description`;
-//! the model name the client sent plays no part in it. `resolve` here just
-//! turns whatever name classification (or the `default` fallback) picked
-//! into a concrete `Target`.
+//! Resolution itself stays boring: exact route name match, nothing else —
+//! route names may not contain `*` (enforced by `crate::config::validate`),
+//! so there is no prefix matching to speak of. What changed is *which* route
+//! name gets resolved — `crate::server::proxy::classify_request` always
+//! decides that first, by classifying the request's content against every
+//! route's `description`; the model name the client sent plays no part in
+//! it. `resolve` here just turns whatever name classification (or the
+//! `default` fallback) picked into a concrete `Target`.
 
-use crate::config::{ApiKind, Config, ModelRef, ProviderConfig, SecretRef};
+use crate::config::{ApiKind, Config, ModelConfig, ModelRef, ProviderConfig, SecretRef};
 use crate::error::{Error, Result};
 
 /// A resolved upstream: which provider, which model, and which protocol.
@@ -36,70 +37,63 @@ impl std::fmt::Display for Target {
     }
 }
 
-/// Why a particular route was chosen. Recorded verbatim in the trace log so a
-/// surprising choice can be explained after the fact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatchKind {
-    /// The client named the route exactly.
-    Exact,
-    /// A `*`-suffixed route matched by prefix.
-    Wildcard,
-}
-
-impl MatchKind {
-    pub fn reason(self) -> &'static str {
-        match self {
-            Self::Exact => "exact route name match",
-            Self::Wildcard => "wildcard route prefix match",
-        }
-    }
-}
-
 /// The outcome of resolving one request.
 #[derive(Debug, Clone)]
 pub struct Resolution {
-    /// Route key from the config (may contain `*`).
+    /// Route key from the config.
     pub route_name: String,
-    pub kind: MatchKind,
     /// `default` first, then `fallbacks`, each paired with its provider's
     /// protocol. Never empty.
     pub targets: Vec<Target>,
 }
 
-/// Resolve `requested` against the configured routes.
-///
-/// Wildcards match by prefix and the **longest** pattern wins, so a specific
-/// `claude-opus-*` can coexist with a catch-all `claude-*` without ordering
-/// tricks in the config file.
+/// Resolve `requested` against the configured routes by exact name match.
 pub fn resolve(config: &Config, requested: &str) -> Result<Resolution> {
-    let (route_name, route, kind) =
+    let (route_name, route) =
         find_route(config, requested).ok_or_else(|| Error::NoRoute(requested.to_string()))?;
 
-    let mut refs = Vec::with_capacity(1 + route.model.fallbacks.len());
-    refs.push(route.model.default.as_str());
-    refs.extend(route.model.fallbacks.iter().map(String::as_str));
+    let targets = resolve_model(config, &format!("route `{route_name}`"), &route.model)?;
+
+    Ok(Resolution {
+        route_name: route_name.to_string(),
+        targets,
+    })
+}
+
+/// Resolve a bare `ModelConfig` (`default` + `fallbacks`) straight to
+/// targets, without going through a route name.
+///
+/// Used both by [`resolve`] (via a route's `model`) and by
+/// `crate::server::proxy` for `Config::auto_mode`, which has no route name to
+/// look up — Claude Code's own internal `<transcript>`-prefixed auto-mode
+/// judgment requests are pinned to whatever the operator configured there,
+/// deliberately bypassing route-name resolution entirely.
+///
+/// `context` labels any error this produces — a pre-formatted phrase such as
+/// `` route `role-writer` `` or `` the `autoMode` config ``, since this
+/// function itself has no route name to blame a malformed entry on.
+pub fn resolve_model(config: &Config, context: &str, model: &ModelConfig) -> Result<Vec<Target>> {
+    let mut refs = Vec::with_capacity(1 + model.fallbacks.len());
+    refs.push(model.default.as_str());
+    refs.extend(model.fallbacks.iter().map(String::as_str));
 
     let mut targets = Vec::with_capacity(refs.len());
     for raw in refs {
         let parsed = ModelRef::parse(raw).ok_or_else(|| {
             Error::Other(format!(
-                "route `{route_name}` has malformed model `{raw}`; expected \"<provider>/<model>\""
+                "{context} has malformed model `{raw}`; expected \"<provider>/<model>\""
             ))
         })?;
         let provider = config
             .provider(&parsed.provider)
             .ok_or_else(|| Error::UnknownProvider {
                 provider: parsed.provider.clone(),
-                route: route_name.to_string(),
+                context: context.to_string(),
             })?;
         targets.push(build_target(parsed, provider));
     }
 
-    Ok(Resolution {
-        route_name: route_name.to_string(),
-        kind,
-        targets,
-    })
+    Ok(targets)
 }
 
 fn build_target(model_ref: ModelRef, provider: &ProviderConfig) -> Target {
@@ -122,23 +116,11 @@ fn build_target(model_ref: ModelRef, provider: &ProviderConfig) -> Target {
 fn find_route<'c>(
     config: &'c Config,
     requested: &str,
-) -> Option<(&'c str, &'c crate::config::RouteConfig, MatchKind)> {
-    if let Some((name, route)) = config.routes.get_key_value(requested) {
-        return Some((name.as_str(), route, MatchKind::Exact));
-    }
-
-    // Longest prefix wins, so `claude-opus-*` beats `claude-*`.
+) -> Option<(&'c str, &'c crate::config::RouteConfig)> {
     config
         .routes
-        .iter()
-        .filter_map(|(name, route)| {
-            let prefix = name.strip_suffix('*')?;
-            requested
-                .starts_with(prefix)
-                .then_some((prefix.len(), name.as_str(), route))
-        })
-        .max_by_key(|(len, _, _)| *len)
-        .map(|(_, name, route)| (name, route, MatchKind::Wildcard))
+        .get_key_value(requested)
+        .map(|(name, route)| (name.as_str(), route))
 }
 
 #[cfg(test)]
@@ -180,43 +162,23 @@ mod tests {
             route("openrouter/qwen/qwen3.5", &["openrouter/deepseek/v4"]),
         );
         c.routes
-            .insert("claude-*".into(), route("anthropic/sonnet-pinned", &[]));
-        c.routes
-            .insert("claude-opus-*".into(), route("anthropic/opus-pinned", &[]));
+            .insert("role-claude".into(), route("anthropic/sonnet-pinned", &[]));
         c
     }
 
     #[test]
-    fn exact_match_beats_wildcard() {
+    fn exact_match_resolves_the_named_route() {
         let c = config();
         let r = resolve(&c, "role-writer").unwrap();
-        assert_eq!(r.kind, MatchKind::Exact);
         assert_eq!(r.route_name, "role-writer");
         assert_eq!(r.targets.len(), 2);
         assert_eq!(r.targets[0].model_ref.model, "qwen/qwen3.5");
     }
 
     #[test]
-    fn route_name_wildcard_still_matches_by_prefix() {
-        let c = config();
-        let r = resolve(&c, "claude-sonnet-4-6").unwrap();
-        assert_eq!(r.kind, MatchKind::Wildcard);
-        assert_eq!(r.targets[0].model_ref.provider, "anthropic");
-        assert_eq!(r.targets[0].model_ref.model, "sonnet-pinned");
-    }
-
-    #[test]
-    fn longest_wildcard_prefix_wins() {
-        let c = config();
-        let r = resolve(&c, "claude-opus-4-6").unwrap();
-        assert_eq!(r.route_name, "claude-opus-*");
-        assert_eq!(r.targets[0].model_ref.model, "opus-pinned");
-    }
-
-    #[test]
     fn trailing_slash_is_stripped_from_base_url() {
         let c = config();
-        let r = resolve(&c, "claude-sonnet-4-6").unwrap();
+        let r = resolve(&c, "role-claude").unwrap();
         assert_eq!(r.targets[0].base_url, "https://example.test/v1");
     }
 

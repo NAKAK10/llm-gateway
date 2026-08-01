@@ -69,6 +69,15 @@ const CLASSIFICATION_THRESHOLD: f32 = 0.45;
 #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
 const HISTORY_WALK_LIMIT: usize = 8;
 
+/// Display-only `resolve_as` / trace-log `matched_route` label for a
+/// `<transcript>`-prefixed utility request resolved via `Config::auto_mode`.
+/// Never looked up as a route name — `Config::auto_mode` is resolved
+/// directly, via `route::resolve_model`, bypassing route-name lookup
+/// entirely — so nothing checks whether this string collides with an actual
+/// route name.
+#[cfg_attr(not(feature = "semantic"), allow(dead_code))]
+const AUTO_MODE_LABEL: &str = "<auto-mode>";
+
 /// Whether classification should run for this request.
 ///
 /// Defaults to `true` (the historical always-classify behaviour) so a
@@ -144,12 +153,13 @@ pub async fn proxy(
     // The one opt-out is `x-gw-auto-route: 0`, set by `llm-gateway launch`
     // when the session answered "no" to the auto-classify prompt — then the
     // model name the client sent is what gets resolved, unclassified.
-    let semantic_attempt = if auto_route_requested(&headers) {
+    let mut semantic_attempt = if auto_route_requested(&headers) {
         classify_request(&state, &config, &payload, expected_api, &requested_model)
     } else {
         SemanticAttempt {
             resolve_as: requested_model.clone(),
             outcome: SemanticOutcome::Manual,
+            resolved_targets: None,
             candidates: Vec::new(),
             score: None,
             embed_ms: 0,
@@ -157,21 +167,32 @@ pub async fn proxy(
             walk: Vec::new(),
         }
     };
-    let resolve_target = semantic_attempt.resolve_as.as_str();
 
-    let mut resolution = match route::resolve(&config, resolve_target) {
-        Ok(r) => r,
-        Err(Error::NoRoute(_)) => {
-            return error_response(
-                http::StatusCode::NOT_FOUND,
-                &format!(
-                    "no route matches model `{requested_model}`; \
-                     GET /v1/models lists the available names"
-                ),
-            );
+    // `Config::auto_mode` resolves straight to targets, with no route name
+    // lookup at all — see `classify_request`'s `<transcript>` bypass. Every
+    // other outcome (including the other two `UtilityBypass` shapes) still
+    // goes through `route::resolve` by name, same as before this field
+    // existed.
+    let mut resolution = if let Some(targets) = semantic_attempt.resolved_targets.take() {
+        route::Resolution {
+            route_name: semantic_attempt.resolve_as.clone(),
+            targets,
         }
-        Err(err) => {
-            return error_response(http::StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
+    } else {
+        match route::resolve(&config, semantic_attempt.resolve_as.as_str()) {
+            Ok(r) => r,
+            Err(Error::NoRoute(_)) => {
+                return error_response(
+                    http::StatusCode::NOT_FOUND,
+                    &format!(
+                        "no route matches model `{requested_model}`; \
+                         GET /v1/models lists the available names"
+                    ),
+                );
+            }
+            Err(err) => {
+                return error_response(http::StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
+            }
         }
     };
 
@@ -603,6 +624,12 @@ fn trace_record(
 struct SemanticAttempt {
     resolve_as: String,
     outcome: SemanticOutcome,
+    /// Pre-resolved targets that bypass the route-name lookup entirely — set
+    /// only when [`SemanticOutcome::UtilityBypass`] resolved via
+    /// `Config::auto_mode` directly. `resolve_as` is still populated in that
+    /// case, but only as a display-only label (`"<auto-mode>"`) for the trace
+    /// log's `matched_route` — it is never looked up as a route name.
+    resolved_targets: Option<Vec<route::Target>>,
     /// The scored candidate list of the embed that decided the outcome: the
     /// matching text's on a match, the newest text's on a
     /// below-threshold fallback (to show how close the closest came).
@@ -653,12 +680,33 @@ enum SemanticOutcome {
     /// The newest user text begins with `<transcript>` — a client-internal
     /// utility request (e.g. Claude Code's auto-mode permission classifier
     /// asking its own gateway a yes/no question), not a real user turn.
-    /// Embedding classification is skipped entirely; `resolve_as` is the
-    /// model name the client sent when a route matches it
-    /// (`resolved_to_requested: true`), or the reserved `default` route
-    /// otherwise — so a utility request never 404s just because no route is
-    /// named after the client's internal classifier model.
-    UtilityBypass { resolved_to_requested: bool },
+    /// Embedding classification is skipped entirely; see
+    /// [`UtilityBypassResolution`] for how `resolve_as` (or
+    /// `resolved_targets`) ended up decided — so a utility request never
+    /// 404s just because no route is named after the client's internal
+    /// classifier model, and, when `Config::auto_mode` is configured, never
+    /// gets routed through the (possibly slow) `default` route at all.
+    UtilityBypass(UtilityBypassResolution),
+}
+
+/// How a `<transcript>`-prefixed utility request's bypass was resolved —
+/// three distinct ways `SemanticOutcome::UtilityBypass` can end up deciding
+/// `resolve_as` (or `resolved_targets`), each needing its own trace-log
+/// wording.
+#[cfg_attr(not(feature = "semantic"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UtilityBypassResolution {
+    /// `Config::auto_mode` was configured: resolved straight to its
+    /// pre-resolved targets, bypassing route-name lookup (and the `default`
+    /// route) entirely — see `route::resolve_model`.
+    AutoModeConfig,
+    /// `Config::auto_mode` was unset (or, defensively, failed to resolve
+    /// even though `validate` should have already caught that): the
+    /// requested model name matched a route by exact name.
+    RequestedModel,
+    /// Neither `auto_mode` nor the requested model name resolved to
+    /// anything: fell back to the reserved `default` route.
+    DefaultFallback,
 }
 
 /// Build the `routing` block of a trace record.
@@ -707,17 +755,19 @@ fn routing_from(resolution: &route::Resolution, attempt: SemanticAttempt) -> Tra
                 crate::config::DEFAULT_ROUTE,
             ),
         ),
-        SemanticOutcome::UtilityBypass {
-            resolved_to_requested: true,
-        } => (
+        SemanticOutcome::UtilityBypass(UtilityBypassResolution::AutoModeConfig) => (
+            "utility_bypass",
+            "client-internal utility request (text begins with `<transcript>`); \
+             classification skipped, resolved to the configured `autoMode` target"
+                .to_string(),
+        ),
+        SemanticOutcome::UtilityBypass(UtilityBypassResolution::RequestedModel) => (
             "utility_bypass",
             "client-internal utility request (text begins with `<transcript>`); \
              classification skipped, resolved by the requested model name"
                 .to_string(),
         ),
-        SemanticOutcome::UtilityBypass {
-            resolved_to_requested: false,
-        } => (
+        SemanticOutcome::UtilityBypass(UtilityBypassResolution::DefaultFallback) => (
             "utility_bypass",
             format!(
                 "client-internal utility request (text begins with `<transcript>`); \
@@ -770,6 +820,7 @@ fn classify_request(
     let fallback = |outcome: SemanticOutcome| SemanticAttempt {
         resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
         outcome,
+        resolved_targets: None,
         candidates: Vec::new(),
         score: None,
         embed_ms: 0,
@@ -785,15 +836,65 @@ fn classify_request(
     // same gateway with its own internal yes/no prompt, wrapped in a
     // `<transcript>` block — not a real user turn. Semantic classification
     // would route it by whichever role description it happens to cosine-match
-    // closest, which is wrong: resolve it by the model name the client asked
-    // for instead, same as `x-gw-auto-route: 0` does, and skip embedding
-    // entirely.
+    // closest, which is wrong. Worse, the fallback the pre-`auto_mode` bypass
+    // used — the requested model name, or the shared `default` route — was
+    // observed to point `default` at a slow, multi-second subprocess target
+    // in a real environment, which starved this fast yes/no judgment into a
+    // rejection (see the 2026-08-01 entry in `docs/decisions.md`). When
+    // `Config::auto_mode` is set, it is resolved straight to targets here —
+    // via `route::resolve_model`, never a route-name lookup — so the operator
+    // can pin a fast target regardless of what model name the client's
+    // internal classifier happens to ask for; the gateway never fabricates
+    // the judgment itself, it only picks which real LLM answers it. Unset
+    // falls back to the pre-existing behaviour: resolve by the model name the
+    // client asked for, same as `x-gw-auto-route: 0` does, or the reserved
+    // `default` route if that name matches no route.
     if texts.first().is_some_and(|t| t.starts_with("<transcript>")) {
+        if let Some(auto_mode) = &config.auto_mode {
+            match route::resolve_model(config, "the `autoMode` config", auto_mode) {
+                Ok(targets) => {
+                    tracing::info!(
+                        "utility request bypassed classification, resolved to the configured \
+                         `autoMode` target"
+                    );
+                    return SemanticAttempt {
+                        resolve_as: AUTO_MODE_LABEL.to_string(),
+                        outcome: SemanticOutcome::UtilityBypass(
+                            UtilityBypassResolution::AutoModeConfig,
+                        ),
+                        resolved_targets: Some(targets),
+                        candidates: Vec::new(),
+                        score: None,
+                        embed_ms: 0,
+                        decided_by_text: None,
+                        walk: Vec::new(),
+                    };
+                }
+                Err(err) => {
+                    // Defensive only — `validate` already checks `auto_mode`
+                    // at config-load time, so this should not happen in
+                    // practice. Fall through to the requested-model/`default`
+                    // resolution below rather than failing the request
+                    // outright.
+                    tracing::warn!(
+                        "configured `autoMode` failed to resolve ({err}); falling back to the \
+                         requested model name"
+                    );
+                }
+            }
+        }
+
         let resolved_to_requested = route::resolve(config, requested_model).is_ok();
-        let resolve_as = if resolved_to_requested {
-            requested_model.to_string()
+        let (resolve_as, bypass_resolution) = if resolved_to_requested {
+            (
+                requested_model.to_string(),
+                UtilityBypassResolution::RequestedModel,
+            )
         } else {
-            crate::config::DEFAULT_ROUTE.to_string()
+            (
+                crate::config::DEFAULT_ROUTE.to_string(),
+                UtilityBypassResolution::DefaultFallback,
+            )
         };
         tracing::info!(
             resolve_as = %resolve_as,
@@ -801,9 +902,8 @@ fn classify_request(
         );
         return SemanticAttempt {
             resolve_as,
-            outcome: SemanticOutcome::UtilityBypass {
-                resolved_to_requested,
-            },
+            outcome: SemanticOutcome::UtilityBypass(bypass_resolution),
+            resolved_targets: None,
             candidates: Vec::new(),
             score: None,
             embed_ms: 0,
@@ -876,6 +976,7 @@ fn classify_request(
             return SemanticAttempt {
                 resolve_as: route,
                 outcome: SemanticOutcome::Matched { texts_back },
+                resolved_targets: None,
                 candidates: as_trace(&verdict.candidates),
                 score,
                 embed_ms: embed_ms_total,
@@ -908,6 +1009,7 @@ fn classify_request(
     SemanticAttempt {
         resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
         outcome: SemanticOutcome::BelowThreshold { texts_tried },
+        resolved_targets: None,
         candidates: as_trace(&newest.candidates),
         score,
         embed_ms: embed_ms_total,
@@ -927,6 +1029,7 @@ fn classify_request(
     SemanticAttempt {
         resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
         outcome: SemanticOutcome::NoClassifier,
+        resolved_targets: None,
         candidates: Vec::new(),
         score: None,
         embed_ms: 0,
@@ -1154,7 +1257,6 @@ mod tests {
     fn test_resolution(targets: Vec<route::Target>) -> route::Resolution {
         route::Resolution {
             route_name: "r".to_string(),
-            kind: route::MatchKind::Exact,
             targets,
         }
     }
@@ -1387,20 +1489,20 @@ mod tests {
         assert_eq!(texts, vec!["the real ask"]);
     }
 
-    fn resolution(route_name: &str, kind: route::MatchKind) -> route::Resolution {
+    fn resolution(route_name: &str) -> route::Resolution {
         route::Resolution {
             route_name: route_name.to_string(),
-            kind,
             targets: Vec::new(),
         }
     }
 
     #[test]
     fn routing_from_reports_no_classifier() {
-        let res = resolution(crate::config::DEFAULT_ROUTE, route::MatchKind::Exact);
+        let res = resolution(crate::config::DEFAULT_ROUTE);
         let attempt = SemanticAttempt {
             resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
             outcome: SemanticOutcome::NoClassifier,
+            resolved_targets: None,
             candidates: Vec::new(),
             score: None,
             embed_ms: 0,
@@ -1421,10 +1523,11 @@ mod tests {
 
     #[test]
     fn routing_from_reports_no_text_distinct_from_no_classifier() {
-        let res = resolution(crate::config::DEFAULT_ROUTE, route::MatchKind::Exact);
+        let res = resolution(crate::config::DEFAULT_ROUTE);
         let attempt = SemanticAttempt {
             resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
             outcome: SemanticOutcome::NoText,
+            resolved_targets: None,
             candidates: Vec::new(),
             score: None,
             embed_ms: 0,
@@ -1446,10 +1549,11 @@ mod tests {
 
     #[test]
     fn routing_from_reports_a_semantic_match() {
-        let res = resolution("role-writer", route::MatchKind::Exact);
+        let res = resolution("role-writer");
         let attempt = SemanticAttempt {
             resolve_as: "role-writer".to_string(),
             outcome: SemanticOutcome::Matched { texts_back: 0 },
+            resolved_targets: None,
             candidates: vec![
                 TraceCandidate {
                     route: "role-writer".to_string(),
@@ -1484,10 +1588,11 @@ mod tests {
 
     #[test]
     fn routing_from_reports_a_history_match_with_its_distance() {
-        let res = resolution("role-tester", route::MatchKind::Exact);
+        let res = resolution("role-tester");
         let attempt = SemanticAttempt {
             resolve_as: "role-tester".to_string(),
             outcome: SemanticOutcome::Matched { texts_back: 2 },
+            resolved_targets: None,
             candidates: vec![TraceCandidate {
                 route: "role-tester".to_string(),
                 score: 0.7,
@@ -1531,10 +1636,11 @@ mod tests {
 
     #[test]
     fn routing_from_explains_a_fallback_below_threshold() {
-        let res = resolution(crate::config::DEFAULT_ROUTE, route::MatchKind::Exact);
+        let res = resolution(crate::config::DEFAULT_ROUTE);
         let attempt = SemanticAttempt {
             resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
             outcome: SemanticOutcome::BelowThreshold { texts_tried: 3 },
+            resolved_targets: None,
             candidates: vec![TraceCandidate {
                 route: "role-writer".to_string(),
                 score: 0.2,
@@ -1587,10 +1693,11 @@ mod tests {
 
     #[test]
     fn routing_from_reports_manual_mode_with_the_sent_model_name() {
-        let res = resolution("gpt-5-codex", route::MatchKind::Exact);
+        let res = resolution("gpt-5-codex");
         let attempt = SemanticAttempt {
             resolve_as: "gpt-5-codex".to_string(),
             outcome: SemanticOutcome::Manual,
+            resolved_targets: None,
             candidates: Vec::new(),
             score: None,
             embed_ms: 0,
@@ -1612,12 +1719,11 @@ mod tests {
 
     #[test]
     fn routing_from_reports_utility_bypass_resolved_to_the_requested_model() {
-        let res = resolution("role-writer", route::MatchKind::Exact);
+        let res = resolution("role-writer");
         let attempt = SemanticAttempt {
             resolve_as: "role-writer".to_string(),
-            outcome: SemanticOutcome::UtilityBypass {
-                resolved_to_requested: true,
-            },
+            outcome: SemanticOutcome::UtilityBypass(UtilityBypassResolution::RequestedModel),
+            resolved_targets: None,
             candidates: Vec::new(),
             score: None,
             embed_ms: 0,
@@ -1644,12 +1750,11 @@ mod tests {
 
     #[test]
     fn routing_from_reports_utility_bypass_falling_back_to_default() {
-        let res = resolution(crate::config::DEFAULT_ROUTE, route::MatchKind::Exact);
+        let res = resolution(crate::config::DEFAULT_ROUTE);
         let attempt = SemanticAttempt {
             resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
-            outcome: SemanticOutcome::UtilityBypass {
-                resolved_to_requested: false,
-            },
+            outcome: SemanticOutcome::UtilityBypass(UtilityBypassResolution::DefaultFallback),
+            resolved_targets: None,
             candidates: Vec::new(),
             score: None,
             embed_ms: 0,
@@ -1669,6 +1774,41 @@ mod tests {
         assert!(
             routing.reason.contains("matches no route"),
             "reason should explain why it fell back: {}",
+            routing.reason
+        );
+    }
+
+    /// The third `UtilityBypass` shape: `Config::auto_mode` configured, so
+    /// the reason must say so distinctly from either of the other two — a
+    /// human reading the trace log needs to tell "pinned to the fast
+    /// operator-chosen target" apart from "fell back to the requested model"
+    /// or "fell back to `default`".
+    #[test]
+    fn routing_from_reports_utility_bypass_resolved_via_auto_mode_config() {
+        let res = resolution(AUTO_MODE_LABEL);
+        let attempt = SemanticAttempt {
+            resolve_as: AUTO_MODE_LABEL.to_string(),
+            outcome: SemanticOutcome::UtilityBypass(UtilityBypassResolution::AutoModeConfig),
+            resolved_targets: None,
+            candidates: Vec::new(),
+            score: None,
+            embed_ms: 0,
+            decided_by_text: None,
+            walk: Vec::new(),
+        };
+
+        let routing = routing_from(&res, attempt);
+
+        assert_eq!(routing.mode, "utility_bypass");
+        assert_eq!(routing.matched_route, AUTO_MODE_LABEL);
+        assert!(
+            routing.reason.contains("autoMode"),
+            "reason should mention the configured autoMode target: {}",
+            routing.reason
+        );
+        assert!(
+            !routing.reason.contains("matches no route"),
+            "the auto_mode path never blames a missing route match: {}",
             routing.reason
         );
     }
@@ -1837,11 +1977,10 @@ mod tests {
 
         assert_eq!(
             attempt.outcome,
-            SemanticOutcome::UtilityBypass {
-                resolved_to_requested: true
-            }
+            SemanticOutcome::UtilityBypass(UtilityBypassResolution::RequestedModel)
         );
         assert_eq!(attempt.resolve_as, "role-writer");
+        assert!(attempt.resolved_targets.is_none());
         assert!(attempt.candidates.is_empty());
         assert!(attempt.score.is_none());
         assert_eq!(attempt.embed_ms, 0);
@@ -1874,11 +2013,91 @@ mod tests {
 
         assert_eq!(
             attempt.outcome,
-            SemanticOutcome::UtilityBypass {
-                resolved_to_requested: false
-            }
+            SemanticOutcome::UtilityBypass(UtilityBypassResolution::DefaultFallback)
         );
         assert_eq!(attempt.resolve_as, crate::config::DEFAULT_ROUTE);
+        assert!(attempt.resolved_targets.is_none());
+    }
+
+    /// The fix for the bug that motivated `Config::auto_mode`: when it is
+    /// configured, a `<transcript>`-prefixed request must resolve straight
+    /// to its targets — never through `route::resolve` (by the requested
+    /// model name or `default`), so it can never land on a slow, shared
+    /// route. `resolved_targets` carries the pre-resolved targets directly,
+    /// and `resolve_as` is the display-only `AUTO_MODE_LABEL`, never a real
+    /// route name.
+    #[cfg(feature = "semantic")]
+    #[tokio::test]
+    async fn classify_request_resolves_via_the_configured_auto_mode_target() {
+        let mut config = classifiable_config();
+        config.auto_mode = Some(crate::config::ModelConfig {
+            default: "anthropic/claude-haiku-fast".to_string(),
+            fallbacks: Vec::new(),
+        });
+        let (_dir, state) = test_state(config.clone());
+        let payload = json!({ "messages": [
+            {"role": "user", "content": "<transcript>...</transcript>\nis this safe?"},
+        ]});
+
+        // Deliberately pass a requested model name that resolves to a real
+        // route (`role-writer`), so a pass here can only be explained by the
+        // `auto_mode` branch actually winning over the requested-model
+        // fallback, not by coincidence.
+        let attempt = classify_request(
+            &state,
+            &config,
+            &payload,
+            ApiKind::AnthropicMessages,
+            "role-writer",
+        );
+
+        assert_eq!(
+            attempt.outcome,
+            SemanticOutcome::UtilityBypass(UtilityBypassResolution::AutoModeConfig)
+        );
+        assert_eq!(attempt.resolve_as, AUTO_MODE_LABEL);
+        let targets = attempt
+            .resolved_targets
+            .expect("auto_mode resolves targets directly");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].model_ref.model, "claude-haiku-fast");
+    }
+
+    /// Defensive fallback: if `Config::auto_mode` somehow fails to resolve at
+    /// request time (it should never happen in practice — `validate` checks
+    /// it at config-load time), the request must not be dropped. It falls
+    /// through to the pre-existing requested-model/`default` resolution
+    /// instead of erroring out.
+    #[cfg(feature = "semantic")]
+    #[tokio::test]
+    async fn classify_request_falls_back_when_auto_mode_fails_to_resolve() {
+        let mut config = classifiable_config();
+        // References a provider that does not exist — `validate` would
+        // reject this at load time, but `classify_request` must still cope
+        // defensively if it ever sees a config in this state.
+        config.auto_mode = Some(crate::config::ModelConfig {
+            default: "does-not-exist/some-model".to_string(),
+            fallbacks: Vec::new(),
+        });
+        let (_dir, state) = test_state(config.clone());
+        let payload = json!({ "messages": [
+            {"role": "user", "content": "<transcript>...</transcript>\nis this safe?"},
+        ]});
+
+        let attempt = classify_request(
+            &state,
+            &config,
+            &payload,
+            ApiKind::AnthropicMessages,
+            "role-writer",
+        );
+
+        assert_eq!(
+            attempt.outcome,
+            SemanticOutcome::UtilityBypass(UtilityBypassResolution::RequestedModel)
+        );
+        assert_eq!(attempt.resolve_as, "role-writer");
+        assert!(attempt.resolved_targets.is_none());
     }
 
     #[cfg(not(feature = "semantic"))]

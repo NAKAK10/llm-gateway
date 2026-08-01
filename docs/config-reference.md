@@ -45,25 +45,24 @@ upstream may be registered under several ids to expose different protocols.
 
 ## routes.<name>
 
-The name is what clients send as `model`. Must not contain `:` or `/`.
-A trailing `*` is still accepted as a prefix wildcard, but wildcard routes are
-an advanced hand-written escape hatch now: `init` does not generate them,
-`GET /v1/models` does not list them, and classification never scores them.
+The name is what clients send as `model`. Must not contain `*`, `:`, or `/` —
+route names are matched exactly; a `*` anywhere in the name (a wildcard route
+name, e.g. `claude-*`) fails config validation.
 
-Every **non-wildcard** route participates as a classification candidate,
-including the reserved `default` route.
+Every route participates as a classification candidate, including the
+reserved `default` route.
 
 | field | default | notes |
 |---|---|---|
 | `title` | *(none)* | Display only. |
-| `description` | *(required on non-wildcard routes)* | `string` or `string[]`. Each entry is inline text, or a path when it starts with `./` `../` `/` `~/` (relative paths resolve against the config dir). This is the classification corpus: every request's newest user text (walking back through history when the newest scores below the threshold — see "Classification behavior") is embedded and compared against every non-wildcard route's `description`. Write it as "when should this route win?" Write it **in the language you give instructions in** — the embedding model aligns meaning weakly across languages, so a description in a different language than the request scores far lower (see the README's [Content-classified routing](../README.md#content-classified-routing)). A `string[]` embeds each entry separately and scores the route by the **max cosine across all variants** — the typical use is one variant per language, so mixed-language traffic (a human writing Japanese, a sub-agent or harness sending English) matches whichever variant fits, instead of diluting both in one mean-pooled string. `llm-gateway init` generates every `description`, including `default`'s, in whichever language you tell it you write instructions in — and as a two-entry array (`[that language, English]`) whenever the chosen language isn't English. |
-| `model.default` | *(required)* | `"<provider>/<model>"`, split on the **first** `/` only — `openrouter/anthropic/claude-x` and `ollama-cloud/glm:cloud` both parse. `*` in the model part expands only when a wildcard route is actually resolved. |
+| `description` | *(required)* | `string` or `string[]`. Each entry is inline text, or a path when it starts with `./` `../` `/` `~/` (relative paths resolve against the config dir). This is the classification corpus: every request's newest user text (walking back through history when the newest scores below the threshold — see "Classification behavior") is embedded and compared against every route's `description`. Write it as "when should this route win?" Write it **in the language you give instructions in** — the embedding model aligns meaning weakly across languages, so a description in a different language than the request scores far lower (see the README's [Content-classified routing](../README.md#content-classified-routing)). A `string[]` embeds each entry separately and scores the route by the **max cosine across all variants** — the typical use is one variant per language, so mixed-language traffic (a human writing Japanese, a sub-agent or harness sending English) matches whichever variant fits, instead of diluting both in one mean-pooled string. `llm-gateway init` generates every `description`, including `default`'s, in whichever language you tell it you write instructions in — and as a two-entry array (`[that language, English]`) whenever the chosen language isn't English. |
+| `model.default` | *(required)* | `"<provider>/<model>"`, split on the **first** `/` only — `openrouter/anthropic/claude-x` and `ollama-cloud/glm:cloud` both parse. No `*` allowed in the model part; every model must be explicit. |
 | `model.fallbacks` | `[]` | Tried in order, only before the first response byte, only on connect failure / timeout / 408 / 429 / 5xx. May use a provider with a different `api` than the default — reachability from the client's protocol is checked per attempt at request time (see [Cross-protocol routing](../README.md#cross-protocol-routing)), not by `config check`; a target the client's protocol cannot reach is skipped. |
 
 ### Reserved route: `default`
 
 A route literally named `default` is **required**. Validation rejects configs
-that omit it or try to make it a wildcard.
+that omit it.
 
 `default` has two jobs:
 
@@ -97,6 +96,10 @@ If classification cannot run at all — for example a build without the default
   when `description` is a `string[]`. Each variant is embedded independently
   at config-load time; a plain `string` is the one-element case of the same
   scoring rule.
+- A request whose newest user text begins with `<transcript>` — Claude Code's
+  own internal auto-mode judgment call, not a real user turn — skips
+  classification entirely rather than being scored against `description`s;
+  see "autoMode" above for where it resolves instead.
 - Before any text is embedded, `<system-reminder>...</system-reminder>` blocks
   are stripped from it (`src/server/proxy.rs`, `classification_texts`) — this
   is harness-injected context, not the user's own words, and it would
@@ -107,6 +110,42 @@ If classification cannot run at all — for example a build without the default
   modified. A block with no closing tag has everything from `<system-reminder>`
   to the end of the text removed.
 
+## autoMode (optional)
+
+| field | default | notes |
+|---|---|---|
+| `autoMode.default` | *(none)* | Same shape as `routes.<name>.model.default`: `"<provider>/<model>"`, no wildcard. |
+| `autoMode.fallbacks` | `[]` | Same shape as `routes.<name>.model.fallbacks`. |
+
+Pins the target for Claude Code's own **internal** auto-mode judgment
+requests — the yes/no permission-approval calls its harness makes to decide
+whether an action needs the user's confirmation, sent through the same
+gateway endpoint a real turn would use, marked by a `<transcript>`-prefixed
+message. These are never classified against `routes.*.description` (see
+"Classification behavior" below) and never depend on a route name or the
+client's requested `model` string — `autoMode`, when set, is resolved
+directly, exactly like a route's `model` but without a route-name lookup at
+all, so it can be pointed at a fast, cheap model regardless of what model
+name Claude Code's internal classifier happens to send. The gateway does not
+fabricate the judgment itself; a real model still answers it, just the one
+you pin here instead of whichever target the fallback below would have used.
+
+**Unset** (the default) keeps the pre-existing behavior: such a request
+resolves by the client-sent model name if it happens to match a route, or
+the reserved `default` route otherwise. That fallback can be a problem in
+practice — if `default` (or the requested model name) points at something
+slow (a multi-second `claude-cli`/`codex-cli` subprocess, say), Claude
+Code's own timeout for this judgment can trip and the action gets rejected
+with "Auto mode could not evaluate this action" (see the 2026-08-01 entry in
+`docs/decisions.md`). Setting `autoMode` to a fast, ordinary model sidesteps
+that regardless of what `default` is doing.
+
+`llm-gateway init` asks whether to configure this (recommended) once
+provider/role selection is done, offering the providers you already picked —
+preferring a fast alias (`haiku`) over the usual `sonnet` default when a
+`claude-cli` subscription's model list is shown, since speed matters more
+than strength here.
+
 ## launch.<client> (optional advanced key)
 
 A normal generated `config.json` omits `launch` entirely. Add it only when you
@@ -116,7 +155,7 @@ need launcher-specific overrides.
 |---|---|---|
 | `extraArgs` | claude / codex / opencode | Inserted before user-supplied arguments. |
 | `wireApi` | codex | `"responses"` (default) or `"chat"`. The gateway serves both endpoints; which one your Codex accepts depends on its version — Codex CLI 0.145+ removed `"chat"` entirely and requires `"responses"`, and the gateway now translates `openai-responses → openai-chat` per attempt so an `openai-chat`-only provider is still reachable with `wireApi` left at the default. |
-| `models` | opencode | Route names to expose. Empty = every non-wildcard route. Verified against the live gateway before starting. |
+| `models` | opencode | Route names to expose. Empty = every route. Verified against the live gateway before starting. |
 | `overrideProviders` | opencode | Built-in opencode provider ids whose `baseURL` is redirected to the gateway. Default: `["openai", "anthropic"]`. |
 
 ## logging
@@ -145,9 +184,18 @@ cache_write_tok}`
 (match or below-threshold fallback), `semantic_history` when the newest text
 scored below the threshold and an earlier user text matched instead (the
 `reason` says how far back), `no_text` when the request carried no classifiable
-user text at all, and `no_classifier` when classification could not run. Every
-mode except `semantic`'s match and `semantic_history` means the request fell
-back to `default`.
+user text at all, `no_classifier` when classification could not run,
+`manual` when the client sent `x-gw-auto-route: 0` (classification skipped
+on purpose, routed by the requested model name), and `utility_bypass` for a
+client-internal `<transcript>`-prefixed request (e.g. Claude Code's
+auto-mode judgment) — `reason` distinguishes its three possible resolutions:
+pinned to the configured `autoMode` target (see "autoMode" above, in which
+case `matched_route` reads `<auto-mode>`, a display-only label rather than a
+real route name), resolved by the requested model name when `autoMode` is
+unset but that name matches a route, or falling back to `default` when
+neither applies. Every mode except `semantic`'s match, `semantic_history`,
+and a `manual`/`utility_bypass` resolved by name or `autoMode` means the
+request fell back to `default`.
 
 `routing.decided_by_text` is the first 200 characters of whichever text
 actually decided the route — present only on a match (`semantic` or

@@ -4,10 +4,6 @@
 //! model name in its config to appear here *verbatim*; on a mismatch it does not
 //! error, it simply offers no models. So this is both the discovery mechanism and
 //! the thing `launch opencode` checks against before starting anything.
-//!
-//! Wildcard routes are excluded — they are forwarding rules, not selectable
-//! models, and listing `claude-*` would invite a client to request that literal
-//! string.
 
 use axum::extract::State;
 use axum::response::Response;

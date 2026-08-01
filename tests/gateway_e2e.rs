@@ -401,7 +401,7 @@ async fn unknown_model_is_a_404_with_a_hint() {
 }
 
 #[tokio::test]
-async fn models_endpoint_lists_routes_but_not_wildcards() {
+async fn models_endpoint_lists_every_route() {
     let mut config = Config::default();
     config.providers.insert(
         "mock".into(),
@@ -410,9 +410,6 @@ async fn models_endpoint_lists_routes_but_not_wildcards() {
     config
         .routes
         .insert("role-a".into(), route_to("mock/m", &[]));
-    config
-        .routes
-        .insert("claude-*".into(), route_to("mock/*", &[]));
 
     let addr = spawn_gateway(config, None).await;
     let body: serde_json::Value = reqwest::get(format!("http://{addr}/v1/models"))
@@ -427,7 +424,7 @@ async fn models_endpoint_lists_routes_but_not_wildcards() {
         .iter()
         .map(|m| m["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, vec!["role-a"], "wildcards must not be advertised");
+    assert_eq!(ids, vec!["role-a"]);
 }
 
 #[tokio::test]
@@ -770,4 +767,75 @@ async fn an_upstream_error_reaches_a_responses_client_in_an_openai_envelope() {
     // No top-level `type` field — that is an Anthropic envelope detail, and
     // this client speaks OpenAI's own error shape instead.
     assert!(body.get("type").is_none());
+}
+
+/// The bug `Config::auto_mode` fixes, end to end: Claude Code's internal
+/// `<transcript>`-prefixed auto-mode judgment request must reach the
+/// operator-pinned fast target directly — never the reserved `default`
+/// route, which in a real deployment can be a multi-second subprocess
+/// target that starves this fast yes/no judgment (see the 2026-08-01 entry
+/// in `docs/decisions.md`). `route::resolve_model` is exercised here through
+/// the real `proxy()` handler, not just in isolation — this is what proves
+/// the second, route-name lookup that `route::resolve` would otherwise do is
+/// actually skipped: the requested model name below matches no configured
+/// route, so a fallback to `default` would hit `slow`, and only the direct
+/// `auto_mode` path can reach `fast` at all.
+///
+/// `semantic`-only: a `--no-default-features` build never inspects the
+/// request's text at all (`classify_request`'s non-`semantic` variant always
+/// falls back to `default` unconditionally, same as before `auto_mode`
+/// existed), so there is no `<transcript>` bypass to exercise there.
+#[cfg(feature = "semantic")]
+#[tokio::test]
+async fn transcript_prefixed_request_bypasses_default_and_reaches_the_configured_auto_mode_target()
+{
+    let (slow_upstream, slow_mock) = spawn_mock().await;
+    let (fast_upstream, fast_mock) = spawn_mock().await;
+
+    let mut config = Config::default();
+    config.providers.insert(
+        "slow".into(),
+        provider(&format!("http://{slow_upstream}/v1"), ApiKind::OpenaiChat),
+    );
+    config.providers.insert(
+        "fast".into(),
+        provider(&format!("http://{fast_upstream}/v1"), ApiKind::OpenaiChat),
+    );
+    config.routes.insert(
+        llm_gateway::config::DEFAULT_ROUTE.into(),
+        route_to("slow/real-model", &[]),
+    );
+    config.auto_mode = Some(ModelConfig {
+        default: "fast/haiku-mock".to_string(),
+        fallbacks: Vec::new(),
+    });
+
+    let addr = spawn_gateway(config, None).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            // Matches no configured route — without `auto_mode`, this would
+            // fall back to `default` (`slow`). With it, the requested model
+            // name is never even looked up.
+            "model": "claude-opus-4-not-a-configured-route",
+            "messages": [
+                {"role": "user", "content": "<transcript>\nsome tool call history\n</transcript>\nis this safe?"},
+            ],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+
+    let fast_seen = fast_mock.requests.lock().unwrap();
+    assert_eq!(fast_seen.len(), 1, "the fast auto_mode target must be hit");
+    assert_eq!(fast_seen[0]["model"], "haiku-mock");
+
+    let slow_seen = slow_mock.requests.lock().unwrap();
+    assert!(
+        slow_seen.is_empty(),
+        "the shared `default` route must never see this request: {:?}",
+        *slow_seen
+    );
 }

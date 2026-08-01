@@ -22,8 +22,9 @@
 //! `model: openai/gpt-…` would go straight to OpenAI and silently bypass the
 //! gateway. So the injected config also **redirects the built-in providers**
 //! listed in `launch.opencode.overrideProviders` (default: openai, anthropic)
-//! to the gateway. Per-agent model choices keep working unchanged; the
-//! wildcard routes (`gpt-*`, `claude-*`) forward the ids as-is.
+//! to the gateway. Per-agent model choices keep working unchanged; the model
+//! id is forwarded as-is and reaches the gateway on the matching endpoint,
+//! where routing is decided by classification, not by the id itself.
 //!
 //! `--isolate` adds `--pure`, which disables external plugins.
 

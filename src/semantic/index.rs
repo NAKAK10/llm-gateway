@@ -68,9 +68,9 @@ pub struct RouteIndex {
 }
 
 impl RouteIndex {
-    /// Build the index from every non-wildcard route in `config` — every
-    /// route is a classification candidate now, including the reserved
-    /// `default` route (see `crate::config::DEFAULT_ROUTE`).
+    /// Build the index from every route in `config` — every route is a
+    /// classification candidate now, including the reserved `default` route
+    /// (see `crate::config::DEFAULT_ROUTE`).
     ///
     /// A candidate that turns out to have no description or an unresolvable
     /// `model.default` is silently skipped rather than causing a build
@@ -81,7 +81,6 @@ impl RouteIndex {
         let candidates = config
             .routes
             .keys()
-            .filter(|name| !name.contains('*'))
             .filter_map(|name| embed_candidate(config, embedder, name))
             .collect();
 
