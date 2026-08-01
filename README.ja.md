@@ -201,9 +201,11 @@ routes: {
 
 ## クロスプロトコルルーティング
 
-Claude Code は Anthropic Messages しか話しませんが、安価あるいはローカルな
-プロバイダーのほとんどは OpenAI Chat しか話しません。そこで一方向だけを
-変換します — そしてこの判定は **route 単位ではなくターゲット単位**で行われます:
+Claude Code は Anthropic Messages しか話さず、Codex CLI は OpenAI Responses
+しか話さず(0.145+ は `wire_api = "chat"` を完全に廃止した —
+`docs/ja/clients/codex.md` 参照)、安価あるいはローカルなプロバイダーの
+ほとんどは OpenAI Chat しか話しません。そこで 2 方向を変換します —
+そしてこの判定は **route 単位ではなくターゲット単位**で行われます:
 1 つの route の `default` と各 `fallbacks` はそれぞれ別のプロトコルを話して
 よく、各試行はクライアントが送ってきたものに基づいて個別に変換またはパス
 スルーされます。
@@ -211,6 +213,7 @@ Claude Code は Anthropic Messages しか話しませんが、安価あるいは
 | クライアントが話す | ターゲットが話す | 結果 |
 |---|---|---|
 | `anthropic-messages` | `openai-chat` | 変換される — Claude Code から Ollama、Groq、DeepSeek、Gemini、Mistral、Together、Sakana AI、PLaMo に到達できる |
+| `openai-responses` | `openai-chat` | 変換される — Codex CLI から同じ顔ぶれに到達できる。`wire_api = "chat"` という逃げ道が無くなった今、これが効いてくる |
 | 両側が同じ | — | 従来どおりバイト単位の無加工転送 |
 | それ以外の組み合わせ | — | そのターゲットはリクエスト送信前にスキップされる。route 内の全ターゲットがこの理由で到達不能な場合に限り `400` |
 
@@ -239,10 +242,15 @@ routes: {
 逆方向 — `openai-chat` のクライアントが `anthropic-messages` のターゲットに
 到達しようとする場合 — の変換はまだ実装されていないため、そのターゲットは
 `fallbacks` のどこに置かれていても、そのようなクライアントに対しては常に
-スキップされます(`docs/roadmap.md` 参照)。
+スキップされます(`docs/roadmap.md` 参照)。`anthropic-messages` と
+`openai-responses` の組み合わせも、どちら向きも同様です — 両方の
+プロトコルを話すクライアントは存在しないので変換する対象がなく、
+存在するのは上記の 2 つの `→ openai-chat` 方向だけです。
 
 変換された*試行*(route の `default` とは限らず、実際にリクエストを処理する
 ターゲット)で失われるもの:
+
+**`anthropic-messages → openai-chat`:**
 
 - **プロンプトキャッシュ、`thinking` ブロック、citation、Anthropic の
   サーバーサイドツール**(`web_search`、`bash`、`text_editor`)は破棄されます
@@ -258,8 +266,24 @@ routes: {
   出力がおかしいと感じたら、まずこのフィールドを確認してください。
   フォールバックが発火した場合、`resolved.translation` は route の
   `default` ではなく、実際に応答したターゲットの変換を反映します。
-- 使用量集計には**影響しません**: トークン数は変換前のアップストリームの
-  バイト列から読み取ります。
+
+**`openai-responses → openai-chat`:**
+
+- **Codex 固有のフィールドは破棄されます**: `reasoning`、`include`、
+  `store` / `previous_response_id`、`prompt_cache_key` /
+  `client_metadata`、`text`、`metadata`。生き残るのはフラットな
+  `function` ツール定義だけです — `local_shell`、`web_search`、複数の
+  function ツールをまとめる `namespace` は Codex 独自の拡張であり、
+  どのみち `openai-chat` プロバイダーには実行できません。
+- **レスポンスは組み立て直され**、Responses の `response` オブジェクト
+  (非ストリーム)、または Responses の SSE イベント列(ストリーム:
+  `response.created`、`response.output_text.delta`、
+  `response.function_call_arguments.delta`、`response.completed` など)に
+  なります。`llm-gateway trace` はこれらに
+  `xlat=openai-responses->openai-chat` を付けます。
+
+使用量集計はどちらの方向でも**影響を受けません**: トークン数は変換前の
+アップストリームのバイト列から読み取ります。
 
 何が引き継がれ、何が引き継がれないかの完全な一覧は
 `docs/ja/gotchas.md` を参照してください。
@@ -365,8 +389,8 @@ routes: {
 | Ollama Cloud | `https://ollama.com/v1` | `openai-chat` | `OLLAMA_API_KEY` |
 | Ollama(ローカル) | `http://127.0.0.1:11434/v1` | `openai-chat` | *(不要)* |
 
-この表の `openai-chat` プロバイダーはすべて Claude Code からも到達できます
-— [クロスプロトコルルーティング](#クロスプロトコルルーティング)参照。
+この表の `openai-chat` プロバイダーはすべて Claude Code からも Codex CLI
+からも到達できます — [クロスプロトコルルーティング](#クロスプロトコルルーティング)参照。
 
 ## 設定リファレンス
 

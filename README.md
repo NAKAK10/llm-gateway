@@ -209,15 +209,18 @@ routes: {
 
 ## Cross-protocol routing
 
-Claude Code only ever speaks Anthropic Messages, and almost every cheap or
-local provider only speaks OpenAI Chat. So one direction is translated — and
-the decision is made **per target, not per route**: a route's `default` and
-each of its `fallbacks` can each speak a different protocol, and every attempt
-is translated or passed through independently based on what the client sent.
+Claude Code only ever speaks Anthropic Messages, Codex CLI only ever speaks
+OpenAI Responses (0.145+ dropped `wire_api = "chat"` entirely — see
+`docs/clients/codex.md`), and almost every cheap or local provider only
+speaks OpenAI Chat. So two directions are translated — and the decision is
+made **per target, not per route**: a route's `default` and each of its
+`fallbacks` can each speak a different protocol, and every attempt is
+translated or passed through independently based on what the client sent.
 
 | client speaks | target speaks | result |
 |---|---|---|
 | `anthropic-messages` | `openai-chat` | translated — Claude Code reaches Ollama, Groq, DeepSeek, Gemini, Mistral, Together, Sakana AI, PLaMo |
+| `openai-responses` | `openai-chat` | translated — Codex CLI reaches the same roster, which matters now that its `wire_api = "chat"` escape hatch is gone |
 | same on both sides | — | byte-for-byte passthrough, as before |
 | anything else | — | that target is skipped before the request is sent; `400` only if every target in the route turns out unreachable this way |
 
@@ -246,10 +249,15 @@ routes: {
 The reverse direction — an `openai-chat` client reaching an
 `anthropic-messages` target — has no translation implemented yet, so that
 target is always skipped for such a client regardless of where it sits in
-`fallbacks` (see `docs/roadmap.md`).
+`fallbacks` (see `docs/roadmap.md`). The same is true for any pairing between
+`anthropic-messages` and `openai-responses`, in either direction — no client
+speaks both protocols, so there is nothing to translate between them; only
+the two `→ openai-chat` directions above exist.
 
 What a translated *attempt* costs you (this is about whichever target
 actually serves the request, not necessarily the route's `default`):
+
+**`anthropic-messages → openai-chat`:**
 
 - **Prompt caching, `thinking` blocks, citations and Anthropic server-side
   tools** (`web_search`, `bash`, `text_editor`) are dropped — the target
@@ -263,8 +271,22 @@ actually serves the request, not necessarily the route's `default`):
   `xlat=anthropic-messages->openai-chat` — always check that field first when
   output looks subtly off. On a fallback, `resolved.translation` reflects the
   target that actually answered, not the route's `default`.
-- Usage accounting is *not* affected: token counts are read from the upstream
-  bytes before translation.
+
+**`openai-responses → openai-chat`:**
+
+- **Codex-specific fields are dropped**: `reasoning`, `include`, `store` /
+  `previous_response_id`, `prompt_cache_key` / `client_metadata`, `text`,
+  `metadata`. Only flat `function` tool definitions survive — `local_shell`,
+  `web_search` and a `namespace` grouping of tools are Codex's own extensions
+  and no `openai-chat` provider can run them anyway.
+- **The response is rebuilt** into a Responses `response` object
+  (non-streaming) or a Responses SSE event sequence (streaming:
+  `response.created`, `response.output_text.delta`,
+  `response.function_call_arguments.delta`, `response.completed`, …).
+  `llm-gateway trace` marks these `xlat=openai-responses->openai-chat`.
+
+Usage accounting is *not* affected by either direction: token counts are read
+from the upstream bytes before translation.
 
 Full list of what is and is not carried across: `docs/gotchas.md`.
 
@@ -362,8 +384,8 @@ copy-paste config for each.
 | Ollama Cloud | `https://ollama.com/v1` | `openai-chat` | `OLLAMA_API_KEY` |
 | Ollama (local) | `http://127.0.0.1:11434/v1` | `openai-chat` | *(none needed)* |
 
-Every `openai-chat` provider in this table is reachable from Claude Code too —
-see [Cross-protocol routing](#cross-protocol-routing).
+Every `openai-chat` provider in this table is reachable from Claude Code and
+from Codex CLI too — see [Cross-protocol routing](#cross-protocol-routing).
 
 ## Configuration reference
 

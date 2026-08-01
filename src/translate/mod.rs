@@ -6,16 +6,21 @@
 //! when the client's protocol and the target provider's protocol differ —
 //! precisely the combination that used to be a flat `400`.
 //!
-//! Today exactly one direction exists:
+//! Today two directions exist:
 //!
 //! | client speaks | provider speaks | translation |
 //! |---|---|---|
 //! | `anthropic-messages` | `openai-chat` | [`Translation::AnthropicToChat`] |
+//! | `openai-responses` | `openai-chat` | [`Translation::ResponsesToChat`] |
 //!
-//! That single direction is what makes `launch claude` useful: Claude Code only
-//! ever speaks `/v1/messages`, and all of Ollama (local and cloud), Gemini,
-//! Groq, DeepSeek, Mistral, Together, Sakana AI and PLaMo speak `openai-chat`.
+//! The first is what makes `launch claude` useful: Claude Code only ever
+//! speaks `/v1/messages`, and all of Ollama (local and cloud), Gemini, Groq,
+//! DeepSeek, Mistral, Together, Sakana AI and PLaMo speak `openai-chat`.
 //! Without it those providers are unreachable from Claude Code.
+//!
+//! The second is what makes `launch codex` useful once Codex CLI drops
+//! `wire_api = "chat"` support: Codex only ever speaks `/v1/responses`, so
+//! the same roster of `openai-chat`-only providers needs this direction too.
 //!
 //! Split by direction and by shape, because the three problems are genuinely
 //! different:
@@ -48,6 +53,9 @@ pub enum Translation {
     /// An `anthropic-messages` client (Claude Code) talking to an
     /// `openai-chat` provider (Ollama, Groq, DeepSeek, …).
     AnthropicToChat,
+    /// An `openai-responses` client (Codex CLI) talking to an `openai-chat`
+    /// provider (Ollama, Groq, DeepSeek, …).
+    ResponsesToChat,
 }
 
 impl Translation {
@@ -65,6 +73,7 @@ impl Translation {
     pub fn select(client: ApiKind, provider: ApiKind) -> Option<Self> {
         match (client, provider) {
             (ApiKind::AnthropicMessages, ApiKind::OpenaiChat) => Some(Self::AnthropicToChat),
+            (ApiKind::OpenaiResponses, ApiKind::OpenaiChat) => Some(Self::ResponsesToChat),
             _ => None,
         }
     }
@@ -73,6 +82,7 @@ impl Translation {
     pub fn label(self) -> &'static str {
         match self {
             Self::AnthropicToChat => "anthropic-messages->openai-chat",
+            Self::ResponsesToChat => "openai-responses->openai-chat",
         }
     }
 
@@ -80,6 +90,7 @@ impl Translation {
     pub fn request(self, payload: &serde_json::Value) -> serde_json::Value {
         match self {
             Self::AnthropicToChat => request::anthropic_to_chat(payload),
+            Self::ResponsesToChat => request::responses_to_chat(payload),
         }
     }
 
@@ -89,6 +100,7 @@ impl Translation {
     pub fn response(self, body: &serde_json::Value, model: &str) -> serde_json::Value {
         match self {
             Self::AnthropicToChat => response::chat_to_anthropic(body, model),
+            Self::ResponsesToChat => response::chat_to_responses(body, model),
         }
     }
 
@@ -98,6 +110,29 @@ impl Translation {
     pub fn error(self, body: &serde_json::Value, status: u16) -> serde_json::Value {
         match self {
             Self::AnthropicToChat => response::chat_error_to_anthropic(body, status),
+            Self::ResponsesToChat => response::chat_error_to_responses(body, status),
+        }
+    }
+
+    /// The gateway's own error envelope, in the client's protocol — for a
+    /// failure inside translation itself (an unreadable or oversized
+    /// upstream body), as opposed to an error the upstream reported (see
+    /// [`Self::error`] above, which translates a real upstream error body).
+    pub fn gateway_error(self, message: &str) -> serde_json::Value {
+        match self {
+            Self::AnthropicToChat => response::anthropic_gateway_error(message),
+            Self::ResponsesToChat => response::responses_gateway_error(message),
+        }
+    }
+
+    /// A fresh stateful converter for this translation's streaming direction,
+    /// boxed so `translate::adapter::Mode::Sse` can hold either output
+    /// protocol behind one type. `model` is what the converter reports when
+    /// upstream chunks do not name one themselves.
+    pub fn stream_converter(self, model: String) -> Box<dyn stream::StreamConverter> {
+        match self {
+            Self::AnthropicToChat => Box::new(stream::ChatToAnthropic::new(model)),
+            Self::ResponsesToChat => Box::new(stream::ChatToResponses::new(model)),
         }
     }
 
@@ -107,9 +142,17 @@ impl Translation {
     /// answers locally with [`request::estimate_input_tokens`] instead. Kept
     /// as a method rather than assumed at the call site so a future
     /// translation whose target *does* count tokens can say so.
+    ///
+    /// `ResponsesToChat` answers `false` too, but for a different reason than
+    /// documentation might suggest at a glance: `openai-responses` has no
+    /// `count_tokens` endpoint of its own for this to matter to, so the
+    /// question never actually reaches this method in practice (see
+    /// `server::endpoint_api`) — it is answered here only to keep the method
+    /// total over every variant.
     pub fn can_forward_count_tokens(self) -> bool {
         match self {
             Self::AnthropicToChat => false,
+            Self::ResponsesToChat => false,
         }
     }
 }
@@ -119,22 +162,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_supported_pair_is_anthropic_client_to_chat_provider() {
+    fn the_supported_pairs_are_anthropic_and_responses_clients_to_a_chat_provider() {
         assert_eq!(
             Translation::select(ApiKind::AnthropicMessages, ApiKind::OpenaiChat),
             Some(Translation::AnthropicToChat)
+        );
+        assert_eq!(
+            Translation::select(ApiKind::OpenaiResponses, ApiKind::OpenaiChat),
+            Some(Translation::ResponsesToChat)
         );
     }
 
     #[test]
     fn unsupported_pairs_are_none() {
-        // The reverse direction does not exist yet.
+        // The reverse directions do not exist yet.
         assert!(Translation::select(ApiKind::OpenaiChat, ApiKind::AnthropicMessages).is_none());
-        // Responses is not translated in either direction (issue #4).
+        assert!(Translation::select(ApiKind::OpenaiChat, ApiKind::OpenaiResponses).is_none());
+        // Anthropic and Responses are not translated between each other in
+        // either direction.
         assert!(
             Translation::select(ApiKind::AnthropicMessages, ApiKind::OpenaiResponses).is_none()
         );
-        assert!(Translation::select(ApiKind::OpenaiResponses, ApiKind::OpenaiChat).is_none());
+        assert!(
+            Translation::select(ApiKind::OpenaiResponses, ApiKind::AnthropicMessages).is_none()
+        );
     }
 
     #[test]

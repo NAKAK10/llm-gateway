@@ -1129,11 +1129,11 @@ mod tests {
         assert_eq!(res.targets[0].api, ApiKind::OpenaiChat);
     }
 
-    /// Every target unreachable: the caller is expected to treat `dropped`
-    /// equal to the original length as "refuse the request", not to forward
-    /// to nothing.
+    /// The point of `Translation::ResponsesToChat`: an `openai-responses`
+    /// client (Codex CLI) can now reach an `openai-chat` target, though not
+    /// an `anthropic-messages` one (there is no translation for that pair).
     #[test]
-    fn filter_reachable_targets_can_drop_every_target() {
+    fn filter_reachable_targets_lets_a_responses_client_reach_a_chat_target() {
         let mut res = test_resolution(vec![
             test_target(ApiKind::OpenaiChat),
             test_target(ApiKind::AnthropicMessages),
@@ -1141,7 +1141,24 @@ mod tests {
 
         let dropped = filter_reachable_targets(&mut res, ApiKind::OpenaiResponses);
 
-        assert_eq!(dropped, 2);
+        assert_eq!(dropped, 1);
+        assert_eq!(res.targets.len(), 1);
+        assert_eq!(res.targets[0].api, ApiKind::OpenaiChat);
+    }
+
+    /// Every target unreachable: the caller is expected to treat `dropped`
+    /// equal to the original length as "refuse the request", not to forward
+    /// to nothing. `openai-responses` has no translation to
+    /// `anthropic-messages` (only to `openai-chat`, via the case above), so a
+    /// route backed solely by an `anthropic-messages` provider is entirely
+    /// unreachable from it.
+    #[test]
+    fn filter_reachable_targets_can_drop_every_target() {
+        let mut res = test_resolution(vec![test_target(ApiKind::AnthropicMessages)]);
+
+        let dropped = filter_reachable_targets(&mut res, ApiKind::OpenaiResponses);
+
+        assert_eq!(dropped, 1);
         assert!(res.targets.is_empty());
     }
 
