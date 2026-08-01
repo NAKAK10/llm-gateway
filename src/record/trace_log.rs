@@ -131,6 +131,12 @@ pub struct TraceAttempt {
 pub struct TraceUsage {
     pub in_tok: u64,
     pub out_tok: u64,
+    /// Added after `in_tok`/`out_tok` shipped, so old trace files that
+    /// predate cache accounting still deserialize.
+    #[serde(default)]
+    pub cache_read_tok: u64,
+    #[serde(default)]
+    pub cache_write_tok: u64,
 }
 
 /// Path for a given day, e.g. `trace-2026-08-01.jsonl`.
@@ -199,6 +205,8 @@ mod tests {
             usage: Some(TraceUsage {
                 in_tok: 12,
                 out_tok: 34,
+                cache_read_tok: 5,
+                cache_write_tok: 6,
             }),
         }
     }
@@ -219,6 +227,22 @@ mod tests {
         let read_back: TraceRecord = serde_json::from_str(line).unwrap();
         assert_eq!(read_back.req_id, record.req_id);
         assert_eq!(read_back.attempts.len(), 1);
-        assert_eq!(read_back.usage.unwrap().in_tok, 12);
+        let usage = read_back.usage.unwrap();
+        assert_eq!(usage.in_tok, 12);
+        assert_eq!(usage.cache_read_tok, 5);
+        assert_eq!(usage.cache_write_tok, 6);
+    }
+
+    /// A trace file written before cache accounting existed has `usage`
+    /// objects with only `in_tok`/`out_tok` — those must still parse, with
+    /// the cache fields defaulting to zero.
+    #[test]
+    fn old_trace_usage_without_cache_fields_still_deserializes() {
+        let json = r#"{"in_tok":12,"out_tok":34}"#;
+        let usage: TraceUsage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.in_tok, 12);
+        assert_eq!(usage.out_tok, 34);
+        assert_eq!(usage.cache_read_tok, 0);
+        assert_eq!(usage.cache_write_tok, 0);
     }
 }

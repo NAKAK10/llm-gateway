@@ -56,6 +56,8 @@ pub struct Row {
     pub failures: u64,
     pub in_tok: u64,
     pub out_tok: u64,
+    pub cache_read_tok: u64,
+    pub cache_write_tok: u64,
 }
 
 pub fn run(options: Options) -> Result<()> {
@@ -148,6 +150,8 @@ pub fn run(options: Options) -> Result<()> {
         "fail".to_string(),
         "in_tok".to_string(),
         "out_tok".to_string(),
+        "cache_r".to_string(),
+        "cache_w".to_string(),
     ]);
 
     let mut total = Row {
@@ -161,11 +165,15 @@ pub fn run(options: Options) -> Result<()> {
             format_count(row.failures),
             format_count(row.in_tok),
             format_count(row.out_tok),
+            format_count(row.cache_read_tok),
+            format_count(row.cache_write_tok),
         ]);
         total.calls += row.calls;
         total.failures += row.failures;
         total.in_tok += row.in_tok;
         total.out_tok += row.out_tok;
+        total.cache_read_tok += row.cache_read_tok;
+        total.cache_write_tok += row.cache_write_tok;
     }
     table.add_row(vec![
         total.key.clone(),
@@ -173,6 +181,8 @@ pub fn run(options: Options) -> Result<()> {
         format_count(total.failures),
         format_count(total.in_tok),
         format_count(total.out_tok),
+        format_count(total.cache_read_tok),
+        format_count(total.cache_write_tok),
     ]);
 
     println!("{table}");
@@ -190,6 +200,8 @@ pub fn run(options: Options) -> Result<()> {
             "fail".to_string(),
             "in_tok".to_string(),
             "out_tok".to_string(),
+            "cache_r".to_string(),
+            "cache_w".to_string(),
         ]);
 
         let mut model_total = Row {
@@ -203,11 +215,15 @@ pub fn run(options: Options) -> Result<()> {
                 format_count(row.failures),
                 format_count(row.in_tok),
                 format_count(row.out_tok),
+                format_count(row.cache_read_tok),
+                format_count(row.cache_write_tok),
             ]);
             model_total.calls += row.calls;
             model_total.failures += row.failures;
             model_total.in_tok += row.in_tok;
             model_total.out_tok += row.out_tok;
+            model_total.cache_read_tok += row.cache_read_tok;
+            model_total.cache_write_tok += row.cache_write_tok;
         }
         model_table.add_row(vec![
             model_total.key.clone(),
@@ -215,6 +231,8 @@ pub fn run(options: Options) -> Result<()> {
             format_count(model_total.failures),
             format_count(model_total.in_tok),
             format_count(model_total.out_tok),
+            format_count(model_total.cache_read_tok),
+            format_count(model_total.cache_write_tok),
         ]);
 
         println!();
@@ -264,6 +282,8 @@ pub fn aggregate(
         }
         row.in_tok += record.in_tok;
         row.out_tok += record.out_tok;
+        row.cache_read_tok += record.cache_read_tok;
+        row.cache_write_tok += record.cache_write_tok;
     }
 
     let mut result: Vec<Row> = rows.into_values().collect();
@@ -460,5 +480,53 @@ mod tests {
         assert_eq!(format_count(999), "999");
         assert_eq!(format_count(1000), "1,000");
         assert_eq!(format_count(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn cache_tokens_are_aggregated() {
+        let mut a = record(
+            "2026-08-01T00:00:00Z",
+            "claude-*",
+            "anthropic",
+            "claude-sonnet-4-6",
+            "success",
+            10,
+            20,
+        );
+        a.cache_read_tok = 100;
+        a.cache_write_tok = 7;
+        let mut b = record(
+            "2026-08-01T01:00:00Z",
+            "claude-*",
+            "anthropic",
+            "claude-sonnet-4-6",
+            "success",
+            5,
+            5,
+        );
+        b.cache_read_tok = 50;
+        b.cache_write_tok = 3;
+
+        let rows = aggregate(&[a, b], GroupBy::Route, None, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cache_read_tok, 150);
+        assert_eq!(rows[0].cache_write_tok, 10);
+    }
+
+    /// A `usage-*.jsonl` line written before cache accounting existed has no
+    /// `cache_read_tok`/`cache_write_tok` fields at all — that must still
+    /// parse and aggregate without falling over, with cache totals at zero.
+    #[test]
+    fn old_usage_records_without_cache_fields_still_aggregate() {
+        let json = r#"{"ts":"2026-08-01T00:00:00Z","client":"claude-code","route":"claude-*","provider":"anthropic","model":"claude-sonnet-4-6","attempt":1,"in_tok":10,"out_tok":20,"dur_ms":100,"status":"success","stream":false}"#;
+        let record: UsageRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.cache_read_tok, 0);
+        assert_eq!(record.cache_write_tok, 0);
+
+        let rows = aggregate(&[record], GroupBy::Route, None, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].in_tok, 10);
+        assert_eq!(rows[0].cache_read_tok, 0);
+        assert_eq!(rows[0].cache_write_tok, 0);
     }
 }
