@@ -2,6 +2,58 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-08-01 — `Config::auto_mode`: Claude Code's internal auto-mode judgment gets its own, route-independent target
+
+A prior fix (`classify_request`'s `<transcript>` bypass, `src/server/proxy.rs`)
+already kept Claude Code's internal auto-mode permission classifier out of
+embedding classification entirely — same idea as `x-gw-auto-route: 0`: skip
+embedding classification, resolve by the client-sent model name if it
+happens to match a route, else fall back to `default`. In the owner's own
+environment that fallback landed on
+`default`, and `default` pointed at `anthropic-subscription/sonnet` — a
+`claude-cli` subprocess whose first response routinely takes several
+seconds to over twenty, with hundreds to 1500+ output tokens. Claude Code's
+own auto-mode judgment expects a fast yes/no answer and gave up with "Auto
+mode could not evaluate this action" — confirmed against the owner's real
+gateway, not a hypothetical.
+
+The `<transcript>` bypass's own fallback chain could not fix this by
+itself: `default` is deliberately a shared, ordinary route (any request
+that fails classification lands there too), so pointing it at something
+fast would just move the problem onto whatever else falls back to it. What
+auto-mode's judgment calls need is a target chosen independently of
+`routes` altogether — never a route name, never the client's requested
+model string, only what the operator explicitly pins for this one purpose.
+
+**`Config::auto_mode: Option<ModelConfig>`** (`src/config/mod.rs`) is that
+target — the same `default` + `fallbacks` shape a route's `model` already
+has, reusing `ModelConfig` rather than inventing a parallel type.
+`route::resolve_model` (`src/route.rs`) is the resolution logic extracted
+out of `route::resolve` to make this possible: it turns a bare `ModelConfig`
+straight into `Vec<Target>` without a route-name lookup, so `resolve` (via a
+route's `model`) and the `auto_mode` path (via `Config::auto_mode`) share
+one implementation instead of two. `classify_request`
+(`src/server/proxy.rs`) tries `auto_mode` first inside the `<transcript>`
+branch; only when it is unset (or, defensively, fails to resolve — `validate`
+should already prevent that) does the request fall through to the
+pre-existing requested-model-then-`default` chain. `SemanticOutcome::UtilityBypass`
+grew a third state (`UtilityBypassResolution::AutoModeConfig`, alongside the
+existing `RequestedModel`/`DefaultFallback`) so the trace log's `routing.reason`
+names all three distinctly instead of collapsing "pinned to a fast operator
+target" into the same wording as "fell back to `default`". The gateway never
+fabricates the auto-mode verdict itself here — it only decides which real LLM
+answers the judgment; a real model still makes the call, just a fast one
+instead of whatever `default` happens to be.
+
+`config/validate.rs` checks `auto_mode.default`/`fallbacks` the same way a
+route's `model` is checked (malformed string, undefined provider, wildcard
+model), reusing `resolve_target` under the fixed label `"autoMode"` rather
+than a route name. `llm-gateway init` gained one more wizard step, asked
+once role assignment is done: whether to pin a fast dedicated model for
+auto-mode (default answer: yes), offered from whatever providers were
+already selected — `haiku` preferred over `sonnet` when a subscription's
+alias list is shown, since the whole point is speed over strength.
+
 ## 2026-08-01 — Wildcard route names abolished
 
 Route-*name* wildcards (`claude-*` → longest-prefix match, see the

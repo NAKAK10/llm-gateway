@@ -96,6 +96,10 @@ If classification cannot run at all — for example a build without the default
   when `description` is a `string[]`. Each variant is embedded independently
   at config-load time; a plain `string` is the one-element case of the same
   scoring rule.
+- A request whose newest user text begins with `<transcript>` — Claude Code's
+  own internal auto-mode judgment call, not a real user turn — skips
+  classification entirely rather than being scored against `description`s;
+  see "autoMode" above for where it resolves instead.
 - Before any text is embedded, `<system-reminder>...</system-reminder>` blocks
   are stripped from it (`src/server/proxy.rs`, `classification_texts`) — this
   is harness-injected context, not the user's own words, and it would
@@ -105,6 +109,42 @@ If classification cannot run at all — for example a build without the default
   classification input: the payload forwarded to the provider is never
   modified. A block with no closing tag has everything from `<system-reminder>`
   to the end of the text removed.
+
+## autoMode (optional)
+
+| field | default | notes |
+|---|---|---|
+| `autoMode.default` | *(none)* | Same shape as `routes.<name>.model.default`: `"<provider>/<model>"`, no wildcard. |
+| `autoMode.fallbacks` | `[]` | Same shape as `routes.<name>.model.fallbacks`. |
+
+Pins the target for Claude Code's own **internal** auto-mode judgment
+requests — the yes/no permission-approval calls its harness makes to decide
+whether an action needs the user's confirmation, sent through the same
+gateway endpoint a real turn would use, marked by a `<transcript>`-prefixed
+message. These are never classified against `routes.*.description` (see
+"Classification behavior" below) and never depend on a route name or the
+client's requested `model` string — `autoMode`, when set, is resolved
+directly, exactly like a route's `model` but without a route-name lookup at
+all, so it can be pointed at a fast, cheap model regardless of what model
+name Claude Code's internal classifier happens to send. The gateway does not
+fabricate the judgment itself; a real model still answers it, just the one
+you pin here instead of whichever target the fallback below would have used.
+
+**Unset** (the default) keeps the pre-existing behavior: such a request
+resolves by the client-sent model name if it happens to match a route, or
+the reserved `default` route otherwise. That fallback can be a problem in
+practice — if `default` (or the requested model name) points at something
+slow (a multi-second `claude-cli`/`codex-cli` subprocess, say), Claude
+Code's own timeout for this judgment can trip and the action gets rejected
+with "Auto mode could not evaluate this action" (see the 2026-08-01 entry in
+`docs/decisions.md`). Setting `autoMode` to a fast, ordinary model sidesteps
+that regardless of what `default` is doing.
+
+`llm-gateway init` asks whether to configure this (recommended) once
+provider/role selection is done, offering the providers you already picked —
+preferring a fast alias (`haiku`) over the usual `sonnet` default when a
+`claude-cli` subscription's model list is shown, since speed matters more
+than strength here.
 
 ## launch.<client> (optional advanced key)
 
@@ -144,9 +184,18 @@ cache_write_tok}`
 (match or below-threshold fallback), `semantic_history` when the newest text
 scored below the threshold and an earlier user text matched instead (the
 `reason` says how far back), `no_text` when the request carried no classifiable
-user text at all, and `no_classifier` when classification could not run. Every
-mode except `semantic`'s match and `semantic_history` means the request fell
-back to `default`.
+user text at all, `no_classifier` when classification could not run,
+`manual` when the client sent `x-gw-auto-route: 0` (classification skipped
+on purpose, routed by the requested model name), and `utility_bypass` for a
+client-internal `<transcript>`-prefixed request (e.g. Claude Code's
+auto-mode judgment) — `reason` distinguishes its three possible resolutions:
+pinned to the configured `autoMode` target (see "autoMode" above, in which
+case `matched_route` reads `<auto-mode>`, a display-only label rather than a
+real route name), resolved by the requested model name when `autoMode` is
+unset but that name matches a route, or falling back to `default` when
+neither applies. Every mode except `semantic`'s match, `semantic_history`,
+and a `manual`/`utility_bypass` resolved by name or `autoMode` means the
+request fell back to `default`.
 
 `routing.decided_by_text` is the first 200 characters of whichever text
 actually decided the route — present only on a match (`semantic` or

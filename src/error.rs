@@ -34,8 +34,12 @@ pub enum Error {
     #[error("secret `{reference}` could not be resolved: {reason}")]
     SecretUnresolved { reference: String, reason: String },
 
-    #[error("unknown provider `{provider}` referenced by route `{route}`")]
-    UnknownProvider { provider: String, route: String },
+    /// `context` is a pre-formatted phrase naming what referenced the
+    /// provider — `` route `role-writer` `` for an ordinary route, or
+    /// `` the `autoMode` config `` for `crate::route::resolve_model` called
+    /// on `Config::auto_mode`, which has no route name to attribute to.
+    #[error("unknown provider `{provider}` referenced by {context}")]
+    UnknownProvider { provider: String, context: String },
 
     #[error("no route matches model `{0}`")]
     NoRoute(String),

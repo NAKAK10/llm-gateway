@@ -166,6 +166,12 @@ Important consequences:
 - **Wildcard route names (`claude-*` and the like) are rejected outright.**
   Every route name is matched exactly; a `*` anywhere in a route name fails
   config validation.
+- **Claude Code's own internal auto-mode judgment requests skip
+  classification entirely.** These are `<transcript>`-prefixed yes/no
+  permission calls its harness makes to itself through the same gateway
+  endpoint, not real user turns — classifying them against `description`s
+  would route them arbitrarily. See `autoMode` below for where they resolve
+  instead.
 
 ```json5
 routes: {
@@ -206,6 +212,36 @@ routes: {
   },
 }
 ```
+
+### `autoMode`: a fast, dedicated target for Claude Code's own internal judgment
+
+`autoMode` is a top-level config key, independent of `routes` — it never
+depends on a route name or the client's requested `model` string, only on
+what you pin here:
+
+```json5
+autoMode: {
+  default: "anthropic-subscription/haiku",
+  // fallbacks: ["anthropic/claude-haiku-4-5"],
+}
+```
+
+Same shape as a route's `model` (`default` + optional `fallbacks`), but with
+nothing to classify: a `<transcript>`-prefixed auto-mode request resolves
+straight to these targets, bypassing the route-name lookup that
+`routes.default` (and every other route) goes through.
+
+**Why this exists:** without `autoMode`, an auto-mode judgment request falls
+back to resolving by the client-sent model name, or the reserved `default`
+route if that name matches nothing. If `default` (or that model name) points
+at something slow — a multi-second `claude-cli`/`codex-cli` subprocess, for
+instance — Claude Code's own timeout for this fast yes/no judgment can trip,
+and the action gets rejected with "Auto mode could not evaluate this
+action." Setting `autoMode` to something fast and cheap sidesteps that
+regardless of what `default` is doing — the gateway still asks a real model
+to make the call, it just asks a quicker one. `llm-gateway init` offers to
+set this up (recommended) once you have picked your providers, preferring a
+fast alias like `haiku` over the usual `sonnet` default.
 
 ## Cross-protocol routing
 
@@ -428,6 +464,9 @@ For everyday use the schema is just **four top-level keys**:
       },
     },
   },
+  autoMode: {                  // optional — see "autoMode" above
+    default: "<provider>/<fast-model>",
+  },
   logging: {
     dir: "./logs",
     usage: true,
@@ -457,6 +496,7 @@ launch: {
 | `routes.<name>.description` | required on every route. Inline text or `./`/`../`/`/`/`~/` path; this is the classification corpus. |
 | `routes.<name>.model.default` | `"<provider>/<model>"`, split on the first `/` only. |
 | `routes.<name>.model.fallbacks` | may use a different `api` than the default; tried in order before the first response byte, skipping any target the client's protocol cannot reach (see [Cross-protocol routing](#cross-protocol-routing)). |
+| `autoMode` | optional; unset by default. Same `default`/`fallbacks` shape as a route's `model`, but resolved directly — no route-name lookup — for Claude Code's own internal `<transcript>`-prefixed auto-mode judgment requests. See [`autoMode`](#automode-a-fast-dedicated-target-for-claude-codes-own-internal-judgment) above. |
 | `launch` | optional advanced escape hatch only: Claude/Codex/opencode extra args, Codex `wireApi`, opencode `models`/`overrideProviders`. |
 | `logging.debug` | `--debug` truncates user text to 200 chars; `--debug-full` keeps everything. Plain-text prompts on disk — enable deliberately. |
 | `logging.logging` | off by default; set `true` to print `serve`'s console diagnostics (which route/provider was picked, embedding-model prep, per-attempt fallback outcomes) to stderr. An explicit `RUST_LOG` still wins. |

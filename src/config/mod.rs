@@ -47,6 +47,17 @@ pub struct Config {
     #[serde(default)]
     pub routes: BTreeMap<String, RouteConfig>,
 
+    /// The target for Claude Code's own internal `<transcript>`-prefixed
+    /// auto-mode judgment requests — see `crate::server::proxy::classify_request`.
+    /// Deliberately separate from `routes`: it never depends on a route name or
+    /// the client's requested model string, only on what the operator pins here,
+    /// so it can be pointed at a fast target regardless of what model name the
+    /// client's internal classifier happens to ask for. `None` falls back to
+    /// resolving by the requested model name, then `default`, same as before
+    /// this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_mode: Option<ModelConfig>,
+
     /// Per-client launch tweaks (`llm-gateway launch claude|codex|opencode`).
     /// Every field has a sane built-in default, so a normal `config.json`
     /// omits this key entirely — it exists only for the rare hand-edit

@@ -9,7 +9,7 @@
 //! it. `resolve` here just turns whatever name classification (or the
 //! `default` fallback) picked into a concrete `Target`.
 
-use crate::config::{ApiKind, Config, ModelRef, ProviderConfig, SecretRef};
+use crate::config::{ApiKind, Config, ModelConfig, ModelRef, ProviderConfig, SecretRef};
 use crate::error::{Error, Result};
 
 /// A resolved upstream: which provider, which model, and which protocol.
@@ -52,30 +52,48 @@ pub fn resolve(config: &Config, requested: &str) -> Result<Resolution> {
     let (route_name, route) =
         find_route(config, requested).ok_or_else(|| Error::NoRoute(requested.to_string()))?;
 
-    let mut refs = Vec::with_capacity(1 + route.model.fallbacks.len());
-    refs.push(route.model.default.as_str());
-    refs.extend(route.model.fallbacks.iter().map(String::as_str));
+    let targets = resolve_model(config, &format!("route `{route_name}`"), &route.model)?;
+
+    Ok(Resolution {
+        route_name: route_name.to_string(),
+        targets,
+    })
+}
+
+/// Resolve a bare `ModelConfig` (`default` + `fallbacks`) straight to
+/// targets, without going through a route name.
+///
+/// Used both by [`resolve`] (via a route's `model`) and by
+/// `crate::server::proxy` for `Config::auto_mode`, which has no route name to
+/// look up — Claude Code's own internal `<transcript>`-prefixed auto-mode
+/// judgment requests are pinned to whatever the operator configured there,
+/// deliberately bypassing route-name resolution entirely.
+///
+/// `context` labels any error this produces — a pre-formatted phrase such as
+/// `` route `role-writer` `` or `` the `autoMode` config ``, since this
+/// function itself has no route name to blame a malformed entry on.
+pub fn resolve_model(config: &Config, context: &str, model: &ModelConfig) -> Result<Vec<Target>> {
+    let mut refs = Vec::with_capacity(1 + model.fallbacks.len());
+    refs.push(model.default.as_str());
+    refs.extend(model.fallbacks.iter().map(String::as_str));
 
     let mut targets = Vec::with_capacity(refs.len());
     for raw in refs {
         let parsed = ModelRef::parse(raw).ok_or_else(|| {
             Error::Other(format!(
-                "route `{route_name}` has malformed model `{raw}`; expected \"<provider>/<model>\""
+                "{context} has malformed model `{raw}`; expected \"<provider>/<model>\""
             ))
         })?;
         let provider = config
             .provider(&parsed.provider)
             .ok_or_else(|| Error::UnknownProvider {
                 provider: parsed.provider.clone(),
-                route: route_name.to_string(),
+                context: context.to_string(),
             })?;
         targets.push(build_target(parsed, provider));
     }
 
-    Ok(Resolution {
-        route_name: route_name.to_string(),
-        targets,
-    })
+    Ok(targets)
 }
 
 fn build_target(model_ref: ModelRef, provider: &ProviderConfig) -> Target {
