@@ -145,7 +145,7 @@ pub async fn proxy(
     // when the session answered "no" to the auto-classify prompt — then the
     // model name the client sent is what gets resolved, unclassified.
     let semantic_attempt = if auto_route_requested(&headers) {
-        classify_request(&state, &config, &payload, expected_api)
+        classify_request(&state, &config, &payload, expected_api, &requested_model)
     } else {
         SemanticAttempt {
             resolve_as: requested_model.clone(),
@@ -650,6 +650,15 @@ enum SemanticOutcome {
     /// User texts existed but none of the `texts_tried` newest ones cleared
     /// the threshold: fall back to `default`.
     BelowThreshold { texts_tried: usize },
+    /// The newest user text begins with `<transcript>` — a client-internal
+    /// utility request (e.g. Claude Code's auto-mode permission classifier
+    /// asking its own gateway a yes/no question), not a real user turn.
+    /// Embedding classification is skipped entirely; `resolve_as` is the
+    /// model name the client sent when a route matches it
+    /// (`resolved_to_requested: true`), or the reserved `default` route
+    /// otherwise — so a utility request never 404s just because no route is
+    /// named after the client's internal classifier model.
+    UtilityBypass { resolved_to_requested: bool },
 }
 
 /// Build the `routing` block of a trace record.
@@ -698,6 +707,25 @@ fn routing_from(resolution: &route::Resolution, attempt: SemanticAttempt) -> Tra
                 crate::config::DEFAULT_ROUTE,
             ),
         ),
+        SemanticOutcome::UtilityBypass {
+            resolved_to_requested: true,
+        } => (
+            "utility_bypass",
+            "client-internal utility request (text begins with `<transcript>`); \
+             classification skipped, resolved by the requested model name"
+                .to_string(),
+        ),
+        SemanticOutcome::UtilityBypass {
+            resolved_to_requested: false,
+        } => (
+            "utility_bypass",
+            format!(
+                "client-internal utility request (text begins with `<transcript>`); \
+                 classification skipped, but the requested model name matches no route; \
+                 falling back to the reserved `{}` route",
+                crate::config::DEFAULT_ROUTE,
+            ),
+        ),
     };
 
     let ran = matches!(
@@ -734,9 +762,10 @@ fn routing_from(resolution: &route::Resolution, attempt: SemanticAttempt) -> Tra
 #[cfg(feature = "semantic")]
 fn classify_request(
     state: &AppState,
-    _config: &Config,
+    config: &Config,
     payload: &serde_json::Value,
     expected_api: ApiKind,
+    requested_model: &str,
 ) -> SemanticAttempt {
     let fallback = |outcome: SemanticOutcome| SemanticAttempt {
         resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
@@ -751,6 +780,38 @@ fn classify_request(
     // Texts before classifier: a textless request falls back no matter
     // what, and "no user text" is the more precise reason to record for it.
     let texts = classification_texts(expected_api, payload);
+
+    // Claude Code's auto-mode permission classifier calls back through this
+    // same gateway with its own internal yes/no prompt, wrapped in a
+    // `<transcript>` block — not a real user turn. Semantic classification
+    // would route it by whichever role description it happens to cosine-match
+    // closest, which is wrong: resolve it by the model name the client asked
+    // for instead, same as `x-gw-auto-route: 0` does, and skip embedding
+    // entirely.
+    if texts.first().is_some_and(|t| t.starts_with("<transcript>")) {
+        let resolved_to_requested = route::resolve(config, requested_model).is_ok();
+        let resolve_as = if resolved_to_requested {
+            requested_model.to_string()
+        } else {
+            crate::config::DEFAULT_ROUTE.to_string()
+        };
+        tracing::info!(
+            resolve_as = %resolve_as,
+            "utility request bypassed classification, resolved as `{resolve_as}`"
+        );
+        return SemanticAttempt {
+            resolve_as,
+            outcome: SemanticOutcome::UtilityBypass {
+                resolved_to_requested,
+            },
+            candidates: Vec::new(),
+            score: None,
+            embed_ms: 0,
+            decided_by_text: None,
+            walk: Vec::new(),
+        };
+    }
+
     if texts.is_empty() {
         return fallback(SemanticOutcome::NoText);
     }
@@ -861,6 +922,7 @@ fn classify_request(
     _config: &Config,
     _payload: &serde_json::Value,
     _expected_api: ApiKind,
+    _requested_model: &str,
 ) -> SemanticAttempt {
     SemanticAttempt {
         resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
@@ -1549,6 +1611,69 @@ mod tests {
     }
 
     #[test]
+    fn routing_from_reports_utility_bypass_resolved_to_the_requested_model() {
+        let res = resolution("role-writer", route::MatchKind::Exact);
+        let attempt = SemanticAttempt {
+            resolve_as: "role-writer".to_string(),
+            outcome: SemanticOutcome::UtilityBypass {
+                resolved_to_requested: true,
+            },
+            candidates: Vec::new(),
+            score: None,
+            embed_ms: 0,
+            decided_by_text: None,
+            walk: Vec::new(),
+        };
+
+        let routing = routing_from(&res, attempt);
+
+        assert_eq!(routing.mode, "utility_bypass");
+        assert_eq!(routing.matched_route, "role-writer");
+        assert!(routing.candidates.is_empty());
+        assert!(routing.score.is_none());
+        assert!(routing.threshold.is_none());
+        assert!(routing.embed_ms.is_none());
+        assert!(routing.decided_by_text.is_none());
+        assert!(routing.walk.is_none());
+        assert!(
+            routing.reason.contains("<transcript>"),
+            "{}",
+            routing.reason
+        );
+    }
+
+    #[test]
+    fn routing_from_reports_utility_bypass_falling_back_to_default() {
+        let res = resolution(crate::config::DEFAULT_ROUTE, route::MatchKind::Exact);
+        let attempt = SemanticAttempt {
+            resolve_as: crate::config::DEFAULT_ROUTE.to_string(),
+            outcome: SemanticOutcome::UtilityBypass {
+                resolved_to_requested: false,
+            },
+            candidates: Vec::new(),
+            score: None,
+            embed_ms: 0,
+            decided_by_text: None,
+            walk: Vec::new(),
+        };
+
+        let routing = routing_from(&res, attempt);
+
+        assert_eq!(routing.mode, "utility_bypass");
+        assert_eq!(routing.matched_route, crate::config::DEFAULT_ROUTE);
+        assert!(
+            routing.reason.contains(crate::config::DEFAULT_ROUTE),
+            "reason should mention the fallback route: {}",
+            routing.reason
+        );
+        assert!(
+            routing.reason.contains("matches no route"),
+            "reason should explain why it fell back: {}",
+            routing.reason
+        );
+    }
+
+    #[test]
     fn auto_route_requested_defaults_to_true_without_the_header() {
         assert!(auto_route_requested(&HeaderMap::new()));
     }
@@ -1653,7 +1778,13 @@ mod tests {
         let config = state.config.get();
         let payload = json!({ "messages": [{"role": "user", "content": "hello"}] });
 
-        let attempt = classify_request(&state, &config, &payload, ApiKind::AnthropicMessages);
+        let attempt = classify_request(
+            &state,
+            &config,
+            &payload,
+            ApiKind::AnthropicMessages,
+            "opus",
+        );
         assert_eq!(attempt.outcome, SemanticOutcome::NoClassifier);
         assert_eq!(attempt.resolve_as, crate::config::DEFAULT_ROUTE);
     }
@@ -1671,8 +1802,82 @@ mod tests {
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]},
         ]});
 
-        let attempt = classify_request(&state, &config, &payload, ApiKind::AnthropicMessages);
+        let attempt = classify_request(
+            &state,
+            &config,
+            &payload,
+            ApiKind::AnthropicMessages,
+            "opus",
+        );
         assert_eq!(attempt.outcome, SemanticOutcome::NoText);
+        assert_eq!(attempt.resolve_as, crate::config::DEFAULT_ROUTE);
+    }
+
+    /// The bug this feature fixes: Claude Code's auto-mode permission
+    /// classifier sends its internal yes/no prompt (a `<transcript>...`
+    /// body) through the same gateway endpoint a real turn would use. It
+    /// must never be classified by the embedding router — it must resolve
+    /// straight to the model name the client asked for.
+    #[cfg(feature = "semantic")]
+    #[tokio::test]
+    async fn classify_request_bypasses_classification_for_a_transcript_prefixed_request() {
+        let (_dir, state) = test_state(classifiable_config());
+        let config = state.config.get();
+        let payload = json!({ "messages": [
+            {"role": "user", "content": "<transcript>\nsome tool call history\n</transcript>\nis this safe?"},
+        ]});
+
+        let attempt = classify_request(
+            &state,
+            &config,
+            &payload,
+            ApiKind::AnthropicMessages,
+            "role-writer",
+        );
+
+        assert_eq!(
+            attempt.outcome,
+            SemanticOutcome::UtilityBypass {
+                resolved_to_requested: true
+            }
+        );
+        assert_eq!(attempt.resolve_as, "role-writer");
+        assert!(attempt.candidates.is_empty());
+        assert!(attempt.score.is_none());
+        assert_eq!(attempt.embed_ms, 0);
+        assert!(attempt.decided_by_text.is_none());
+        assert!(attempt.walk.is_empty());
+    }
+
+    /// When the requested model name matches no configured route,
+    /// bypassing classification must not turn into a 404 — it falls back to
+    /// the reserved `default` route instead, same escape hatch `Manual`
+    /// mode does not have but this one needs (the client-internal request
+    /// carries whatever model name Claude Code itself is configured with,
+    /// which this gateway's routes have no reason to know about).
+    #[cfg(feature = "semantic")]
+    #[tokio::test]
+    async fn classify_request_falls_back_to_default_when_the_requested_model_has_no_route() {
+        let (_dir, state) = test_state(classifiable_config());
+        let config = state.config.get();
+        let payload = json!({ "messages": [
+            {"role": "user", "content": "<transcript>...</transcript>\nis this safe?"},
+        ]});
+
+        let attempt = classify_request(
+            &state,
+            &config,
+            &payload,
+            ApiKind::AnthropicMessages,
+            "claude-opus-4-not-a-configured-route",
+        );
+
+        assert_eq!(
+            attempt.outcome,
+            SemanticOutcome::UtilityBypass {
+                resolved_to_requested: false
+            }
+        );
         assert_eq!(attempt.resolve_as, crate::config::DEFAULT_ROUTE);
     }
 
@@ -1683,7 +1888,13 @@ mod tests {
         let config = state.config.get();
         let payload = json!({ "messages": [{"role": "user", "content": "hello"}] });
 
-        let attempt = classify_request(&state, &config, &payload, ApiKind::AnthropicMessages);
+        let attempt = classify_request(
+            &state,
+            &config,
+            &payload,
+            ApiKind::AnthropicMessages,
+            "opus",
+        );
         assert_eq!(attempt.outcome, SemanticOutcome::NoClassifier);
         assert_eq!(attempt.resolve_as, crate::config::DEFAULT_ROUTE);
     }
