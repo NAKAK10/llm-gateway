@@ -134,7 +134,8 @@ cache_write_tok, dur_ms, status(success|aborted|error), stream, error?`
 `ts, req_id, client, endpoint, requested_model, input{messages_n,
 last_user_text?, tokens_est, tools, has_image, stream}, routing{mode,
 matched_route, reason, decided_by_text?, walk?, …セマンティック時はスコアも}, resolved{provider, model, api, translation?},
-attempts[{n, target, result, ms}], usage?{in_tok, out_tok}`
+attempts[{n, target, result, ms}], usage?{in_tok, out_tok, cache_read_tok,
+cache_write_tok}`
 
 `routing.mode` は、最新の user テキストで route が決まったとき(マッチ、
 または閾値未満のフォールバック)は `semantic`、最新のテキストが閾値未満で

@@ -108,6 +108,17 @@ pub fn format_line(record: &TraceRecord) -> String {
         Some(usage) => format!(" in={} out={}", usage.in_tok, usage.out_tok),
         None => String::new(),
     };
+    // Most requests never touch the cache, so this is only worth a look when
+    // it did something — same reasoning as `decided_by_suffix` below.
+    let cache_suffix = match &record.usage {
+        Some(usage) if usage.cache_read_tok > 0 || usage.cache_write_tok > 0 => {
+            format!(
+                " cache_r={} cache_w={}",
+                usage.cache_read_tok, usage.cache_write_tok
+            )
+        }
+        _ => String::new(),
+    };
     // Only semantic routing has a score to show; explicit matches leave it
     // `None` and this stays empty, so the common case is unaffected.
     let score_suffix = match record.routing.score {
@@ -136,7 +147,7 @@ pub fn format_line(record: &TraceRecord) -> String {
     };
 
     format!(
-        "{time} {client}→{route}{score_suffix} [{provider}/{model}]{translation_suffix} {result}{attempts_suffix}{usage_suffix}{decided_by_suffix}",
+        "{time} {client}→{route}{score_suffix} [{provider}/{model}]{translation_suffix} {result}{attempts_suffix}{usage_suffix}{cache_suffix}{decided_by_suffix}",
         client = record.client,
         route = record.routing.matched_route,
         provider = record.resolved.provider,
@@ -223,11 +234,43 @@ mod tests {
         record.usage = Some(TraceUsage {
             in_tok: 120,
             out_tok: 340,
+            cache_read_tok: 0,
+            cache_write_tok: 0,
         });
         assert_eq!(
             format_line(&record),
             "12:34:56 claude-code→claude-* [anthropic/claude-sonnet-4-6] ok_first_byte in=120 out=340"
         );
+    }
+
+    #[test]
+    fn cache_tokens_are_appended_when_present() {
+        let mut record = base_record();
+        record.usage = Some(TraceUsage {
+            in_tok: 120,
+            out_tok: 340,
+            cache_read_tok: 500,
+            cache_write_tok: 20,
+        });
+        assert_eq!(
+            format_line(&record),
+            "12:34:56 claude-code→claude-* [anthropic/claude-sonnet-4-6] ok_first_byte \
+             in=120 out=340 cache_r=500 cache_w=20"
+        );
+    }
+
+    #[test]
+    fn cache_tokens_are_omitted_when_zero() {
+        let mut record = base_record();
+        record.usage = Some(TraceUsage {
+            in_tok: 120,
+            out_tok: 340,
+            cache_read_tok: 0,
+            cache_write_tok: 0,
+        });
+        let line = format_line(&record);
+        assert!(!line.contains("cache_r="));
+        assert!(!line.contains("cache_w="));
     }
 
     #[test]

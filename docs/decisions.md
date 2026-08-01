@@ -2,6 +2,31 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-08-01 — Cache observability before cache transfer
+
+Record of where prompt caching stands today: a client's cache hints
+(`cache_control` blocks, `prompt_cache_key`) only survive when the request
+passes through as the same protocol it arrived in. Cross-protocol translation
+(`anthropic → chat`, `responses → chat`) rebuilds the outbound request field
+by field from an allowlist — the same design `AnthropicToChat` and
+`ResponsesToChat` use for every other unrecognized field (see the entries
+above and near the bottom of this file) — so cache hints are dropped
+structurally, not by oversight. This isn't a total loss: OpenAI-family
+providers run their own automatic prefix caching server-side regardless of
+what the request carries. `transport: "claude-cli"` is the one path immune
+to all of this — the CLI manages its own cache, and its usage numbers,
+cache counts included, arrive from the model untouched (see the
+`claude-cli` entry below).
+
+**Decision: build observability first, not transfer.** The next lever here
+would be a provider opt-in that forwards `cache_control` / `prompt_cache_key`
+through translation instead of dropping them. That isn't being built yet —
+`in_tok`/`out_tok`'s new siblings `cache_read_tok`/`cache_write_tok` are
+landing in trace usage and `stats` first, so real cache-hit-rate data exists
+before deciding whether a transfer opt-in is worth the added per-provider
+surface. Deferred, not rejected — this entry is the marker to revisit once
+that data exists.
+
 ## 2026-08-01 — Second translation direction: `openai-responses` in → `openai-chat` out, for Codex CLI 0.145+
 
 Codex CLI 0.145.0 dropped `wire_api = "chat"` entirely — a config naming it

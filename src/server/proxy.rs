@@ -444,6 +444,8 @@ pub async fn proxy(
                 (!usage.is_empty()).then_some(TraceUsage {
                     in_tok: usage.input_tokens,
                     out_tok: usage.output_tokens,
+                    cache_read_tok: usage.cache_read_tokens,
+                    cache_write_tok: usage.cache_write_tokens,
                 }),
                 semantic_attempt,
             ));
