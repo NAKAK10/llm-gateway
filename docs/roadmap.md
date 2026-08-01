@@ -27,9 +27,11 @@
   (Tailscale tailnet IP recommended; never a bare `0.0.0.0`), (3) the staged
   Day 0–4 plan in `docs/clients/openclaw.md` executed while the 09:20 watchdog
   is observable.
-- **Codex `wire_api` ambiguity** — official docs list `chat` and `responses`;
-  secondary sources say `chat` was removed 2026-02. The gateway serves both
-  endpoints and `launch.codex.wireApi` switches, so measurement decides.
+- ~~**Codex `wire_api` ambiguity**~~ — resolved: verified against a real
+  Codex CLI 0.145.0, which no longer accepts `wire_api = "chat"` at all
+  (startup refuses it) and requires `"responses"`. `Translation::
+  ResponsesToChat` (below) is what keeps `openai-chat`-only providers
+  reachable now that `chat` is gone.
 
 ## Phase 2 — classification (shipped)
 
@@ -53,9 +55,14 @@
       provider). No unmet need yet: OpenRouter exposes an Anthropic-compatible
       endpoint, and the OpenAI-protocol clients already reach `openai-chat`
       providers directly.
-- [ ] anything involving `openai-responses` (issue #4). Codex is the only
-      client that speaks it, and `launch.codex.wireApi: "chat"` sidesteps the
-      problem entirely.
+- [x] `openai-responses` in → `openai-chat` out (issue #4,
+      `Translation::ResponsesToChat`), needed once Codex CLI 0.145+ dropped
+      `wire_api = "chat"` support entirely — see decisions.md for what it
+      drops (`reasoning`, `include`, `store`, Codex's own `namespace`/
+      `web_search` tool types, …) and its real-machine verification
+      (`codex exec`, normal response and `exec_command` tool calling).
+      `anthropic-messages` ⇄ `openai-responses` remains untranslated in
+      either direction — no client speaks both.
 - [ ] let a provider choose its auth header (`Authorization: Bearer` vs
       `x-api-key`), independently of its `api`. This is what stands between us
       and GitHub Copilot's own `/v1/messages` endpoint: Copilot advertises it

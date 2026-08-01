@@ -36,7 +36,7 @@ upstream may be registered under several ids to expose different protocols.
 | field | default | notes |
 |---|---|---|
 | `baseUrl` | *(required for `http`)* | No trailing slash. For `anthropic-messages` this is the host root (`https://api.anthropic.com`) — the gateway appends `/v1/messages`. For the OpenAI kinds include the version prefix (`…/v1`) — the gateway appends `/chat/completions` or `/responses`. |
-| `api` | *(required)* | `openai-chat` \| `openai-responses` \| `anthropic-messages`. A route may be reached from a client speaking a different protocol only when the gateway can translate the pair — today `anthropic-messages` in → `openai-chat` out, i.e. Claude Code to any OpenAI-compatible provider. Anything else is a `400`. |
+| `api` | *(required)* | `openai-chat` \| `openai-responses` \| `anthropic-messages`. A route may be reached from a client speaking a different protocol only when the gateway can translate the pair — today `anthropic-messages` in → `openai-chat` out (Claude Code to any OpenAI-compatible provider) and `openai-responses` in → `openai-chat` out (Codex CLI to the same providers — needed since Codex CLI 0.145+ requires `wire_api = "responses"` and no longer accepts `"chat"`). Anything else is a `400`. |
 | `apiKey` | *(none)* | Literal string \| `"${ENV_VAR}"` \| `"keychain:<name>"` (macOS Keychain, service `llm-gateway/<name>`) \| `"command:<cmd>"` (stdout of a command, e.g. `command:gh auth token`). Resolved **per request attempt**, so rotation applies live — which is the point of the `command:` form, since a `serve` process's environment is fixed at startup and cannot be updated from outside. A command runs on every attempt, so keep it fast. |
 | `headers` | `{}` | Extra request headers, e.g. OpenRouter's optional `HTTP-Referer` / `X-Title`. |
 | `transport` | `"http"` | `"http"` \| `"claude-cli"` \| `"codex-cli"`. The CLI transports run a local binary instead of making a request, which is how a subscription can serve gateway traffic — `baseUrl` and `apiKey` are then unused (the CLI holds its own login), and `api` is fixed by the CLI's output: `anthropic-messages` for `claude-cli`, `openai-chat` for `codex-cli`. A model part of `default` means "whatever the CLI is configured to use". See the README's "Subscription-backed providers". |
@@ -115,7 +115,7 @@ need launcher-specific overrides.
 | field | applies to | notes |
 |---|---|---|
 | `extraArgs` | claude / codex / opencode | Inserted before user-supplied arguments. |
-| `wireApi` | codex | `"responses"` (default) or `"chat"`. The gateway serves both endpoints; which one your Codex accepts depends on its version. |
+| `wireApi` | codex | `"responses"` (default) or `"chat"`. The gateway serves both endpoints; which one your Codex accepts depends on its version — Codex CLI 0.145+ removed `"chat"` entirely and requires `"responses"`, and the gateway now translates `openai-responses → openai-chat` per attempt so an `openai-chat`-only provider is still reachable with `wireApi` left at the default. |
 | `models` | opencode | Route names to expose. Empty = every non-wildcard route. Verified against the live gateway before starting. |
 | `overrideProviders` | opencode | Built-in opencode provider ids whose `baseURL` is redirected to the gateway. Default: `["openai", "anthropic"]`. |
 
@@ -156,7 +156,8 @@ pairs, so a single trace line shows which text won and how the walk got there
 without having to re-derive it from scores alone.
 
 `resolved.translation` is present only when the request crossed protocols
-(e.g. `"anthropic-messages->openai-chat"`); its absence means the response was
+(e.g. `"anthropic-messages->openai-chat"` or `"openai-responses->openai-chat"`);
+its absence means the response was
 forwarded byte-for-byte. It always describes the target in `resolved` — i.e.
 whichever attempt actually served the response — not the route's `default`,
 since a fallback may sit on the other side of a protocol boundary.

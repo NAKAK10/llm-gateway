@@ -472,7 +472,7 @@ async fn protocol_mismatch_is_a_400_not_a_confusing_upstream_error() {
     let mut config = Config::default();
     config.providers.insert(
         "mock".into(),
-        provider("http://127.0.0.1:9/v1", ApiKind::OpenaiChat),
+        provider("http://127.0.0.1:9/v1", ApiKind::AnthropicMessages),
     );
     config.routes.insert(
         llm_gateway::config::DEFAULT_ROUTE.into(),
@@ -480,11 +480,12 @@ async fn protocol_mismatch_is_a_400_not_a_confusing_upstream_error() {
     );
 
     let addr = spawn_gateway(config, None).await;
-    // Calling the *Responses* endpoint with a chat-backed route must be
-    // refused up front.
+    // Calling the *Chat* endpoint with an anthropic-only-backed route must be
+    // refused up front: unlike `openai-responses`, `openai-chat` has no
+    // translation to `anthropic-messages`.
     let response = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/responses"))
-        .json(&serde_json::json!({"model": "default", "input": "hi"}))
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({"model": "default", "messages": []}))
         .send()
         .await
         .unwrap();
@@ -493,7 +494,7 @@ async fn protocol_mismatch_is_a_400_not_a_confusing_upstream_error() {
     assert!(body["error"]["message"]
         .as_str()
         .unwrap()
-        .contains("openai-chat"));
+        .contains("anthropic-messages"));
 }
 
 /// The point of issue #3: Claude Code only ever speaks `/v1/messages`, and
@@ -642,4 +643,131 @@ async fn count_tokens_on_a_translated_route_is_answered_locally() {
         mock.requests.lock().unwrap().is_empty(),
         "the provider must never see a count_tokens request it cannot answer"
     );
+}
+
+/// The point of `Translation::ResponsesToChat`: Codex CLI only ever speaks
+/// `/v1/responses`, and the same `openai-chat`-only providers `launch claude`
+/// already reaches need to be reachable from it too. This is that pair, end
+/// to end over real TCP, streaming.
+#[tokio::test]
+async fn a_responses_client_streams_from_an_openai_chat_provider() {
+    let (upstream, mock) = spawn_chat_mock(ChatMockMode::Sse).await;
+    let addr = spawn_gateway(translated_config(upstream), None).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/responses"))
+        .header("x-gw-client", "codex")
+        .json(&serde_json::json!({
+            "model": "default",
+            "stream": true,
+            "instructions": "You are terse.",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "ping"}],
+            }],
+            "tools": [{
+                "type": "function",
+                "name": "read_file",
+                "description": "read a file",
+                "parameters": {"type": "object"},
+            }],
+            "tool_choice": "auto",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+
+    // What the client sees must be a well-formed Responses event sequence.
+    for event in [
+        "event: response.created",
+        "event: response.output_item.added",
+        "event: response.content_part.added",
+        "event: response.output_text.delta",
+        "event: response.content_part.done",
+        "event: response.completed",
+    ] {
+        assert!(body.contains(event), "missing {event} in:\n{body}");
+    }
+    assert!(body.contains("日本語"), "{body}");
+    assert!(body.contains("テスト"), "{body}");
+    // `[DONE]` is not part of the Responses protocol either.
+    assert!(!body.contains("[DONE]"), "{body}");
+    // The final usage must reach the client, restated Responses-style.
+    assert!(body.contains("\"input_tokens\":11"), "{body}");
+    assert!(body.contains("\"output_tokens\":4"), "{body}");
+
+    // And what reached the upstream must be a plain `openai-chat` request.
+    let seen = mock.requests.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let sent = &seen[0];
+    assert_eq!(sent["model"], "qwen3.5");
+    assert_eq!(sent["messages"][0]["role"], "system");
+    assert_eq!(sent["messages"][0]["content"], "You are terse.");
+    assert_eq!(sent["messages"][1]["role"], "user");
+    assert_eq!(sent["messages"][1]["content"], "ping");
+    assert_eq!(sent["tools"][0]["type"], "function");
+    assert_eq!(sent["tools"][0]["function"]["name"], "read_file");
+    assert_eq!(sent["tool_choice"], "auto");
+    // Usage injection still applies.
+    assert_eq!(sent["stream_options"]["include_usage"], true);
+    // Responses-only keys must not leak upstream.
+    assert!(sent.get("input").is_none(), "{sent}");
+    assert!(sent.get("instructions").is_none(), "{sent}");
+}
+
+#[tokio::test]
+async fn a_non_streaming_responses_client_gets_an_output_text_response() {
+    let (upstream, _mock) = spawn_chat_mock(ChatMockMode::Json).await;
+    let addr = spawn_gateway(translated_config(upstream), None).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "default",
+            "input": "ping",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["output"][0]["type"], "message");
+    assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
+    assert_eq!(body["output"][0]["content"][0]["text"], "こんにちは");
+    assert_eq!(body["usage"]["input_tokens"], 11);
+    assert_eq!(body["usage"]["output_tokens"], 4);
+    // The upstream's own model name is the honest answer.
+    assert_eq!(body["model"], "qwen3.5");
+}
+
+#[tokio::test]
+async fn an_upstream_error_reaches_a_responses_client_in_an_openai_envelope() {
+    let (upstream, _mock) = spawn_chat_mock(ChatMockMode::RateLimited).await;
+    let addr = spawn_gateway(translated_config(upstream), None).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "default",
+            "stream": true,
+            "input": "ping",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 429);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["message"], "slow down");
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    // No top-level `type` field — that is an Anthropic envelope detail, and
+    // this client speaks OpenAI's own error shape instead.
+    assert!(body.get("type").is_none());
 }

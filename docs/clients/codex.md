@@ -16,7 +16,7 @@ Append to `~/.codex/config.toml` (**user-level** — a project-local
 name = "LLM Gateway"
 base_url = "http://127.0.0.1:4000/v1"
 env_key = "LLM_GATEWAY_KEY"     # names an env var; the value goes in ~/.codex/.env
-wire_api = "responses"           # if this errors on your version, try "chat"
+wire_api = "responses"           # required on Codex CLI 0.145+; older versions may also accept "chat"
 
 [model_providers.gateway.http_headers]
 "x-gw-client" = "codex"
@@ -54,9 +54,16 @@ Notes:
 - `disable_response_storage = true` matters as soon as any fallback goes to
   OpenRouter: its `/v1/responses` is stateless and 400s on a non-null
   `previous_response_id` — every conversation would die on turn 2.
-- `wire_api` accepts `responses` on current versions; whether `chat` still
-  exists differs between sources. The gateway serves both endpoints, so try
-  `responses` first and fall back to `chat` only if Codex refuses.
+- `wire_api = "responses"` is required, not just preferred, on Codex CLI
+  0.145.0+: `"chat"` support was dropped entirely and Codex refuses to start
+  with it configured. Stay on `responses` even when your route's provider
+  only speaks `openai-chat` (OpenRouter, Ollama, …) — the gateway translates
+  `openai-responses → openai-chat` per attempt now
+  (`Translation::ResponsesToChat`), so nothing downstream needs `wire_api =
+  "chat"` to exist. Verified end to end against 0.145.0: a normal `codex exec`
+  response and a full `exec_command` tool-calling round trip through an
+  `openai-chat` fallback provider. Older Codex versions that still accept
+  `"chat"` may keep using it, but there is no longer a reason to.
 
 ## Verify
 

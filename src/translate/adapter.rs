@@ -28,7 +28,7 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use futures_util::Stream;
 
-use crate::translate::stream::ChatToAnthropic;
+use crate::translate::stream::StreamConverter;
 use crate::translate::Translation;
 
 /// Cap on how much of a non-streaming body gets buffered for translation.
@@ -69,7 +69,7 @@ where
     S: Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send + 'static,
 {
     let mode = match shape {
-        ResponseShape::Sse { model } => Mode::Sse(ChatToAnthropic::new(model)),
+        ResponseShape::Sse { model } => Mode::Sse(translation.stream_converter(model)),
         ResponseShape::Json { model } => Mode::Buffer {
             kind: JsonKind::Success { model },
             buffer: Vec::new(),
@@ -96,8 +96,10 @@ enum JsonKind {
 }
 
 enum Mode {
-    /// Event-by-event conversion, no buffering beyond a partial event.
-    Sse(ChatToAnthropic),
+    /// Event-by-event conversion, no buffering beyond a partial event. Boxed
+    /// as a trait object because which client protocol's SSE shape comes out
+    /// depends on the translation, and this type must not depend on that.
+    Sse(Box<dyn StreamConverter>),
     /// The whole body, translated once the upstream signals the end.
     Buffer {
         kind: JsonKind,
@@ -209,10 +211,9 @@ impl TranslateStream {
                     (JsonKind::Error { status }, Ok(body)) => translation.error(&body, *status),
                     // An error status *and* an unreadable body: the status is
                     // still the useful part, so it leads the message.
-                    (JsonKind::Error { status }, Err(detail)) => {
-                        anthropic_error(&format!("upstream returned HTTP {status}: {detail}"))
-                    }
-                    (JsonKind::Success { .. }, Err(detail)) => anthropic_error(&format!(
+                    (JsonKind::Error { status }, Err(detail)) => translation
+                        .gateway_error(&format!("upstream returned HTTP {status}: {detail}")),
+                    (JsonKind::Success { .. }, Err(detail)) => translation.gateway_error(&format!(
                         "upstream returned 2xx with a body this gateway could not \
                          translate: {detail}"
                     )),
@@ -234,15 +235,6 @@ fn parse_body(body: &[u8]) -> std::result::Result<serde_json::Value, String> {
         let text = String::from_utf8_lossy(body);
         let snippet: String = text.chars().take(SNIPPET_CHARS).collect();
         format!("{err} (body starts: {snippet})")
-    })
-}
-
-/// The Anthropic error envelope. `type: api_error` because this is the
-/// gateway's own failure, not the client's.
-fn anthropic_error(message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "error",
-        "error": { "type": "api_error", "message": message },
     })
 }
 
@@ -376,5 +368,61 @@ mod tests {
         let text = collect(out).await.unwrap();
         assert!(text.contains("event: content_block_stop"), "{text}");
         assert!(text.contains("event: message_stop"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_responses_non_streaming_body_is_translated_as_one_chunk() {
+        let body = r#"{"id":"chatcmpl-1","model":"qwen3","choices":[{"index":0,
+            "message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":3,"completion_tokens":1}}"#;
+        let out = translate_body(
+            source(vec![body]),
+            Translation::ResponsesToChat,
+            ResponseShape::Json {
+                model: "fallback".to_string(),
+            },
+        );
+
+        let text = collect(out).await.unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["object"], "response");
+        assert_eq!(value["output"][0]["content"][0]["text"], "hi");
+        assert_eq!(value["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn a_responses_error_body_becomes_an_openai_error_envelope() {
+        let body = r#"{"error":{"message":"model not found","type":"invalid_request_error"}}"#;
+        let out = translate_body(
+            source(vec![body]),
+            Translation::ResponsesToChat,
+            ResponseShape::Error { status: 404 },
+        );
+
+        let text = collect(out).await.unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["error"]["message"], "model not found");
+        // No top-level `type` field — that is an Anthropic envelope detail.
+        assert!(value.get("type").is_none());
+    }
+
+    #[tokio::test]
+    async fn responses_sse_events_are_converted_as_they_arrive() {
+        let out = translate_body(
+            source(vec![
+                "data: {\"id\":\"chatcmpl-1\",\"model\":\"qwen3\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"he\"}}]}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"llo\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ]),
+            Translation::ResponsesToChat,
+            ResponseShape::Sse { model: "m".to_string() },
+        );
+
+        let text = collect(out).await.unwrap();
+        assert!(text.contains("event: response.created"), "{text}");
+        assert!(text.contains("\"delta\":\"he\""), "{text}");
+        assert!(text.contains("\"delta\":\"llo\""), "{text}");
+        assert!(text.contains("event: response.completed"), "{text}");
+        assert!(!text.contains("[DONE]"), "{text}");
     }
 }

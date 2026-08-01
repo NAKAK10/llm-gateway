@@ -36,7 +36,7 @@ id は `model` 文字列の最初の `/` より前に現れる部分です。同
 | フィールド | デフォルト | 補足 |
 |---|---|---|
 | `baseUrl` | *(`http` では必須)* | 末尾スラッシュなし。`anthropic-messages` はホストのルート(`https://api.anthropic.com`)— ゲートウェイが `/v1/messages` を付加する。OpenAI 系はバージョンプレフィックス(`…/v1`)まで含める — ゲートウェイが `/chat/completions` または `/responses` を付加する。 |
-| `api` | *(必須)* | `openai-chat` \| `openai-responses` \| `anthropic-messages`。あるルートに、その `api` とは異なるプロトコルを話すクライアントから到達できるのは、ゲートウェイがその組み合わせを変換できる場合だけ — 現時点では `anthropic-messages` 受信 → `openai-chat` 送信のみ(つまり Claude Code から任意の OpenAI 互換プロバイダーへ)。それ以外の組み合わせは `400` になる。 |
+| `api` | *(必須)* | `openai-chat` \| `openai-responses` \| `anthropic-messages`。あるルートに、その `api` とは異なるプロトコルを話すクライアントから到達できるのは、ゲートウェイがその組み合わせを変換できる場合だけ — 現時点では `anthropic-messages` 受信 → `openai-chat` 送信(つまり Claude Code から任意の OpenAI 互換プロバイダーへ)と、`openai-responses` 受信 → `openai-chat` 送信(つまり Codex CLI から同じプロバイダー群へ — Codex CLI 0.145+ が `wire_api = "responses"` を必須にし `"chat"` を受け付けなくなったことへの対応)。それ以外の組み合わせは `400` になる。 |
 | `apiKey` | *(なし)* | リテラル文字列 \| `"${ENV_VAR}"` \| `"keychain:<name>"`(macOS Keychain、サービス名 `llm-gateway/<name>`) \| `"command:<cmd>"`(コマンドの標準出力、例: `command:gh auth token`)。**リクエスト試行ごとに**解決されるため、ローテーションは即時反映 — これが `command:` 形式の存在理由でもある。`serve` プロセスの環境変数は起動時に固定され、外部から更新できないため `${VAR}` ではローテーションするトークンを扱えない。コマンドは試行のたびに実行されるので、高速なものにすること。 |
 | `headers` | `{}` | 追加リクエストヘッダー。例: OpenRouter の任意ヘッダー `HTTP-Referer` / `X-Title`。 |
 | `transport` | `"http"` | `"http"` \| `"claude-cli"` \| `"codex-cli"`。CLI transport はリクエストを送る代わりにローカルのバイナリを実行する — これがサブスクリプションでゲートウェイのトラフィックを処理させる方法。この場合 `baseUrl` と `apiKey` は使われず(CLI 自身がログイン済み)、`api` は CLI の出力に応じて固定される: `claude-cli` なら `anthropic-messages`、`codex-cli` なら `openai-chat`。モデル部の `default` は「CLI が設定されている通りのもの」を意味する。README の「サブスクリプションベースのプロバイダー」を参照。 |
@@ -111,7 +111,7 @@ name はクライアントが `model` として送るものです。`:` と `/` 
 | フィールド | 対象 | 補足 |
 |---|---|---|
 | `extraArgs` | claude / codex / opencode | ユーザー指定の引数より前に挿入される。 |
-| `wireApi` | codex | `"responses"`(既定)または `"chat"`。ゲートウェイは両エンドポイントを提供し、どちらを受け付けるかは Codex のバージョン次第。 |
+| `wireApi` | codex | `"responses"`(既定)または `"chat"`。ゲートウェイは両エンドポイントを提供し、どちらを受け付けるかは Codex のバージョン次第 — Codex CLI 0.145+ は `"chat"` を完全に廃止し `"responses"` を必須にした。ゲートウェイは試行ごとに `openai-responses → openai-chat` を変換するので、`wireApi` を既定のままにしていても `openai-chat` 専用のプロバイダーに到達できる。 |
 | `models` | opencode | 公開する route 名。空 = ワイルドカード以外のすべての route。起動前に稼働中のゲートウェイに対して検証される。 |
 | `overrideProviders` | opencode | `baseURL` をゲートウェイへ向け替える opencode 組み込み provider id。既定: `["openai", "anthropic"]`。 |
 
@@ -152,7 +152,8 @@ attempts[{n, target, result, ms}], usage?{in_tok, out_tok}`
 trace の 1 行だけでわかります。
 
 `resolved.translation` はリクエストがプロトコルをまたいだ場合にのみ存在し
-(例: `"anthropic-messages->openai-chat"`)、存在しなければレスポンスが
+(例: `"anthropic-messages->openai-chat"` や `"openai-responses->openai-chat"`)、
+存在しなければレスポンスが
 バイト単位で無加工のまま転送されたことを意味します。これは常に
 `resolved` が示すターゲット — つまり実際に応答した試行 — についての値で
 あり、route の `default` についての値ではありません。フォールバックが

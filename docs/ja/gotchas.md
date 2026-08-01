@@ -84,20 +84,34 @@
 
 ## クロスプロトコル変換
 
-方向は一つだけ: `anthropic-messages` 受信 → `openai-chat` 送信
-(`src/translate/`)。走るのはクライアントとプロバイダーのプロトコルが
-異なる場合*だけ*で、同一プロトコル同士のトラフィックはこの経路に一切入らない。
+2 方向が存在し、どちらも `openai-chat` を変換先にする(`src/translate/`):
+`anthropic-messages` 受信(`Translation::AnthropicToChat`)と
+`openai-responses` 受信(`Translation::ResponsesToChat`。Codex CLI 0.145+ が
+`wire_api = "chat"` を完全に廃止したことに対応するため追加)。どちらも
+走るのはクライアントとプロバイダーのプロトコルが異なる場合*だけ*で、
+同一プロトコル同士のトラフィックはこの経路に一切入らない。
+`anthropic-messages` ⇄ `openai-responses` に触れる方向は無い —
+両方を話すクライアントが存在しないため。
 
 - **変換されたルートではバイト単位無加工の保証が成り立たない。** ユーザー
   向けの説明には必ずそう書くこと。「出力がおかしい」という報告を調べる前に
-  `llm-gateway trace` で `xlat=anthropic-messages->openai-chat` を確認する。
-- **静かに破棄されるもの(変換先プロトコルに置き場がないため):**
-  プロンプトキャッシュ(`cache_control`。`cache_creation_input_tokens` は
-  常に 0)、`thinking` ブロックと `thinking` リクエスト設定、citation、
-  `document`/`search_result` コンテンツブロック、`top_k`、Anthropic の
-  サーバーサイドツール(`web_search_*`、`bash_*`、`text_editor_*` —
-  Anthropic 自身のインフラ内で実行されるものなので、どのみち他の
-  プロバイダーには実行しようがない)。
+  `llm-gateway trace` で `xlat=anthropic-messages->openai-chat` または
+  `xlat=openai-responses->openai-chat` を確認する。
+- **`anthropic-messages → openai-chat` で静かに破棄されるもの(変換先
+  プロトコルに置き場がないため):** プロンプトキャッシュ
+  (`cache_control`。`cache_creation_input_tokens` は常に 0)、`thinking`
+  ブロックと `thinking` リクエスト設定、citation、`document`/
+  `search_result` コンテンツブロック、`top_k`、Anthropic のサーバーサイド
+  ツール(`web_search_*`、`bash_*`、`text_editor_*` — Anthropic 自身の
+  インフラ内で実行されるものなので、どのみち他のプロバイダーには
+  実行しようがない)。
+- **`openai-responses → openai-chat` で静かに破棄されるもの:**
+  `reasoning`、`include`、`store` / `previous_response_id`、
+  `prompt_cache_key` / `client_metadata`、`text`、`metadata`、そして
+  フラットな `function` 型以外のツール — `local_shell`、`web_search`、
+  複数の function ツールをまとめる `namespace`。最後の3つは Codex 自身の
+  拡張であり、Codex 自身か OpenAI のインフラ内で実行されるものなので、
+  どのみちどの `openai-chat` プロバイダーにも実行できない。
 - **`reasoning_content` / `reasoning` の delta は変換されず破棄される。**
   本物の Anthropic `thinking` ブロックは Anthropic だけが発行できる
   `signature` を持つ — reasoning を普通のテキストとして転送すれば、

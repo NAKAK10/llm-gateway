@@ -18,7 +18,7 @@
 name = "LLM Gateway"
 base_url = "http://127.0.0.1:4000/v1"
 env_key = "LLM_GATEWAY_KEY"     # 環境変数の名前; 値は ~/.codex/.env に置く
-wire_api = "responses"           # このバージョンでエラーになるなら "chat" を試す
+wire_api = "responses"           # Codex CLI 0.145+ では必須。旧バージョンは "chat" も受け付ける場合がある
 
 [model_providers.gateway.http_headers]
 "x-gw-client" = "codex"
@@ -57,10 +57,17 @@ Codex は依然として model 文字列を要求しますが、`llm-gateway` �
   瞬間に効いてくる: OpenRouter の `/v1/responses` はステートレスで、
   `previous_response_id` が非 null だと 400 を返す — なければすべての会話が
   2 ターン目で死ぬ。
-- `wire_api` は現行バージョンでは `responses` を受け付ける。`chat` がまだ
-  存在するかはソースによって食い違う。ゲートウェイは両エンドポイントを
-  提供しているので、まず `responses` を試し、Codex が拒否した場合のみ
-  `chat` に切り替えること。
+- `wire_api = "responses"` は Codex CLI 0.145.0+ では単なる推奨ではなく
+  必須。`"chat"` サポートは完全に廃止され、設定されていると Codex は起動を
+  拒否する。route のプロバイダーが `openai-chat` しか話さない場合
+  (OpenRouter、Ollama など)でも `responses` のままでよい —
+  ゲートウェイは試行ごとに `openai-responses → openai-chat` を変換する
+  ようになった(`Translation::ResponsesToChat`)ので、下流のどこにも
+  `wire_api = "chat"` が存在する必要はない。0.145.0 に対して実機で
+  検証済み: 通常の `codex exec` 応答と、`openai-chat` の fallback
+  プロバイダー経由での `exec_command` ツール呼び出しの往復。`chat` を
+  まだ受け付ける旧バージョンの Codex は引き続き使ってもよいが、もう
+  そうする理由はない。
 
 ## 動作確認
 

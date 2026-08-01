@@ -2,6 +2,78 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-08-01 — Second translation direction: `openai-responses` in → `openai-chat` out, for Codex CLI 0.145+
+
+Codex CLI 0.145.0 dropped `wire_api = "chat"` entirely — a config naming it
+now refuses to start, where earlier versions accepted either value. Codex
+therefore only ever speaks `/v1/responses` from here on. In any config whose
+Codex-facing route resolves (directly or via fallback) to a provider that
+only speaks `openai-chat` — every local Ollama, Groq, DeepSeek, Gemini,
+Mistral, Together, Sakana AI, and PLaMo entry in `docs/providers.md` — every
+Codex request became an unconditional `400`: there was no longer any
+`wire_api` value that reached those providers at all. The gateway already
+solved exactly this shape of problem for Claude Code (issue #3,
+`Translation::AnthropicToChat`, see the entry near the bottom of this file);
+Codex needed the same fix for its own protocol pair.
+
+**Built: `Translation::ResponsesToChat` (`src/translate/`), using
+`AnthropicToChat` as the template.** Same three-way split — `request.rs`
+builds a fresh `openai-chat` request field by field (never patches the
+Responses body in place, for the same reason: an unrecognized key like
+`reasoning` or `store` makes strict `openai-chat` servers answer `400`),
+`response.rs` handles the non-streaming reverse translation, `stream.rs`
+handles the streaming one. `instructions` becomes a leading `system`
+message, `input` (string or the typed item array — `message`,
+`function_call`, `function_call_output`) becomes `messages` (`developer`
+role folds into `system`, chat has no third role), `max_output_tokens`
+becomes `max_tokens`, and flat `{"type":"function",…}` tool definitions
+translate directly. The reverse direction rebuilds a Responses `response`
+object (non-streaming) or a Responses SSE event sequence — `response.created`
+→ `response.output_text.delta` / `response.function_call_arguments.delta` →
+`response.completed`, each carrying its own `sequence_number` — because
+Responses clients dispatch on named event types the way Anthropic ones do,
+not on a single `delta` shape the way `openai-chat` does.
+
+**Dropped, and why:** `reasoning` (Codex's own extended-thinking config; no
+reachable `openai-chat` provider implements it), `include` /
+`prompt_cache_key` / `client_metadata` (Responses-specific caching and
+telemetry hints with nothing to land in on the target side), `store` /
+`previous_response_id` (server-side conversation state `openai-chat` has no
+concept of), `text` (Responses' own structured-output/verbosity config,
+incompatible with `openai-chat`'s), and — the one most specific to Codex —
+non-`function` tool entries: `local_shell`, `web_search`, and a `namespace`
+grouping of several function tools. Those last three are Codex's own
+extensions, executed either by Codex itself or by OpenAI's infrastructure;
+no `openai-chat` provider this gateway reaches could run them regardless of
+translation, so silently dropping them (rather than erroring) is the same
+call `AnthropicToChat` already makes for Anthropic's server-side tools.
+
+**Refactored while adding the second direction, rather than duplicating
+`AnthropicToChat`'s call sites:** `translate::adapter`'s `Mode::Sse` used to
+hold a concrete `ChatToAnthropic` field; it now holds `Box<dyn
+StreamConverter>` (`src/translate/stream.rs`), and `Translation::
+stream_converter` picks the concrete converter per direction. The gateway's
+own mid-translation error envelope (an unreadable or oversized upstream
+body — as opposed to a real upstream error, which `Translation::error`
+already handled per-direction) was hardcoded to the Anthropic shape
+(`anthropic_error` in `adapter.rs`); it is now `Translation::gateway_error`,
+dispatching per direction like every other `Translation` method. Neither
+change alters `AnthropicToChat`'s behaviour — both are the same code paths,
+now selected on `self` instead of assumed.
+
+**Verified against a real Codex CLI 0.145.0** run through
+`llm-gateway launch codex exec`, wired to an `openai-chat` provider
+(OpenRouter): an ordinary response, and a full tool-calling round trip —
+`exec_command`'s `function_call` out, `function_call_output` back in on the
+next turn, matched by `call_id`. Not just unit fixtures; this is the same
+bar `AnthropicToChat`'s launch entry and the `codex-cli` transport entry
+below were held to.
+
+**Not built: any direction touching `anthropic-messages` ⇄ `openai-responses`
+directly.** No client speaks both protocols, so there is nothing to
+translate between them — the roadmap's issue #4 line now reads "no client
+needs this" rather than "not attempted yet".
+
 ## 2026-08-01 — `description` accepts an array of language variants; each is embedded separately and scored by max cosine
 
 The previous entry fixed same-language routing but assumed traffic is

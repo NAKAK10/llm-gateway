@@ -76,19 +76,32 @@ Traps we already know about. If you hit one that isn't here, add it.
 
 ## Cross-protocol translation
 
-Only one direction exists: `anthropic-messages` in → `openai-chat` out
-(`src/translate/`). It runs *only* when the client's protocol and the provider's
-differ; same-protocol traffic never enters this code path.
+Two directions exist, both targeting `openai-chat` (`src/translate/`):
+`anthropic-messages` in (`Translation::AnthropicToChat`) and `openai-responses`
+in (`Translation::ResponsesToChat`, added for Codex CLI 0.145+, which dropped
+`wire_api = "chat"` entirely). Either runs *only* when the client's protocol
+and the provider's differ; same-protocol traffic never enters this code path.
+No direction touches `anthropic-messages` ⇄ `openai-responses` — no client
+speaks both.
 
 - **The byte-for-byte guarantee does not hold on a translated route.** Say so in
   any user-facing description, and check `llm-gateway trace` for
-  `xlat=anthropic-messages->openai-chat` before debugging a "weird output" report.
-- **Silently dropped, because the target protocol has nowhere to put them:**
-  prompt caching (`cache_control`, and `cache_creation_input_tokens` is always
-  0), `thinking` blocks and the `thinking` request config, citations,
-  `document`/`search_result` content blocks, `top_k`, and Anthropic server-side
-  tools (`web_search_*`, `bash_*`, `text_editor_*` — they run inside
-  Anthropic's infrastructure, so no other provider could execute them anyway).
+  `xlat=anthropic-messages->openai-chat` or `xlat=openai-responses->openai-chat`
+  before debugging a "weird output" report.
+- **Silently dropped on `anthropic-messages → openai-chat`, because the target
+  protocol has nowhere to put them:** prompt caching (`cache_control`, and
+  `cache_creation_input_tokens` is always 0), `thinking` blocks and the
+  `thinking` request config, citations, `document`/`search_result` content
+  blocks, `top_k`, and Anthropic server-side tools (`web_search_*`, `bash_*`,
+  `text_editor_*` — they run inside Anthropic's infrastructure, so no other
+  provider could execute them anyway).
+- **Silently dropped on `openai-responses → openai-chat`:** `reasoning`,
+  `include`, `store` / `previous_response_id`, `prompt_cache_key` /
+  `client_metadata`, `text`, `metadata`, and any tool that is not a flat
+  `function` type — `local_shell`, `web_search`, a `namespace` grouping of
+  several function tools. The last three are Codex's own extensions, executed
+  by Codex itself or by OpenAI's infrastructure; no `openai-chat` provider
+  could run them regardless.
 - **`reasoning_content` / `reasoning` deltas are dropped, not converted.** A
   real Anthropic `thinking` block carries a `signature` only Anthropic can
   produce; forwarding the reasoning as ordinary text would present it as the
