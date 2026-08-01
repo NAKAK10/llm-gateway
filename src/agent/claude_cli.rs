@@ -190,6 +190,18 @@ pub struct CliToAnthropic {
     started: bool,
     /// Whether the terminal events have gone downstream.
     finished: bool,
+    /// The `message_delta` stream event, held back rather than forwarded
+    /// immediately: its `usage` is a mid-run snapshot, and the authoritative
+    /// total only arrives with the top-level `result` line that follows.
+    pending_delta: Option<Value>,
+    /// The `message_stop` stream event, held back alongside `pending_delta`
+    /// so the two are always emitted together, in order.
+    pending_stop: Option<Value>,
+    /// Whether a top-level `result` line has been processed. Emission waits
+    /// for this even if `pending_stop` is already set, so a `result` that
+    /// arrives a moment after `message_stop` (the normal order) still gets
+    /// to correct the usage before anything goes out.
+    result_seen: bool,
 }
 
 /// Defensive cap on a single JSONL line, mirroring the SSE scanners.
@@ -202,6 +214,9 @@ impl CliToAnthropic {
             buffer: Vec::new(),
             started: false,
             finished: false,
+            pending_delta: None,
+            pending_stop: None,
+            result_seen: false,
         }
     }
 
@@ -224,9 +239,21 @@ impl CliToAnthropic {
 
     /// Terminal events, for a child that ended without emitting them itself —
     /// killed, crashed, or simply not asked to stream. Idempotent.
+    ///
+    /// If `message_delta`/`message_stop` were already seen but held back
+    /// waiting for `result`'s authoritative usage (which never arrived — the
+    /// child was killed, or produced no `result` line), they are flushed now
+    /// with whatever usage they already carried rather than left unsent.
     pub fn finish(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
-        self.close(&mut out, "end_turn");
+        if self.finished {
+            return out;
+        }
+        if self.pending_delta.is_some() || self.pending_stop.is_some() {
+            self.emit_pending(&mut out);
+        } else {
+            self.close(&mut out, "end_turn");
+        }
         out
     }
 
@@ -246,7 +273,10 @@ impl CliToAnthropic {
 
         match event.get("type").and_then(|t| t.as_str()) {
             // The interesting case: the payload already *is* an Anthropic
-            // stream event, so it goes out untouched.
+            // stream event, so it goes out (almost) untouched — except
+            // `message_delta`/`message_stop`, which are held back until
+            // `result` has had a chance to correct the usage. See
+            // `pending_delta`/`pending_stop`.
             Some("stream_event") => {
                 let Some(inner) = event.get("event") else {
                     return;
@@ -255,11 +285,19 @@ impl CliToAnthropic {
                     return;
                 };
                 match name {
-                    "message_start" => self.started = true,
-                    "message_stop" => self.finished = true,
-                    _ => {}
+                    "message_start" => {
+                        self.started = true;
+                        emit(out, name, inner);
+                    }
+                    "message_delta" => {
+                        self.pending_delta = Some(inner.clone());
+                    }
+                    "message_stop" => {
+                        self.pending_stop = Some(inner.clone());
+                        self.try_flush(out);
+                    }
+                    _ => emit(out, name, inner),
                 }
-                emit(out, name, inner);
             }
             // A failed run. `result` carries the reason, and after it the CLI
             // says nothing more, so this is terminal.
@@ -271,10 +309,57 @@ impl CliToAnthropic {
                     .to_string();
                 self.error(out, &message);
             }
-            // `system`, `rate_limit_event`, `assistant`, a successful `result`:
-            // all redundant while partial messages are streaming.
+            // A successful run. The assistant event's usage seen so far (now
+            // sitting in `pending_delta`) is a mid-run snapshot — it reported
+            // `output_tokens: 1` for an answer that cost 5. `result`'s usage
+            // is the total, and it is what accounting reads downstream (it
+            // scans this converter's own SSE output), so it replaces rather
+            // than merges into the held-back `message_delta`.
+            Some("result") => {
+                if let Some(usage) = event.get("usage").filter(|u| u.is_object()) {
+                    if let Some(delta) = self.pending_delta.as_mut() {
+                        delta["usage"] = usage.clone();
+                    }
+                }
+                self.result_seen = true;
+                self.try_flush(out);
+            }
+            // `system`, `rate_limit_event`, `assistant`: redundant while
+            // partial messages are streaming.
             _ => {}
         }
+    }
+
+    /// Emit the held-back `message_delta`/`message_stop` once both are ready:
+    /// `message_stop` must have arrived (there is nothing to flush yet
+    /// otherwise) and `result` must have been seen, so a `result` a moment
+    /// behind `message_stop` — the normal order — still gets to correct the
+    /// usage before either goes out.
+    fn try_flush(&mut self, out: &mut Vec<u8>) {
+        if self.finished || self.pending_stop.is_none() || !self.result_seen {
+            return;
+        }
+        self.emit_pending(out);
+    }
+
+    /// Emit whatever of `pending_delta`/`pending_stop` is set, in order, and
+    /// mark the stream finished.
+    fn emit_pending(&mut self, out: &mut Vec<u8>) {
+        if let Some(delta) = self.pending_delta.take() {
+            emit(out, "message_delta", &delta);
+        }
+        if let Some(stop) = self.pending_stop.take() {
+            emit(out, "message_stop", &stop);
+        }
+        self.finished = true;
+    }
+
+    /// Whether the terminal events have already gone out. A caller deciding
+    /// whether to report a non-zero exit as an error should check this first:
+    /// a child that finished its turn (`message_stop` seen, `result` applied)
+    /// and then exited oddly afterwards still produced a real answer.
+    pub fn is_finished(&self) -> bool {
+        self.finished
     }
 
     /// Emit an Anthropic `error` frame and stop.
@@ -548,16 +633,98 @@ mod tests {
                 .as_bytes(),
             ),
         );
+        // `message_delta`/`message_stop` are held back until `result`
+        // arrives — the normal order, since the CLI always emits `result`
+        // last — so both are included here to see them go out.
+        out.extend(
+            converter.push(
+                stream_event(json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 1},
+                }))
+                .as_bytes(),
+            ),
+        );
         out.extend(converter.push(stream_event(json!({"type": "message_stop"})).as_bytes()));
+        out.extend(
+            converter
+                .push(b"{\"type\":\"result\",\"is_error\":false,\"stop_reason\":\"end_turn\"}\n"),
+        );
 
         assert_eq!(
             names(&out),
-            vec!["message_start", "content_block_delta", "message_stop"]
+            vec![
+                "message_start",
+                "content_block_delta",
+                "message_delta",
+                "message_stop"
+            ]
         );
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("\"text\":\"hi\""), "{text}");
         // Nothing was rebuilt, so the upstream ids survive.
         assert!(text.contains("msg_1"), "{text}");
+    }
+
+    #[test]
+    fn streaming_result_usage_replaces_the_mid_run_snapshot() {
+        // Same correction as the non-streaming path
+        // (`the_result_events_usage_wins_over_the_mid_run_snapshot`), applied
+        // to the streamed converter: the `assistant`/`message_delta` usage
+        // seen while the run is still in progress is a snapshot, and
+        // `result`'s usage is the total.
+        let mut converter = CliToAnthropic::new("sonnet".into());
+        converter.push(
+            stream_event(json!({
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 2, "output_tokens": 0}},
+            }))
+            .as_bytes(),
+        );
+        converter.push(
+            stream_event(json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 1},
+            }))
+            .as_bytes(),
+        );
+        let mut out = converter.push(stream_event(json!({"type": "message_stop"})).as_bytes());
+        // Nothing goes out yet: `message_stop` is held back for `result`.
+        assert!(out.is_empty(), "{:?}", String::from_utf8_lossy(&out));
+
+        out.extend(converter.push(
+            b"{\"type\":\"result\",\"is_error\":false,\"stop_reason\":\"end_turn\",\
+              \"usage\":{\"input_tokens\":2,\"output_tokens\":5,\"cache_read_input_tokens\":15456}}\n",
+        ));
+
+        assert_eq!(names(&out), vec!["message_delta", "message_stop"]);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"output_tokens\":5"), "{text}");
+        assert!(text.contains("15456"), "{text}");
+    }
+
+    #[test]
+    fn a_result_with_no_usage_field_still_flushes_the_pending_snapshot() {
+        let mut converter = CliToAnthropic::new("sonnet".into());
+        converter.push(
+            stream_event(json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 3},
+            }))
+            .as_bytes(),
+        );
+        let mut out = converter.push(stream_event(json!({"type": "message_stop"})).as_bytes());
+        out.extend(
+            converter
+                .push(b"{\"type\":\"result\",\"is_error\":false,\"stop_reason\":\"end_turn\"}\n"),
+        );
+
+        assert_eq!(names(&out), vec!["message_delta", "message_stop"]);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"output_tokens\":3"), "{text}");
     }
 
     #[test]
@@ -612,9 +779,17 @@ mod tests {
     }
 
     #[test]
-    fn finish_is_idempotent_and_never_follows_message_stop() {
+    fn finish_flushes_a_message_stop_still_pending_on_result_and_is_then_idempotent() {
+        // The child sent `message_stop` but was killed (or crashed) before a
+        // `result` line ever arrived — `finish` must still deliver the
+        // pending `message_stop` rather than leave the client's stream open
+        // forever, and a second call must not repeat it.
         let mut converter = CliToAnthropic::new("sonnet".into());
-        converter.push(stream_event(json!({"type": "message_stop"})).as_bytes());
+        let held = converter.push(stream_event(json!({"type": "message_stop"})).as_bytes());
+        assert!(held.is_empty(), "{:?}", String::from_utf8_lossy(&held));
+
+        let first = converter.finish();
+        assert_eq!(names(&first), vec!["message_stop"]);
         assert!(converter.finish().is_empty());
     }
 

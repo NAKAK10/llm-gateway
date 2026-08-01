@@ -357,6 +357,7 @@ pub async fn proxy(
                         out_tok: 0,
                         cache_read_tok: 0,
                         cache_write_tok: 0,
+                        usage_missing: false,
                         dur_ms,
                         status: "error".to_string(),
                         stream: streaming,
@@ -459,6 +460,11 @@ pub async fn proxy(
                 out_tok: usage.output_tokens,
                 cache_read_tok: usage.cache_read_tokens,
                 cache_write_tok: usage.cache_write_tokens,
+                // A `success` response with no usage at all means extraction
+                // failed, not that it genuinely cost zero tokens — see
+                // `tee::ObserveStream`'s warning for the same signal at the
+                // point it's first observed.
+                usage_missing: status_str == "success" && usage.is_empty(),
                 dur_ms,
                 status: status_str.to_string(),
                 stream: streaming,

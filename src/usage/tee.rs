@@ -142,6 +142,14 @@ impl Drop for ObserveStream {
     fn drop(&mut self) {
         if let Some(report) = self.report.take() {
             let usage = self.scan.take().map(Scan::finish).unwrap_or_default();
+            // A response that completed normally but yielded no usage at all
+            // is not a quiet zero — it means extraction failed somewhere (a
+            // parse error, a buffer overflow, a provider that never sent
+            // usage), and `stats` has no way to tell that apart from a
+            // genuine 0-token response unless this is logged.
+            if self.outcome == StreamOutcome::Complete && usage.is_empty() {
+                tracing::warn!("usage could not be extracted from a completed response");
+            }
             report(usage, self.outcome);
         }
     }

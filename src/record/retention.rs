@@ -93,6 +93,7 @@ fn cutoff_day(now: time::OffsetDateTime, keep_days: i64) -> String {
 }
 
 /// What happened to one usage file after considering its lines.
+#[derive(Debug, PartialEq, Eq)]
 enum UsagePruneOutcome {
     /// Every line was stale — the whole file was removed.
     Deleted(u64),
@@ -105,8 +106,34 @@ enum UsagePruneOutcome {
 /// Rewrite a usage file with lines older than `cutoff_day` removed.
 ///
 /// The file is deleted outright if nothing would be left in it.
+///
+/// `serve` serializes its own appends and prunes through one task (see
+/// `record::Recorder`), so within that process this can never race an
+/// append. It can still race a *different* process's append — `stats` runs
+/// this too, and nothing stops it running while `serve` is up — so the plan
+/// computed from the initial read is only committed if the file is still
+/// exactly as it was read; see `commit_usage_prune`.
 fn prune_usage_file(path: &Path, cutoff_day: &str) -> Result<UsagePruneOutcome> {
+    match plan_usage_prune(path, cutoff_day)? {
+        Some(plan) => commit_usage_prune(path, plan),
+        None => Ok(UsagePruneOutcome::Unchanged),
+    }
+}
+
+/// What pruning would do to one usage file, computed from a single read.
+struct UsagePrunePlan {
+    /// Byte length of the file as read, to detect a concurrent writer before
+    /// the plan below is committed.
+    read_len: u64,
+    kept: Vec<String>,
+    removed: u64,
+}
+
+/// Read `path` and decide what pruning it would do. `Ok(None)` means nothing
+/// in it is old enough to remove.
+fn plan_usage_prune(path: &Path, cutoff_day: &str) -> Result<Option<UsagePrunePlan>> {
     let text = std::fs::read_to_string(path)?;
+    let read_len = text.len() as u64;
 
     let mut kept = Vec::new();
     let mut removed = 0u64;
@@ -131,18 +158,46 @@ fn prune_usage_file(path: &Path, cutoff_day: &str) -> Result<UsagePruneOutcome> 
     }
 
     if removed == 0 {
+        return Ok(None);
+    }
+    Ok(Some(UsagePrunePlan {
+        read_len,
+        kept,
+        removed,
+    }))
+}
+
+/// Commit a prune plan computed by [`plan_usage_prune`] — unless the file has
+/// grown or shrunk since that read, in which case something else (another
+/// process's `append`) wrote to it in between, and committing a plan based on
+/// the stale read would silently discard whatever it wrote. Skipping is safe:
+/// the next prune pass picks the file up again with a fresh read.
+fn commit_usage_prune(path: &Path, plan: UsagePrunePlan) -> Result<UsagePruneOutcome> {
+    let current_len = std::fs::metadata(path)?.len();
+    if current_len != plan.read_len {
         return Ok(UsagePruneOutcome::Unchanged);
     }
 
-    if kept.is_empty() {
+    if plan.kept.is_empty() {
         std::fs::remove_file(path)?;
-        Ok(UsagePruneOutcome::Deleted(removed))
+        Ok(UsagePruneOutcome::Deleted(plan.removed))
     } else {
-        let mut contents = kept.join("\n");
+        let mut contents = plan.kept.join("\n");
         contents.push('\n');
-        std::fs::write(path, contents)?;
-        Ok(UsagePruneOutcome::Trimmed(removed))
+        write_atomically(path, &contents)?;
+        Ok(UsagePruneOutcome::Trimmed(plan.removed))
     }
+}
+
+/// Replace `path`'s contents by writing to a sibling temp file and renaming
+/// over it — a reader (or a writer reopening the path) never observes a
+/// half-written file, which a direct `fs::write` (truncate then write) does
+/// not guarantee.
+fn write_atomically(path: &Path, contents: &str) -> Result<()> {
+    let tmp = path.with_extension("jsonl.tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -239,5 +294,69 @@ mod tests {
         let summary = prune_at(dir.path(), now(), 28).unwrap();
 
         assert_eq!(summary, PruneSummary::default());
+    }
+
+    /// The race this module exists to avoid: something else (another
+    /// process's `usage_log::append`, standing in for `serve` running
+    /// alongside a `stats` invocation) writes to the file after the prune
+    /// plan was computed from an earlier read, but before that plan is
+    /// committed. Committing anyway would silently discard the concurrent
+    /// write; the size check in `commit_usage_prune` must refuse to.
+    #[test]
+    fn a_concurrent_append_between_plan_and_commit_is_never_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage-2026-08.jsonl");
+        write_lines(
+            &path,
+            &[
+                &usage_line("2026-07-01T00:00:00Z"), // stale, would be pruned
+                &usage_line("2026-08-20T00:00:00Z"),
+            ],
+        );
+
+        let cutoff_day = cutoff_day(now(), 28);
+        let plan = plan_usage_prune(&path, &cutoff_day).unwrap().unwrap();
+        assert_eq!(plan.removed, 1);
+
+        // Simulate a concurrent append landing between the read above and
+        // the commit below.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{}", usage_line("2026-08-25T00:00:00Z")).unwrap();
+        drop(file);
+        let appended_contents = std::fs::read_to_string(&path).unwrap();
+
+        let outcome = commit_usage_prune(&path, plan).unwrap();
+
+        assert_eq!(outcome, UsagePruneOutcome::Unchanged);
+        // Nothing was lost: the file is exactly what the concurrent append
+        // left it as, stale line and all — the next prune pass will pick it
+        // up with a fresh read.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), appended_contents);
+    }
+
+    #[test]
+    fn a_trimmed_file_is_replaced_atomically() {
+        // Exercises `write_atomically` through the normal (uncontended) path:
+        // the temp file it uses must not be left behind, and the final
+        // content must match what a direct write would have produced.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage-2026-08.jsonl");
+        write_lines(
+            &path,
+            &[
+                &usage_line("2026-07-01T00:00:00Z"),
+                &usage_line("2026-08-20T00:00:00Z"),
+            ],
+        );
+
+        prune_at(dir.path(), now(), 28).unwrap();
+
+        assert!(!dir.path().join("usage-2026-08.jsonl.tmp").exists());
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.lines().count(), 1);
+        assert!(contents.contains("2026-08-20"));
     }
 }

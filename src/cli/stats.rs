@@ -4,6 +4,10 @@
 //! money is not always available, because a flat-rate subscription has no
 //! per-token price. So the table always shows tokens and shows cost only when
 //! something computed one.
+//!
+//! Records are stamped in UTC (see `record::usage_log`), but day boundaries
+//! for grouping and `--since`/`--until` are shown and filtered in the local
+//! timezone — otherwise a JST evening looks like it happened "the next day".
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -11,7 +15,7 @@ use std::path::PathBuf;
 use clap::ValueEnum;
 
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::paths;
 use crate::record::retention;
 use crate::record::usage_log::UsageRecord;
@@ -54,13 +58,46 @@ pub struct Row {
     pub key: String,
     pub calls: u64,
     pub failures: u64,
+    /// `success` calls whose usage could not be extracted at all — a
+    /// missing/unparseable upstream `usage`, not a genuine 0-token response.
+    /// Counted separately so it never silently hides inside `in_tok`/`out_tok`
+    /// totals of 0. See `UsageRecord::usage_missing`.
+    pub unknown: u64,
     pub in_tok: u64,
     pub out_tok: u64,
     pub cache_read_tok: u64,
     pub cache_write_tok: u64,
 }
 
+impl Row {
+    /// Every token counted against this row, cache included. Prompt caching
+    /// clients (Claude Code, above all) put most of their real usage in
+    /// `cache_read_tok`/`cache_write_tok`, so a total that ignores them makes
+    /// heavy cache users look nearly idle.
+    pub fn total_tokens(&self) -> u64 {
+        self.in_tok + self.out_tok + self.cache_read_tok + self.cache_write_tok
+    }
+}
+
 pub fn run(options: Options) -> Result<()> {
+    // Validate before touching disk: a typo'd `--since` should be reported
+    // as exactly that, not silently exclude or include everything (a bare
+    // string comparison against `YYYY-MM-DD` day keys would do either
+    // depending on the typo, with no indication anything was wrong).
+    if let Some(since) = &options.since {
+        parse_date(since)?;
+    }
+    if let Some(until) = &options.until {
+        parse_date(until)?;
+    }
+
+    // `stats` displays and filters by calendar day in local time — records
+    // are stamped in UTC, so without this a JST evening (or any zone ahead
+    // of UTC) shows up as "yesterday". `current_local_offset` is safe to
+    // call here: `stats` is a single-threaded CLI invocation that has not
+    // spawned any threads yet.
+    let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+
     // `Config::load()` also validates, and a broken config should not stop
     // `stats` from reading logs that already exist — fall back to the
     // default logs directory rather than erroring out.
@@ -71,7 +108,8 @@ pub fn run(options: Options) -> Result<()> {
 
     // Shed anything past the retention window before reading, so `stats`
     // doubles as the everyday trigger for cleanup on machines that don't run
-    // `serve` continuously.
+    // `serve` continuously. Best-effort and non-destructive under
+    // concurrency: see `retention::prune_usage_file`.
     if let Err(err) = retention::prune(&logs_dir) {
         eprintln!("warning: failed to prune old logs: {err}");
     }
@@ -93,7 +131,17 @@ pub fn run(options: Options) -> Result<()> {
         paths.sort();
 
         for path in paths {
-            let text = std::fs::read_to_string(&path)?;
+            // One unreadable file should not abort `stats` entirely — the
+            // directory listing above already tolerates unreadable entries
+            // the same way; a file that vanishes or loses permissions
+            // between listing and reading deserves the same treatment.
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(err) => {
+                    eprintln!("warning: failed to read {}: {err}", path.display());
+                    continue;
+                }
+            };
             for line in text.lines() {
                 let line = line.trim();
                 if line.is_empty() {
@@ -119,7 +167,7 @@ pub fn run(options: Options) -> Result<()> {
     // With no explicit range and no `--all`, default to the last 7 days —
     // that's what "how much did I just use" almost always means, and
     // `--since`/`--until`/`--all` remain the escape hatch for anything else.
-    let default_since = default_since_7_days();
+    let default_since = default_since_7_days(offset);
     let since = if options.all {
         None
     } else {
@@ -138,38 +186,73 @@ pub fn run(options: Options) -> Result<()> {
             (None, Some(u)) => format!("until {u}"),
             (None, None) => unreachable!(),
         };
-        println!("showing {label} (use --all for everything retained)");
+        println!("showing {label} (use --all for everything retained), dates in local time (UTC{offset})");
+    } else {
+        println!("dates in local time (UTC{offset})");
     }
 
-    let rows = aggregate(&records, options.by, since.as_deref(), until.as_deref());
+    let rows = aggregate(
+        &records,
+        options.by,
+        since.as_deref(),
+        until.as_deref(),
+        offset,
+    );
+    print_table(&options.by.to_string(), &rows);
 
+    // Also show a per-model breakdown, since that's usually what people
+    // want to know ("how much did each model actually get used") and it's
+    // easy to miss when the main table is grouped by something else.
+    if options.by != GroupBy::Model {
+        let model_rows = aggregate(
+            &records,
+            GroupBy::Model,
+            since.as_deref(),
+            until.as_deref(),
+            offset,
+        );
+        println!();
+        print_table("model", &model_rows);
+    }
+
+    Ok(())
+}
+
+/// Render one grouped table plus its `TOTAL` row, sharing the same shape for
+/// both the primary table and the per-model breakdown.
+fn print_table(header_key: &str, rows: &[Row]) {
     let mut table = comfy_table::Table::new();
     table.set_header(vec![
-        options.by.to_string(),
+        header_key.to_string(),
         "calls".to_string(),
         "fail".to_string(),
+        "unk".to_string(),
         "in_tok".to_string(),
         "out_tok".to_string(),
         "cache_r".to_string(),
         "cache_w".to_string(),
+        "total".to_string(),
     ]);
 
     let mut total = Row {
         key: "TOTAL".to_string(),
         ..Default::default()
     };
-    for row in &rows {
+    for row in rows {
         table.add_row(vec![
             row.key.clone(),
             format_count(row.calls),
             format_count(row.failures),
+            format_count(row.unknown),
             format_count(row.in_tok),
             format_count(row.out_tok),
             format_count(row.cache_read_tok),
             format_count(row.cache_write_tok),
+            format_count(row.total_tokens()),
         ]);
         total.calls += row.calls;
         total.failures += row.failures;
+        total.unknown += row.unknown;
         total.in_tok += row.in_tok;
         total.out_tok += row.out_tok;
         total.cache_read_tok += row.cache_read_tok;
@@ -179,87 +262,46 @@ pub fn run(options: Options) -> Result<()> {
         total.key.clone(),
         format_count(total.calls),
         format_count(total.failures),
+        format_count(total.unknown),
         format_count(total.in_tok),
         format_count(total.out_tok),
         format_count(total.cache_read_tok),
         format_count(total.cache_write_tok),
+        format_count(total.total_tokens()),
     ]);
 
     println!("{table}");
+}
 
-    // Also show a per-model breakdown, since that's usually what people
-    // want to know ("how much did each model actually get used") and it's
-    // easy to miss when the main table is grouped by something else.
-    if options.by != GroupBy::Model {
-        let model_rows = aggregate(&records, GroupBy::Model, since.as_deref(), until.as_deref());
-
-        let mut model_table = comfy_table::Table::new();
-        model_table.set_header(vec![
-            "model".to_string(),
-            "calls".to_string(),
-            "fail".to_string(),
-            "in_tok".to_string(),
-            "out_tok".to_string(),
-            "cache_r".to_string(),
-            "cache_w".to_string(),
-        ]);
-
-        let mut model_total = Row {
-            key: "TOTAL".to_string(),
-            ..Default::default()
-        };
-        for row in &model_rows {
-            model_table.add_row(vec![
-                row.key.clone(),
-                format_count(row.calls),
-                format_count(row.failures),
-                format_count(row.in_tok),
-                format_count(row.out_tok),
-                format_count(row.cache_read_tok),
-                format_count(row.cache_write_tok),
-            ]);
-            model_total.calls += row.calls;
-            model_total.failures += row.failures;
-            model_total.in_tok += row.in_tok;
-            model_total.out_tok += row.out_tok;
-            model_total.cache_read_tok += row.cache_read_tok;
-            model_total.cache_write_tok += row.cache_write_tok;
-        }
-        model_table.add_row(vec![
-            model_total.key.clone(),
-            format_count(model_total.calls),
-            format_count(model_total.failures),
-            format_count(model_total.in_tok),
-            format_count(model_total.out_tok),
-            format_count(model_total.cache_read_tok),
-            format_count(model_total.cache_write_tok),
-        ]);
-
-        println!();
-        println!("{model_table}");
-    }
-
-    Ok(())
+/// Parse a `--since`/`--until` value as `YYYY-MM-DD`.
+fn parse_date(s: &str) -> Result<time::Date> {
+    let format = time::macros::format_description!("[year]-[month]-[day]");
+    time::Date::parse(s, &format)
+        .map_err(|_| Error::Other(format!("invalid date `{s}` (expected YYYY-MM-DD)")))
 }
 
 /// Aggregate already-parsed records. Pure, so it can be tested directly.
+///
+/// `offset` decides which calendar day each record's (UTC-stamped) timestamp
+/// falls on, for both grouping by day and `since`/`until` filtering.
 pub fn aggregate(
     records: &[UsageRecord],
     by: GroupBy,
     since: Option<&str>,
     until: Option<&str>,
+    offset: time::UtcOffset,
 ) -> Vec<Row> {
     let mut rows: BTreeMap<String, Row> = BTreeMap::new();
 
     for record in records {
-        let day = day_of(&record.ts);
+        let day = day_of(&record.ts, offset);
         if let Some(since) = since {
-            if day < since {
+            if day.as_str() < since {
                 continue;
             }
         }
         if let Some(until) = until {
-            if day > until {
+            if day.as_str() > until {
                 continue;
             }
         }
@@ -269,7 +311,7 @@ pub fn aggregate(
             GroupBy::Client => record.client.clone(),
             GroupBy::Provider => record.provider.clone(),
             GroupBy::Model => record.model.clone(),
-            GroupBy::Day => day.to_string(),
+            GroupBy::Day => day.clone(),
         };
 
         let row = rows.entry(key.clone()).or_insert_with(|| Row {
@@ -279,6 +321,9 @@ pub fn aggregate(
         row.calls += 1;
         if record.status != "success" {
             row.failures += 1;
+        }
+        if record.usage_missing {
+            row.unknown += 1;
         }
         row.in_tok += record.in_tok;
         row.out_tok += record.out_tok;
@@ -290,21 +335,37 @@ pub fn aggregate(
     match by {
         // Day is a timeline, so it reads best in chronological order.
         GroupBy::Day => result.sort_by(|a, b| a.key.cmp(&b.key)),
-        // Everything else reads best biggest-first.
-        _ => result.sort_by_key(|row| std::cmp::Reverse(row.in_tok + row.out_tok)),
+        // Everything else reads best biggest-first, cache tokens included —
+        // a prompt-caching-heavy client can have most of its real usage
+        // there, and `in_tok + out_tok` alone would rank it as nearly idle.
+        _ => result.sort_by_key(|row| std::cmp::Reverse(row.total_tokens())),
     }
     result
 }
 
-/// The leading `YYYY-MM-DD` of an RFC 3339 timestamp.
-fn day_of(ts: &str) -> &str {
-    ts.get(..10).unwrap_or(ts)
+/// The `YYYY-MM-DD` calendar day an RFC 3339 UTC timestamp falls on in
+/// `offset`. Falls back to the raw leading 10 characters if `ts` does not
+/// parse as RFC 3339 — a record from a future schema version should still
+/// aggregate into *some* day rather than being dropped.
+fn day_of(ts: &str, offset: time::UtcOffset) -> String {
+    match time::OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339) {
+        Ok(dt) => {
+            let local = dt.to_offset(offset).date();
+            format!(
+                "{:04}-{:02}-{:02}",
+                local.year(),
+                local.month() as u8,
+                local.day()
+            )
+        }
+        Err(_) => ts.get(..10).unwrap_or(ts).to_string(),
+    }
 }
 
-/// `YYYY-MM-DD` 7 days ago (inclusive of today), for the default `stats`
-/// window.
-fn default_since_7_days() -> Option<String> {
-    let today = time::OffsetDateTime::now_utc().date();
+/// `YYYY-MM-DD` 7 days ago in `offset` (inclusive of today), for the default
+/// `stats` window.
+fn default_since_7_days(offset: time::UtcOffset) -> Option<String> {
+    let today = time::OffsetDateTime::now_utc().to_offset(offset).date();
     let since = today - time::Duration::days(6);
     Some(format!(
         "{:04}-{:02}-{:02}",
@@ -331,6 +392,8 @@ fn format_count(n: u64) -> String {
 mod tests {
     use super::*;
 
+    const UTC: time::UtcOffset = time::UtcOffset::UTC;
+
     fn record(
         ts: &str,
         route: &str,
@@ -351,6 +414,7 @@ mod tests {
             out_tok,
             cache_read_tok: 0,
             cache_write_tok: 0,
+            usage_missing: false,
             dur_ms: 100,
             status: status.to_string(),
             stream: false,
@@ -390,7 +454,7 @@ mod tests {
             ),
         ];
 
-        let rows = aggregate(&records, GroupBy::Route, None, None);
+        let rows = aggregate(&records, GroupBy::Route, None, None, UTC);
 
         assert_eq!(rows.len(), 2);
         let claude = rows.iter().find(|r| r.key == "claude-*").unwrap();
@@ -412,6 +476,7 @@ mod tests {
             GroupBy::Day,
             Some("2026-08-01"),
             Some("2026-08-02"),
+            UTC,
         );
         let calls: u64 = rows.iter().map(|r| r.calls).sum();
         assert_eq!(calls, 2);
@@ -421,6 +486,7 @@ mod tests {
             GroupBy::Day,
             Some("2026-08-01"),
             Some("2026-08-03"),
+            UTC,
         );
         let calls: u64 = all.iter().map(|r| r.calls).sum();
         assert_eq!(calls, 3);
@@ -434,9 +500,26 @@ mod tests {
             record("2026-08-01T00:00:02Z", "r", "p", "m", "aborted", 1, 1),
         ];
 
-        let rows = aggregate(&records, GroupBy::Route, None, None);
+        let rows = aggregate(&records, GroupBy::Route, None, None, UTC);
         assert_eq!(rows[0].calls, 3);
         assert_eq!(rows[0].failures, 2);
+    }
+
+    #[test]
+    fn usage_missing_is_counted_separately_from_a_failure() {
+        let records = vec![
+            record("2026-08-01T00:00:00Z", "r", "p", "m", "success", 1, 1),
+            {
+                let mut r = record("2026-08-01T00:00:01Z", "r", "p", "m", "success", 0, 0);
+                r.usage_missing = true;
+                r
+            },
+        ];
+
+        let rows = aggregate(&records, GroupBy::Route, None, None, UTC);
+        assert_eq!(rows[0].calls, 2);
+        assert_eq!(rows[0].failures, 0);
+        assert_eq!(rows[0].unknown, 1);
     }
 
     #[test]
@@ -455,9 +538,39 @@ mod tests {
             ),
         ];
 
-        let rows = aggregate(&records, GroupBy::Route, None, None);
+        let rows = aggregate(&records, GroupBy::Route, None, None, UTC);
         let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(keys, vec!["big", "medium", "small"]);
+    }
+
+    /// A prompt-caching client can put nearly all of its real usage in cache
+    /// reads, with `in_tok`/`out_tok` almost zero — sorting on those alone
+    /// would rank it below a route that barely used cache at all.
+    #[test]
+    fn default_grouping_sort_includes_cache_tokens() {
+        let mut cache_heavy = record(
+            "2026-08-01T00:00:00Z",
+            "cache-heavy",
+            "p",
+            "m",
+            "success",
+            5,
+            5,
+        );
+        cache_heavy.cache_read_tok = 1_000_000;
+        let plain = record(
+            "2026-08-01T00:00:00Z",
+            "plain",
+            "p",
+            "m",
+            "success",
+            100,
+            100,
+        );
+
+        let rows = aggregate(&[cache_heavy, plain], GroupBy::Route, None, None, UTC);
+        let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, vec!["cache-heavy", "plain"]);
     }
 
     #[test]
@@ -468,9 +581,54 @@ mod tests {
             record("2026-08-02T00:00:00Z", "r", "p", "m", "success", 10, 10),
         ];
 
-        let rows = aggregate(&records, GroupBy::Day, None, None);
+        let rows = aggregate(&records, GroupBy::Day, None, None, UTC);
         let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
         assert_eq!(keys, vec!["2026-08-01", "2026-08-02", "2026-08-03"]);
+    }
+
+    /// A record stamped just after UTC midnight falls on the *previous*
+    /// calendar day in a timezone ahead of UTC (e.g. JST, UTC+9) — the whole
+    /// point of converting before grouping.
+    #[test]
+    fn day_grouping_uses_the_given_offset() {
+        let records = vec![record(
+            "2026-08-02T00:30:00Z",
+            "r",
+            "p",
+            "m",
+            "success",
+            1,
+            1,
+        )];
+
+        let jst = time::UtcOffset::from_hms(9, 0, 0).unwrap();
+        let rows = aggregate(&records, GroupBy::Day, None, None, jst);
+        assert_eq!(rows[0].key, "2026-08-02"); // 09:30 JST, still Aug 2nd
+
+        let rows_utc = aggregate(&records, GroupBy::Day, None, None, UTC);
+        assert_eq!(rows_utc[0].key, "2026-08-02"); // 00:30 UTC, also Aug 2nd
+
+        let records_late = vec![record(
+            "2026-08-01T20:00:00Z",
+            "r",
+            "p",
+            "m",
+            "success",
+            1,
+            1,
+        )];
+        let rows_jst_late = aggregate(&records_late, GroupBy::Day, None, None, jst);
+        // 20:00 UTC + 9h = 05:00 the next day in JST.
+        assert_eq!(rows_jst_late[0].key, "2026-08-02");
+        let rows_utc_late = aggregate(&records_late, GroupBy::Day, None, None, UTC);
+        assert_eq!(rows_utc_late[0].key, "2026-08-01");
+    }
+
+    #[test]
+    fn since_and_until_reject_malformed_dates() {
+        assert!(parse_date("2026-8-1").is_err());
+        assert!(parse_date("not-a-date").is_err());
+        assert!(parse_date("2026-08-01").is_ok());
     }
 
     #[test]
@@ -507,10 +665,11 @@ mod tests {
         b.cache_read_tok = 50;
         b.cache_write_tok = 3;
 
-        let rows = aggregate(&[a, b], GroupBy::Route, None, None);
+        let rows = aggregate(&[a, b], GroupBy::Route, None, None, UTC);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].cache_read_tok, 150);
         assert_eq!(rows[0].cache_write_tok, 10);
+        assert_eq!(rows[0].total_tokens(), 15 + 25 + 150 + 10);
     }
 
     /// A `usage-*.jsonl` line written before cache accounting existed has no
@@ -522,8 +681,9 @@ mod tests {
         let record: UsageRecord = serde_json::from_str(json).unwrap();
         assert_eq!(record.cache_read_tok, 0);
         assert_eq!(record.cache_write_tok, 0);
+        assert!(!record.usage_missing);
 
-        let rows = aggregate(&[record], GroupBy::Route, None, None);
+        let rows = aggregate(&[record], GroupBy::Route, None, None, UTC);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].in_tok, 10);
         assert_eq!(rows[0].cache_read_tok, 0);
