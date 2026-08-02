@@ -29,6 +29,10 @@ pub struct Target {
     /// Provider-level extra headers (e.g. OpenRouter attribution).
     pub headers: Vec<(String, String)>,
     pub inject_usage: bool,
+    /// How long to wait for response headers from this target. Defaults to
+    /// `crate::upstream::FIRST_BYTE_TIMEOUT` when the provider config does not
+    /// set its own `timeout_seconds`.
+    pub timeout: std::time::Duration,
 }
 
 impl std::fmt::Display for Target {
@@ -110,6 +114,10 @@ fn build_target(model_ref: ModelRef, provider: &ProviderConfig) -> Target {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         inject_usage: provider.inject_usage,
+        timeout: provider
+            .timeout_seconds
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(crate::upstream::FIRST_BYTE_TIMEOUT),
     }
 }
 
@@ -138,6 +146,7 @@ mod tests {
             inject_usage: true,
             transport: Default::default(),
             agent_args: Vec::new(),
+            timeout_seconds: None,
         }
     }
 

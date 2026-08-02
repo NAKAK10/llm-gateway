@@ -258,6 +258,11 @@ pub struct ProviderConfig {
     /// usage-only chunk, so it can be turned off for clients that choke on it.
     #[serde(default = "default_true")]
     pub inject_usage: bool,
+
+    /// How long to wait for response headers from this provider, in seconds.
+    /// Defaults to `crate::upstream::FIRST_BYTE_TIMEOUT` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
 }
 
 fn default_true() -> bool {

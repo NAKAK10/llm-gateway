@@ -224,6 +224,7 @@ fn provider(base: &str, api: ApiKind) -> ProviderConfig {
         inject_usage: true,
         transport: Default::default(),
         agent_args: Vec::new(),
+        timeout_seconds: None,
     }
 }
 
