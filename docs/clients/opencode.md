@@ -99,6 +99,17 @@ entirely by classifying every request regardless of the model id sent.
 provider pins that fall outside `overrideProviders` and warns about them
 before starting opencode — see `--help` output for what it checks.
 
+## `--isolate`
+
+`llm-gateway launch opencode --isolate` adds `--pure`, which disables
+opencode's *external plugins* only. Configuration files — `opencode.json`,
+agent frontmatter, the injected `OPENCODE_CONFIG_CONTENT` — are all still
+read normally. Unlike Claude Code's `--isolate`, this does not stop any
+config from loading.
+
+See the [README's `--isolate` by client table](../../README.md#--isolate-by-client)
+for how this compares to Claude Code and Codex.
+
 ## Verify
 
 ```sh

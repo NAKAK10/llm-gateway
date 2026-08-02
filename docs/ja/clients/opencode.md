@@ -102,6 +102,17 @@ POST するかで決まる — ゲートウェイが受けるのは `/v1/message
 プロバイダを pin しているエージェントファイル・`opencode.json` を検出して
 警告する。
 
+## `--isolate`
+
+`llm-gateway launch opencode --isolate` は `--pure` を追加します。これが
+無効化するのは opencode の*外部プラグイン*だけです。設定ファイル
+(`opencode.json`、エージェントの frontmatter、注入される
+`OPENCODE_CONFIG_CONTENT`)はすべて普段どおり読み込まれます。Claude Code の
+`--isolate` とは違い、こちらは設定の読み込みを一切止めません。
+
+Claude Code・Codex との比較は README の「コマンド」節
+([README.ja.md](../../../README.ja.md#コマンド))を参照してください。
+
 ## 動作確認
 
 ```sh

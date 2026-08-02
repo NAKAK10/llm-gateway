@@ -573,6 +573,29 @@ its own binary: that would leave a package manager believing the old version is
 still there. For a hand-placed binary it prints the release link instead.
 `--check` reports without changing anything.
 
+### `--isolate` by client
+
+`--isolate` means something different for each client — same flag name, three
+different scopes of what actually stops loading:
+
+| client | implementation | what is actually disabled |
+|---|---|---|
+| Claude Code | `--setting-sources project` | user settings are not read **at all** — permissions, hooks and model preferences are discarded along with everything else |
+| Codex | `--ignore-user-config` | only on `codex exec`; on the TUI the flag is never added, so nothing is isolated (no equivalent option upstream — there is no workaround) |
+| opencode | `--pure` | external plugins only; config files are still read |
+
+For Claude Code, `--setting-sources project` is a heavier hammer than most
+`launch` sessions need. If the only goal is avoiding a stale
+`ANTHROPIC_BASE_URL` (or similar) in `~/.claude/settings.json`'s `env` block,
+the conflict warning `launch claude` already prints on every run is usually
+enough — reach for `--isolate` when permissions/hooks/model prefs from that
+file are themselves the problem, not just its `env` block.
+
+See [`docs/clients/claude-code.md`](docs/clients/claude-code.md),
+[`docs/clients/codex.md`](docs/clients/codex.md) and
+[`docs/clients/opencode.md`](docs/clients/opencode.md) for the full detail
+behind each row.
+
 `serve` binds before doing anything else. If the port is already taken —
 almost always a previous `llm-gateway serve` still running — it identifies the
 process (via `lsof`) and asks before touching anything:
