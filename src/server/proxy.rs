@@ -2486,6 +2486,7 @@ mod tests {
             #[cfg(feature = "semantic")]
             classifier: None,
             live: None,
+            ui_token: None,
         };
         (dir, state)
     }
