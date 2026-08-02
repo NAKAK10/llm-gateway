@@ -36,8 +36,15 @@
 //!   this upstream suits generation, not an agent loop.
 //! - **Multi-turn structure.** The CLI takes one prompt, so a `messages` array
 //!   is flattened into a labelled transcript (see [`prompt`]).
-//! - **Sampling controls.** `temperature`, `top_p`, `stop_sequences` and
-//!   `max_tokens` have no CLI equivalent and are dropped.
+//! - **Sampling controls.** `temperature`, `top_p` and `stop_sequences` have
+//!   no CLI equivalent and are dropped. `max_tokens` has no equivalent
+//!   either, but is approximated by appending a brevity instruction to the
+//!   system prompt (see [`system_prompt`]) — a caller expecting a short
+//!   verdict (Claude Code's own `<transcript>`-prefixed utility calls, for
+//!   instance) otherwise gets several hundred tokens of unrequested
+//!   reasoning, which is slow enough through a freshly spawned CLI process to
+//!   blow past the caller's own timeout (issue #17). This is guidance, not
+//!   an enforced cap: the model can still ignore it.
 //!
 //! # Isolation, and why each flag is there
 //!
@@ -172,6 +179,30 @@ pub fn prompt(payload: &Value) -> String {
 pub fn system(payload: &Value) -> Option<String> {
     let text = crate::translate::request::system_text(payload.get("system")?);
     (!text.trim().is_empty()).then_some(text)
+}
+
+/// A brevity instruction derived from the request's `max_tokens`, standing in
+/// for the sampling control the CLI has no flag for. Best-effort: it curbs
+/// the multi-hundred-token rambling measured on judgment-style utility calls
+/// (issue #17), but the model can still ignore it.
+fn token_budget_hint(payload: &Value) -> Option<String> {
+    let max_tokens = payload.get("max_tokens")?.as_u64()?;
+    Some(format!(
+        "IMPORTANT: Respond in at most about {max_tokens} tokens. Be direct \
+         and concise — do not pad the answer with unrequested explanation or \
+         reasoning."
+    ))
+}
+
+/// The full `--system-prompt` value: the caller's system text, if any, with
+/// [`token_budget_hint`] appended when the request set `max_tokens`.
+pub fn system_prompt(payload: &Value) -> Option<String> {
+    match (system(payload), token_budget_hint(payload)) {
+        (Some(base), Some(hint)) => Some(format!("{base}\n\n{hint}")),
+        (Some(base), None) => Some(base),
+        (None, Some(hint)) => Some(hint),
+        (None, None) => None,
+    }
 }
 
 /// Incremental converter from the CLI's JSONL to an Anthropic SSE stream.
@@ -611,6 +642,43 @@ mod tests {
         ]});
         assert_eq!(system(&payload).as_deref(), Some("a\n\nb"));
         assert!(system(&json!({})).is_none());
+    }
+
+    #[test]
+    fn token_budget_hint_is_present_when_max_tokens_is_set() {
+        let hint = token_budget_hint(&json!({"max_tokens": 64})).unwrap();
+        assert!(hint.contains("64"), "{hint}");
+    }
+
+    #[test]
+    fn token_budget_hint_is_absent_without_max_tokens() {
+        assert!(token_budget_hint(&json!({})).is_none());
+    }
+
+    #[test]
+    fn system_prompt_appends_the_budget_hint_to_the_callers_system() {
+        let payload = json!({"system": "You are terse.", "max_tokens": 64});
+        let combined = system_prompt(&payload).unwrap();
+        assert!(combined.starts_with("You are terse."), "{combined}");
+        assert!(combined.contains("64"), "{combined}");
+    }
+
+    #[test]
+    fn system_prompt_is_just_the_hint_when_the_caller_has_no_system() {
+        let payload = json!({"max_tokens": 64});
+        let combined = system_prompt(&payload).unwrap();
+        assert!(combined.contains("64"), "{combined}");
+    }
+
+    #[test]
+    fn system_prompt_is_just_the_callers_system_without_max_tokens() {
+        let payload = json!({"system": "You are terse."});
+        assert_eq!(system_prompt(&payload).as_deref(), Some("You are terse."));
+    }
+
+    #[test]
+    fn system_prompt_is_none_when_neither_is_present() {
+        assert!(system_prompt(&json!({})).is_none());
     }
 
     #[test]
