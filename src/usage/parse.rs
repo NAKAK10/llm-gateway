@@ -36,20 +36,41 @@ fn field(value: &serde_json::Value, key: &str) -> u64 {
     value.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
 }
 
+/// Pull a `u64` out of a JSON object field, but — unlike `field` — `None`
+/// when the key is absent (or not a number) rather than defaulting to 0.
+///
+/// Only used for Anthropic's streaming events, which are genuinely partial:
+/// a `message_delta` event has no `input_tokens` key at all, and that must
+/// stay distinguishable from a `message_start` that reported `input_tokens:
+/// 0` — see [`Usage`]'s doc comment for why the difference matters to
+/// `merge`.
+fn field_opt(value: &serde_json::Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(|v| v.as_u64())
+}
+
 /// Extract usage from an `anthropic-messages` `usage` object.
 ///
 /// Used for both the non-streaming response body and the `message.usage`
-/// object nested inside a streamed `message_start` event.
+/// object nested inside a streamed `message_start` event — in both cases
+/// each field is set only when present, since a `message_delta` event's
+/// `usage` object legitimately omits `input_tokens` entirely.
 fn anthropic_usage(usage: &serde_json::Value) -> Usage {
     Usage {
-        input_tokens: field(usage, "input_tokens"),
-        output_tokens: field(usage, "output_tokens"),
-        cache_read_tokens: field(usage, "cache_read_input_tokens"),
-        cache_write_tokens: field(usage, "cache_creation_input_tokens"),
+        input_tokens: field_opt(usage, "input_tokens"),
+        output_tokens: field_opt(usage, "output_tokens"),
+        cache_read_tokens: field_opt(usage, "cache_read_input_tokens"),
+        cache_write_tokens: field_opt(usage, "cache_creation_input_tokens"),
     }
 }
 
 /// Extract usage from an `openai-chat` `usage` object.
+///
+/// Unlike Anthropic's streaming events, an `openai-chat` usage object is
+/// always a complete snapshot when it appears at all (there is exactly one
+/// per response), so every field here is `Some` — including a `cache_read`
+/// of `Some(0)` when the subtraction below lands on zero, which must
+/// overwrite a non-zero value from an earlier event rather than being
+/// mistaken for "not reported this time". See [`Usage`]'s doc comment.
 fn openai_chat_usage(usage: &serde_json::Value) -> Usage {
     let cache_read = usage
         .get("prompt_tokens_details")
@@ -57,14 +78,17 @@ fn openai_chat_usage(usage: &serde_json::Value) -> Usage {
         .unwrap_or(0);
     Usage {
         // `prompt_tokens` includes `cached_tokens`; see the module docs.
-        input_tokens: field(usage, "prompt_tokens").saturating_sub(cache_read),
-        output_tokens: field(usage, "completion_tokens"),
-        cache_read_tokens: cache_read,
-        cache_write_tokens: 0,
+        input_tokens: Some(field(usage, "prompt_tokens").saturating_sub(cache_read)),
+        output_tokens: Some(field(usage, "completion_tokens")),
+        cache_read_tokens: Some(cache_read),
+        cache_write_tokens: Some(0),
     }
 }
 
 /// Extract usage from an `openai-responses` `usage` object.
+///
+/// Same reasoning as `openai_chat_usage`: always a complete snapshot, so
+/// every field is `Some`.
 fn openai_responses_usage(usage: &serde_json::Value) -> Usage {
     let cache_read = usage
         .get("input_tokens_details")
@@ -72,10 +96,10 @@ fn openai_responses_usage(usage: &serde_json::Value) -> Usage {
         .unwrap_or(0);
     Usage {
         // `input_tokens` includes `cached_tokens`; see the module docs.
-        input_tokens: field(usage, "input_tokens").saturating_sub(cache_read),
-        output_tokens: field(usage, "output_tokens"),
-        cache_read_tokens: cache_read,
-        cache_write_tokens: 0,
+        input_tokens: Some(field(usage, "input_tokens").saturating_sub(cache_read)),
+        output_tokens: Some(field(usage, "output_tokens")),
+        cache_read_tokens: Some(cache_read),
+        cache_write_tokens: Some(0),
     }
 }
 
@@ -268,25 +292,29 @@ mod tests {
         assert_eq!(
             usage,
             Usage {
-                input_tokens: 12,
-                output_tokens: 34,
-                cache_read_tokens: 5,
-                cache_write_tokens: 7,
+                input_tokens: Some(12),
+                output_tokens: Some(34),
+                cache_read_tokens: Some(5),
+                cache_write_tokens: Some(7),
             }
         );
     }
 
     #[test]
-    fn anthropic_missing_fields_default_to_zero() {
+    fn anthropic_missing_fields_are_unobserved_not_zero() {
+        // A `message_delta` event legitimately omits `input_tokens` entirely
+        // — that must stay distinguishable from an event that reported it as
+        // 0, or `merge` cannot tell "nothing new here" from "this is now
+        // genuinely zero" (see the `Usage` doc comment and #23).
         let body = json!({ "usage": { "input_tokens": 12 } });
         let usage = from_json(ApiKind::AnthropicMessages, &body);
         assert_eq!(
             usage,
             Usage {
-                input_tokens: 12,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
+                input_tokens: Some(12),
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
             }
         );
     }
@@ -313,10 +341,10 @@ mod tests {
             Usage {
                 // `prompt_tokens` (10) already includes `cached_tokens` (3);
                 // `input_tokens` is the non-cached remainder.
-                input_tokens: 7,
-                output_tokens: 20,
-                cache_read_tokens: 3,
-                cache_write_tokens: 0,
+                input_tokens: Some(7),
+                output_tokens: Some(20),
+                cache_read_tokens: Some(3),
+                cache_write_tokens: Some(0),
             }
         );
     }
@@ -336,10 +364,10 @@ mod tests {
             Usage {
                 // Same normalization as `openai-chat`: `input_tokens` (100)
                 // includes `cached_tokens` (40).
-                input_tokens: 60,
-                output_tokens: 200,
-                cache_read_tokens: 40,
-                cache_write_tokens: 0,
+                input_tokens: Some(60),
+                output_tokens: Some(200),
+                cache_read_tokens: Some(40),
+                cache_write_tokens: Some(0),
             }
         );
     }
@@ -356,7 +384,7 @@ mod tests {
             }
         });
         let usage = from_json(ApiKind::OpenaiChat, &body);
-        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.input_tokens, Some(0));
     }
 
     fn anthropic_message_start_event(
@@ -400,10 +428,10 @@ mod tests {
         assert_eq!(
             usage,
             Usage {
-                input_tokens: 50,
-                output_tokens: 75,
-                cache_read_tokens: 8,
-                cache_write_tokens: 2,
+                input_tokens: Some(50),
+                output_tokens: Some(75),
+                cache_read_tokens: Some(8),
+                cache_write_tokens: Some(2),
             }
         );
     }
@@ -419,10 +447,10 @@ mod tests {
         assert_eq!(
             usage,
             Usage {
-                input_tokens: 50,
-                output_tokens: 75,
-                cache_read_tokens: 8,
-                cache_write_tokens: 2,
+                input_tokens: Some(50),
+                output_tokens: Some(75),
+                cache_read_tokens: Some(8),
+                cache_write_tokens: Some(2),
             }
         );
     }
@@ -447,10 +475,10 @@ mod tests {
         assert_eq!(
             usage,
             Usage {
-                input_tokens: 50,
-                output_tokens: 75,
-                cache_read_tokens: 8,
-                cache_write_tokens: 2,
+                input_tokens: Some(50),
+                output_tokens: Some(75),
+                cache_read_tokens: Some(8),
+                cache_write_tokens: Some(2),
             }
         );
     }
@@ -477,10 +505,57 @@ mod tests {
         assert_eq!(
             usage,
             Usage {
-                input_tokens: 15,
-                output_tokens: 25,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
+                input_tokens: Some(15),
+                output_tokens: Some(25),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+            }
+        );
+    }
+
+    #[test]
+    fn openai_chat_second_usage_event_that_is_a_full_cache_hit_overwrites_the_first() {
+        // Regression test for #23: some `openai-chat` upstreams emit more
+        // than one non-null `usage` chunk in a single stream. If the second
+        // one is a full cache hit (`cached_tokens == prompt_tokens`), the
+        // subtracted `input_tokens` is a genuine, observed 0 — it must
+        // overwrite the first event's `input_tokens`, not be skipped as
+        // "nothing new" the way a plain `u64` merge would skip it, which
+        // would leave `in_tok + cache_read_tok` double-counting the cached
+        // portion again.
+        let mut scanner = SseUsageScanner::new(ApiKind::OpenaiChat);
+        let first = format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 10,
+                    "prompt_tokens_details": { "cached_tokens": 20 },
+                }
+            })
+        );
+        let second = format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "prompt_tokens_details": { "cached_tokens": 100 },
+                }
+            })
+        );
+        scanner.push(first.as_bytes());
+        scanner.push(second.as_bytes());
+        let usage = scanner.finish();
+        assert_eq!(
+            usage,
+            Usage {
+                input_tokens: Some(0),
+                output_tokens: Some(20),
+                cache_read_tokens: Some(100),
+                cache_write_tokens: Some(0),
             }
         );
     }
@@ -502,10 +577,10 @@ mod tests {
         assert_eq!(
             usage,
             Usage {
-                input_tokens: 30,
-                output_tokens: 60,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
+                input_tokens: Some(30),
+                output_tokens: Some(60),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
             }
         );
     }
@@ -526,7 +601,7 @@ mod tests {
             })
         );
         scanner.push(event.as_bytes());
-        assert_eq!(scanner.finish().output_tokens, 60);
+        assert_eq!(scanner.finish().output_tokens, Some(60));
     }
 
     #[test]
@@ -542,7 +617,7 @@ mod tests {
             })
         );
         scanner.push(event.as_bytes());
-        assert_eq!(scanner.finish().output_tokens, 3);
+        assert_eq!(scanner.finish().output_tokens, Some(3));
     }
 
     #[test]
@@ -605,8 +680,8 @@ mod tests {
         );
         scanner.push(event.as_bytes());
         let usage = scanner.finish();
-        assert_eq!(usage.input_tokens, 15);
-        assert_eq!(usage.output_tokens, 25);
+        assert_eq!(usage.input_tokens, Some(15));
+        assert_eq!(usage.output_tokens, Some(25));
     }
 
     #[test]
@@ -617,8 +692,8 @@ mod tests {
         scanner.push(start.as_bytes());
         scanner.push(delta.as_bytes());
         let usage = scanner.finish();
-        assert_eq!(usage.input_tokens, 50);
-        assert_eq!(usage.output_tokens, 75);
+        assert_eq!(usage.input_tokens, Some(50));
+        assert_eq!(usage.output_tokens, Some(75));
     }
 
     #[test]
@@ -635,8 +710,8 @@ mod tests {
               data: 5, \"completion_tokens\": 25}}\r\n\r\n",
         );
         let usage = scanner.finish();
-        assert_eq!(usage.input_tokens, 15);
-        assert_eq!(usage.output_tokens, 25);
+        assert_eq!(usage.input_tokens, Some(15));
+        assert_eq!(usage.output_tokens, Some(25));
     }
 
     #[test]
@@ -656,8 +731,8 @@ mod tests {
             .as_bytes(),
         );
         let usage = scanner.finish();
-        assert_eq!(usage.input_tokens, 9);
-        assert_eq!(usage.output_tokens, 4);
+        assert_eq!(usage.input_tokens, Some(9));
+        assert_eq!(usage.output_tokens, Some(4));
     }
 
     #[test]

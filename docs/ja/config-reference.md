@@ -130,6 +130,15 @@ name はクライアントが `model` として送るものです。`:` と `/` 
 `ts, client, route, provider, model, attempt, in_tok, out_tok, cache_read_tok,
 cache_write_tok, dur_ms, status(success|aborted|error), stream, error?`
 
+`in_tok` は「非キャッシュの入力」を意味する — `cache_read_tok` は別フィールドで
+報告されるので、`in_tok + cache_read_tok` が二重計上なしの真の入力合計になる。
+この正規化(OpenAI 形式の `prompt_tokens`/`input_tokens` から `cached_tokens`
+を差し引いてから `in_tok` にする処理)は `usage::parse` のモジュールコメントに
+書かれているとおりで、この正規化が入る前に書かれたレコードの `in_tok` は
+キャッシュ分を含んだ値のままになっている。`stats` はこの 2 種類のレコードを
+区別せず同じ列に合算するため、移行をまたぐ集計はその期間にヒットしたキャッシュ
+分だけずれる — 詳細は `docs/decisions.md` を参照。
+
 `trace-*.jsonl`:
 `ts, req_id, client, endpoint, requested_model, input{messages_n,
 last_user_text?, tokens_est, tools, has_image, stream}, routing{mode,

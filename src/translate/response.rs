@@ -77,12 +77,19 @@ pub fn chat_to_anthropic(body: &Value, model: &str) -> Value {
     };
 
     let usage = body.get("usage");
-    let input_tokens = usage_field(usage, "prompt_tokens");
     let output_tokens = usage_field(usage, "completion_tokens");
     let cache_read = usage
         .and_then(|u| u.get("prompt_tokens_details"))
         .map(|d| usage_field(Some(d), "cached_tokens"))
         .unwrap_or(0);
+    // `prompt_tokens` includes `cached_tokens` (OpenAI's convention), but
+    // Anthropic's `input_tokens`/`cache_read_input_tokens` are exclusive —
+    // reporting `prompt_tokens` verbatim as `input_tokens` here would make a
+    // client that sums the two (Claude Code does, to show context usage)
+    // double-count the cached portion. Subtracting matches the same
+    // normalization `usage::parse` already applies to the gateway's own
+    // accounting (see #24); see `docs/decisions.md` for when this changed.
+    let input_tokens = usage_field(usage, "prompt_tokens").saturating_sub(cache_read);
 
     json!({
         "id": id,
@@ -677,7 +684,12 @@ mod tests {
     }
 
     #[test]
-    fn usage_is_mapped_including_cached_tokens() {
+    fn usage_is_mapped_excluding_cached_tokens_from_input_tokens() {
+        // #24: Anthropic's `input_tokens`/`cache_read_input_tokens` are
+        // exclusive, unlike OpenAI's `prompt_tokens` (which already includes
+        // `cached_tokens`) — so `prompt_tokens` (10) minus `cached_tokens`
+        // (3) is what a client that sums the two must see, or it
+        // double-counts the cached portion.
         let body = json!({
             "choices": [{
                 "index": 0,
@@ -696,7 +708,7 @@ mod tests {
         assert_eq!(
             msg["usage"],
             json!({
-                "input_tokens": 10,
+                "input_tokens": 7,
                 "output_tokens": 20,
                 "cache_read_input_tokens": 3,
                 "cache_creation_input_tokens": 0,

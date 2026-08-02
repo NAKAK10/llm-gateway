@@ -252,10 +252,10 @@ data: {"type":"message_delta","usage":{"output_tokens":20}}
         assert_eq!(
             usage,
             Usage {
-                input_tokens: 10,
-                output_tokens: 20,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
+                input_tokens: Some(10),
+                output_tokens: Some(20),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
             }
         );
     }
@@ -274,8 +274,8 @@ data: {"type":"message_delta","usage":{"output_tokens":20}}
 
         let (usage, outcome) = slot.lock().unwrap().take().expect("report was called");
         assert_eq!(outcome, StreamOutcome::Complete);
-        assert_eq!(usage.input_tokens, 5);
-        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.input_tokens, Some(5));
+        assert_eq!(usage.output_tokens, Some(7));
     }
 
     #[tokio::test]

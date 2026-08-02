@@ -120,6 +120,38 @@ fn filter_reachable_targets(resolution: &mut route::Resolution, expected_api: Ap
     before - resolution.targets.len()
 }
 
+/// Whether an attempt built for `target` can be expected to come back with a
+/// `usage` object at all, given the request as it will actually be sent.
+///
+/// `count_tokens` responses never carry `usage` — that part was already
+/// true before #22. The addition is the `openai-chat` streaming case:
+/// upstreams in that shape only report usage when
+/// `stream_options.include_usage` is on the wire, which the request only
+/// gets when `target.inject_usage` is set (see the injection just above
+/// wherever `request` was built). A provider deliberately configured with
+/// `injectUsage: false`, given a client that never asked for
+/// `stream_options` itself, is never going to see a `usage` object in its
+/// response — that is the normal, expected shape of that configuration, not
+/// a failed extraction, so `expect_usage` must say `false` for it. Both
+/// `usage::tee`'s "usage could not be extracted" warning and
+/// `UsageRecord::usage_missing` key off this same flag, so a provider set up
+/// this way stops looking like every request silently fails (#22).
+fn expect_usage_for(
+    target: &route::Target,
+    streaming: bool,
+    count_tokens: bool,
+    request: &serde_json::Value,
+) -> bool {
+    if count_tokens {
+        return false;
+    }
+    let known_to_have_no_stream_options = streaming
+        && target.api == ApiKind::OpenaiChat
+        && !target.inject_usage
+        && request.get("stream_options").is_none();
+    !known_to_have_no_stream_options
+}
+
 /// Proxy one request. `endpoint` must be one of the four POST paths.
 pub async fn proxy(
     state: AppState,
@@ -304,6 +336,16 @@ pub async fn proxy(
     let started = Instant::now();
     let mut attempts = Vec::new();
 
+    // `build` runs once per target tried, in order, so recording an
+    // `expect_usage` alongside each `Attempt` (rather than recomputing it
+    // once from `accepted` after the fact) lets whichever attempt is finally
+    // accepted be looked up by its 1-based position below — the same
+    // position `Accepted::attempt` already uses. A `Mutex` rather than a
+    // `RefCell`: `build` is held across `.await` points inside
+    // `send_with_fallback`, and this whole future must stay `Send` for axum
+    // to accept it as a handler — `&RefCell<_>` is not `Send`, `&Mutex<_>` is.
+    let expect_usage_per_attempt = std::sync::Mutex::new(Vec::new());
+
     let build = |target: &route::Target| -> crate::error::Result<Attempt> {
         // Translation is decided per target, not once for the whole
         // resolution: a route's default and its fallbacks may speak
@@ -332,6 +374,11 @@ pub async fn proxy(
         {
             request["stream_options"] = serde_json::json!({ "include_usage": true });
         }
+
+        expect_usage_per_attempt
+            .lock()
+            .unwrap()
+            .push(expect_usage_for(target, streaming, count_tokens, &request));
 
         Ok(Attempt {
             body: serde_json::to_vec(&request)?,
@@ -464,6 +511,18 @@ pub async fn proxy(
     let attempt_n = accepted.attempt;
     let ok_status = status.is_success();
     let requested = requested_model.clone();
+    // `accepted.attempt` is 1-based and `expect_usage_per_attempt` gained one
+    // entry per attempt `build` was called for, in the same order — so the
+    // accepted attempt's entry sits at `attempt - 1`. Defaults to the
+    // conservative `!count_tokens` if that invariant is ever violated, which
+    // only means a real extraction failure could log a warning it otherwise
+    // wouldn't — never the other way around.
+    let expect_usage = expect_usage_per_attempt
+        .lock()
+        .unwrap()
+        .get(accepted.attempt as usize - 1)
+        .copied()
+        .unwrap_or(!count_tokens);
 
     // Recording happens when the stream is dropped — the only moment that
     // exists for aborted requests too. See `usage::tee`.
@@ -483,15 +542,26 @@ pub async fn proxy(
                 provider: provider.clone(),
                 model: model.clone(),
                 attempt: attempt_n,
-                in_tok: usage.input_tokens,
-                out_tok: usage.output_tokens,
-                cache_read_tok: usage.cache_read_tokens,
-                cache_write_tok: usage.cache_write_tokens,
+                // The persisted record's fields stay plain `u64` — an
+                // unobserved field is recorded the same as an observed zero,
+                // which keeps `usage-*.jsonl` byte-compatible with records
+                // written before `Usage` gained `Option` fields (#23). The
+                // `usage_missing` flag below is what actually distinguishes
+                // "nothing observed" from a genuine zero-token response.
+                in_tok: usage.input_tokens.unwrap_or(0),
+                out_tok: usage.output_tokens.unwrap_or(0),
+                cache_read_tok: usage.cache_read_tokens.unwrap_or(0),
+                cache_write_tok: usage.cache_write_tokens.unwrap_or(0),
                 // A `success` response with no usage at all means extraction
                 // failed, not that it genuinely cost zero tokens — see
                 // `tee::ObserveStream`'s warning for the same signal at the
-                // point it's first observed.
-                usage_missing: status_str == "success" && usage.is_empty(),
+                // point it's first observed. Gated on `expect_usage` the same
+                // way that warning is (#22): a provider configured with
+                // `injectUsage: false` and no client-supplied
+                // `stream_options` never gets a `usage` object back, and
+                // that is the expected shape of a normal response, not a
+                // failed extraction.
+                usage_missing: status_str == "success" && expect_usage && usage.is_empty(),
                 dur_ms,
                 status: status_str.to_string(),
                 stream: streaming,
@@ -508,10 +578,10 @@ pub async fn proxy(
                 resolved,
                 attempts,
                 (!usage.is_empty()).then_some(TraceUsage {
-                    in_tok: usage.input_tokens,
-                    out_tok: usage.output_tokens,
-                    cache_read_tok: usage.cache_read_tokens,
-                    cache_write_tok: usage.cache_write_tokens,
+                    in_tok: usage.input_tokens.unwrap_or(0),
+                    out_tok: usage.output_tokens.unwrap_or(0),
+                    cache_read_tok: usage.cache_read_tokens.unwrap_or(0),
+                    cache_write_tok: usage.cache_write_tokens.unwrap_or(0),
                 }),
                 semantic_attempt,
             );
@@ -531,19 +601,18 @@ pub async fn proxy(
     // before any translation — which is what keeps token accounting correct on
     // a translated route (`usage::parse` never sees a rebuilt body).
     //
-    // `count_tokens` responses never carry a `usage` object at all, so
-    // `expect_usage` is `!count_tokens` here — same gate as `record_usage`
-    // above. Routing count_tokens through `observe` at all (rather than
-    // bypassing it) keeps this the one place that understands both the
-    // streaming and buffered body shapes, and keeps every endpoint observed
-    // on the same upstream-bytes-below-translation path.
-    let observed = tee::observe(
-        accepted.body,
-        accepted.api,
-        streaming,
-        !count_tokens,
-        report,
-    );
+    // `expect_usage` is the same flag computed above for `usage_missing`
+    // (see `expect_usage_for`): `count_tokens` responses never carry a
+    // `usage` object at all, and neither does an `openai-chat` streaming
+    // response from a provider with `injectUsage: false` when the client
+    // didn't ask for `stream_options` itself (#22) — both are expected
+    // shapes, not extraction failures, so both must suppress the same
+    // warning here that `usage_missing` suppresses in the trace/usage log.
+    // Routing count_tokens through `observe` at all (rather than bypassing
+    // it) keeps this the one place that understands both the streaming and
+    // buffered body shapes, and keeps every endpoint observed on the same
+    // upstream-bytes-below-translation path.
+    let observed = tee::observe(accepted.body, accepted.api, streaming, expect_usage, report);
 
     match translation {
         // The passthrough path: nothing at all between the upstream stream and
@@ -1582,6 +1651,68 @@ mod tests {
             headers: Vec::new(),
             inject_usage: true,
         }
+    }
+
+    /// Regression tests for #22: `expect_usage_for` is what both
+    /// `usage::tee`'s "usage could not be extracted" warning and
+    /// `UsageRecord::usage_missing` key off, so the false-positive case in
+    /// the issue (`injectUsage: false`, streaming, no client-supplied
+    /// `stream_options`) must resolve to `false`, and every other
+    /// combination must keep resolving to `true` (the old, unconditional
+    /// `!count_tokens` behavior).
+    #[test]
+    fn expect_usage_for_is_false_only_for_the_no_usage_openai_chat_streaming_case() {
+        let mut target = test_target(ApiKind::OpenaiChat);
+        target.inject_usage = false;
+        let request = json!({ "messages": [] });
+        assert!(!expect_usage_for(&target, true, false, &request));
+    }
+
+    #[test]
+    fn expect_usage_for_is_true_when_inject_usage_is_set() {
+        // `inject_usage: true` means `stream_options` gets added before the
+        // request goes out (see the injection in `proxy`'s `build`
+        // closure), so usage is expected the normal way.
+        let mut target = test_target(ApiKind::OpenaiChat);
+        target.inject_usage = true;
+        let request = json!({ "messages": [] });
+        assert!(expect_usage_for(&target, true, false, &request));
+    }
+
+    #[test]
+    fn expect_usage_for_is_true_when_the_client_already_sent_stream_options() {
+        // Even with `injectUsage: false`, a client that asked for
+        // `stream_options` itself may still get usage back — only the
+        // "neither side asked" combination is a known no-usage case.
+        let mut target = test_target(ApiKind::OpenaiChat);
+        target.inject_usage = false;
+        let request = json!({ "messages": [], "stream_options": { "include_usage": true } });
+        assert!(expect_usage_for(&target, true, false, &request));
+    }
+
+    #[test]
+    fn expect_usage_for_is_true_for_non_streaming_openai_chat() {
+        let mut target = test_target(ApiKind::OpenaiChat);
+        target.inject_usage = false;
+        let request = json!({ "messages": [] });
+        assert!(expect_usage_for(&target, false, false, &request));
+    }
+
+    #[test]
+    fn expect_usage_for_is_true_for_anthropic_regardless_of_inject_usage() {
+        // `injectUsage`/`stream_options` are an `openai-chat` streaming
+        // concept only — Anthropic reports usage unprompted.
+        let mut target = test_target(ApiKind::AnthropicMessages);
+        target.inject_usage = false;
+        let request = json!({ "messages": [] });
+        assert!(expect_usage_for(&target, true, false, &request));
+    }
+
+    #[test]
+    fn expect_usage_for_is_false_for_count_tokens_regardless_of_everything_else() {
+        let target = test_target(ApiKind::OpenaiChat);
+        let request = json!({ "messages": [] });
+        assert!(!expect_usage_for(&target, true, true, &request));
     }
 
     fn test_resolution(targets: Vec<route::Target>) -> route::Resolution {
