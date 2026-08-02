@@ -1417,6 +1417,7 @@ pub fn build_config_with_auth(
                 inject_usage: true,
                 transport: Default::default(),
                 agent_args: Vec::new(),
+                timeout_seconds: None,
             },
         );
     }
@@ -1446,6 +1447,7 @@ pub fn build_config_with_auth(
                 inject_usage: true,
                 transport: Default::default(),
                 agent_args: Vec::new(),
+                timeout_seconds: None,
             },
         );
     }
@@ -1556,6 +1558,7 @@ pub fn build_config_with_auth(
                 inject_usage: true,
                 transport,
                 agent_args: Vec::new(),
+                timeout_seconds: None,
             },
         );
     }
@@ -1795,6 +1798,7 @@ mod tests {
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect(),
                     inject_usage: provider.inject_usage,
+                    timeout: crate::upstream::FIRST_BYTE_TIMEOUT,
                 },
                 false
             ),

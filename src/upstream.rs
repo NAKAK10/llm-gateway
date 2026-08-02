@@ -115,11 +115,41 @@ pub async fn send_with_fallback(
         let attempt = build(target)?;
 
         // A local agent CLI: no credential to resolve (the child authenticates
-        // itself), no URL, and no first-byte deadline — process startup is the
-        // latency, and it is bounded by the binary existing.
+        // itself) and no URL, but it still gets `target.timeout` as a deadline
+        // — a hung child process is otherwise indistinguishable from one still
+        // working, and fallback would never trigger.
         if target.transport.is_agent_cli() {
-            match crate::agent::spawn(target, &attempt.payload, attempt.streaming).await {
+            let outcome = tokio::time::timeout(
+                target.timeout,
+                crate::agent::spawn(target, &attempt.payload, attempt.streaming),
+            )
+            .await;
+            let spawn_result = match outcome {
+                Ok(result) => result,
+                Err(_) => {
+                    attempts.push(TraceAttempt {
+                        n,
+                        target: target.to_string(),
+                        result: "timeout".to_string(),
+                        ms: started.elapsed().as_millis() as u64,
+                    });
+                    if is_last {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            match spawn_result {
                 Ok(spawned) => {
+                    if is_retryable_agent_status(spawned.status, attempt.streaming) && !is_last {
+                        attempts.push(TraceAttempt {
+                            n,
+                            target: target.to_string(),
+                            result: format!("http_{}", spawned.status.as_u16()),
+                            ms: started.elapsed().as_millis() as u64,
+                        });
+                        continue;
+                    }
                     attempts.push(TraceAttempt {
                         n,
                         target: target.to_string(),
@@ -183,7 +213,7 @@ pub async fn send_with_fallback(
 
         let request = http.post(&url).headers(headers).body(attempt.body);
 
-        let outcome = tokio::time::timeout(FIRST_BYTE_TIMEOUT, request.send()).await;
+        let outcome = tokio::time::timeout(target.timeout, request.send()).await;
         let ms = started.elapsed().as_millis() as u64;
 
         match outcome {
@@ -262,6 +292,17 @@ pub async fn send_with_fallback(
     })
 }
 
+/// Whether a completed agent-CLI attempt's status should be treated as
+/// retryable, the same way an HTTP target's status is (see the `retryable`
+/// check in [`send_with_fallback`]'s HTTP branch — same status set).
+///
+/// Only applies to a non-streaming attempt: a streaming response is already
+/// committed to the client by the time a status is known, and fallback
+/// cannot un-send bytes that already went out — see the module docs.
+fn is_retryable_agent_status(status: http::StatusCode, streaming: bool) -> bool {
+    !streaming && matches!(status.as_u16(), 408 | 429 | 500..=599)
+}
+
 /// Add the provider credential in the form its protocol expects.
 ///
 /// Anthropic authenticates with `x-api-key` and requires `anthropic-version`;
@@ -326,6 +367,7 @@ mod tests {
             api_key: None,
             headers: Vec::new(),
             inject_usage: true,
+            timeout: FIRST_BYTE_TIMEOUT,
         }
     }
 
@@ -413,5 +455,35 @@ mod tests {
         assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0].result, "key_unresolved");
         assert_eq!(attempts[1].result, "connect_error");
+    }
+
+    #[test]
+    fn streaming_agent_statuses_are_never_retryable() {
+        for status in [200, 400, 401, 403, 408, 429, 500, 502, 503] {
+            assert!(
+                !is_retryable_agent_status(http::StatusCode::from_u16(status).unwrap(), true),
+                "status {status} should not be retryable while streaming"
+            );
+        }
+    }
+
+    #[test]
+    fn non_streaming_client_and_success_statuses_are_not_retryable() {
+        for status in [200, 400, 401, 403] {
+            assert!(
+                !is_retryable_agent_status(http::StatusCode::from_u16(status).unwrap(), false),
+                "status {status} should not be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn non_streaming_transient_statuses_are_retryable() {
+        for status in [408, 429, 500, 502, 503] {
+            assert!(
+                is_retryable_agent_status(http::StatusCode::from_u16(status).unwrap(), false),
+                "status {status} should be retryable"
+            );
+        }
     }
 }

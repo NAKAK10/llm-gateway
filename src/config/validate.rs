@@ -294,6 +294,7 @@ mod tests {
             inject_usage: true,
             transport: Default::default(),
             agent_args: Vec::new(),
+            timeout_seconds: None,
         }
     }
 
@@ -504,6 +505,7 @@ mod tests {
                 inject_usage: true,
                 transport: Transport::ClaudeCli,
                 agent_args: Vec::new(),
+                timeout_seconds: None,
             },
         );
         c.routes
@@ -534,6 +536,7 @@ mod tests {
                 inject_usage: true,
                 transport: Transport::ClaudeCli,
                 agent_args: Vec::new(),
+                timeout_seconds: None,
             },
         );
         c.routes
@@ -565,6 +568,7 @@ mod tests {
                 inject_usage: true,
                 transport: Transport::ClaudeCli,
                 agent_args: Vec::new(),
+                timeout_seconds: None,
             },
         );
         c.routes.insert("role-y".into(), route("noisy/sonnet", &[]));
