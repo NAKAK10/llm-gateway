@@ -51,6 +51,17 @@ impl LiveFeed {
     pub fn subscribe(&self) -> broadcast::Receiver<LiveEvent> {
         self.tx.subscribe()
     }
+
+    /// Whether any tab is currently subscribed. `publish` is already a
+    /// no-op with zero subscribers, but a caller that has to *build* the
+    /// event first — assembling a `LiveEvent`'s `point` field, in
+    /// particular, means a second embedding and a `Basis::fit` (see
+    /// `crate::server::ui::project_point`) — needs this to skip that work
+    /// too, rather than doing it only to have `publish` throw the result
+    /// away. See #27.
+    pub fn has_subscribers(&self) -> bool {
+        self.tx.receiver_count() > 0
+    }
 }
 
 impl Default for LiveFeed {
@@ -182,6 +193,18 @@ mod tests {
 
         assert_eq!(a.try_recv().unwrap().req_id, "1");
         assert_eq!(b.try_recv().unwrap().req_id, "1");
+    }
+
+    #[test]
+    fn has_subscribers_reflects_the_live_receiver_count() {
+        let feed = LiveFeed::new();
+        assert!(!feed.has_subscribers());
+
+        let rx = feed.subscribe();
+        assert!(feed.has_subscribers());
+
+        drop(rx);
+        assert!(!feed.has_subscribers());
     }
 
     #[test]

@@ -791,17 +791,29 @@ fn live_event_from(
 
 /// Where the text that decided routing (`record.routing.decided_by_text`)
 /// lands on the same 2-D map `GET /api/routes/vectors` draws — `None` when
-/// nothing decided routing by text, or no classifier is loaded to re-embed
-/// it with.
+/// nothing decided routing by text, no classifier is loaded to re-embed it
+/// with, or nobody is subscribed to see the result.
 ///
-/// Only called when `state.live` is already known to be `Some` (see the
-/// call sites below), so this never runs the extra embed for a request
-/// nobody is watching.
+/// Only called when `state.live` is already known to be `Some` (see the call
+/// sites below) — but `Some` only means `serve --ui` is on for this run, not
+/// that any tab is actually open. `LiveFeed::publish` is already a no-op
+/// with zero subscribers, but that is too late: by then this function's
+/// work (re-embedding `text`, then fitting or reusing a `Basis`) has already
+/// run, once per request, on the tokio worker handling it (#27). Checking
+/// `has_subscribers` first, before any of that, is what actually makes an
+/// unwatched dashboard free.
 #[cfg(feature = "semantic")]
 fn live_point(state: &AppState, record: &TraceRecord) -> Option<[f32; 2]> {
+    if !state
+        .live
+        .as_ref()
+        .is_some_and(|live| live.has_subscribers())
+    {
+        return None;
+    }
     let classifier = state.classifier.as_ref()?;
     let text = record.routing.decided_by_text.as_deref()?;
-    crate::server::ui::project_point(classifier, text)
+    crate::server::ui::project_point(state, classifier, text)
 }
 
 #[cfg(not(feature = "semantic"))]
@@ -1799,6 +1811,28 @@ mod tests {
         assert!((event.candidates[0].score - 0.9).abs() < 1e-6);
     }
 
+    #[cfg(feature = "semantic")]
+    #[tokio::test]
+    async fn live_point_skips_projection_when_nobody_is_subscribed() {
+        // #27: `live_point` must bail out before it would need a classifier
+        // at all once `has_subscribers` says nobody is listening — proven
+        // here by a `state.classifier` of `None` (which `test_state` always
+        // leaves unset — see its doc comment) not causing a panic or an
+        // early `?`-return that would also pass with the gate missing: if
+        // the `has_subscribers` check were removed, this call would still
+        // return `None`, just by falling through the `classifier.as_ref()?`
+        // below instead — so the meaningful assertion is `has_subscribers`
+        // itself (see `live.rs`'s own tests for that), and this test exists
+        // to pin `live_point`'s observable contract: no subscribers, no
+        // point, regardless of why.
+        let (_dir, mut state) = test_state(crate::config::Config::default());
+        state.live = Some(std::sync::Arc::new(crate::server::live::LiveFeed::new()));
+        assert!(!state.live.as_ref().unwrap().has_subscribers());
+
+        let record = test_trace_record(None);
+        assert_eq!(live_point(&state, &record), None);
+    }
+
     #[test]
     fn live_event_from_defaults_usage_to_zero_without_a_usage_block() {
         let record = test_trace_record(None);
@@ -2616,6 +2650,8 @@ mod tests {
             inbound_key: None,
             #[cfg(feature = "semantic")]
             classifier: None,
+            #[cfg(feature = "semantic")]
+            basis_cache: std::sync::Arc::new(crate::server::ui::pca::BasisCache::new()),
             live: None,
             ui_token: None,
         };

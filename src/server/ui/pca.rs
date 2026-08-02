@@ -21,6 +21,8 @@
 /// more than a handful of iterations is usually needed.
 const POWER_ITERATIONS: usize = 64;
 
+use std::sync::{Arc, Mutex, PoisonError};
+
 /// A fitted 2-D projection: a mean to center on and two principal axes to
 /// project onto.
 pub struct Basis {
@@ -63,6 +65,71 @@ impl Basis {
             dot(&centered, &self.components[0]),
             dot(&centered, &self.components[1]),
         ]
+    }
+}
+
+/// Caches the last [`Basis`] a caller fit, keyed on `crate::config::watch::
+/// SharedConfig::generation` — fitting is deterministic on the same route
+/// vectors (see the module docs), and the route vectors only ever change on
+/// a config reload, which is exactly what bumps that counter. Keyed on
+/// generation rather than on the route-vector set itself: comparing vector
+/// sets for equality would mean cloning and diffing every route's embedding
+/// on every single request just to decide whether a refit is needed, which
+/// defeats the point of caching in the first place, while the generation
+/// counter is already sitting there as a single, already-incremented
+/// integer (see `crate::semantic::index`'s `StaleCheck`, which makes the
+/// same trade-off for the embedding index itself).
+///
+/// A coarser key than "did the route set change" — any reload bumps the
+/// generation, even one that only touched `server.port` — so an unrelated
+/// reload can trigger one avoidable refit. That is a rare, one-time cost
+/// (the next call repopulates the cache), not a per-request one, so it is
+/// not worth a finer-grained key.
+pub struct BasisCache {
+    cached: Mutex<Option<(u64, Arc<Basis>)>>,
+}
+
+impl BasisCache {
+    pub fn new() -> Self {
+        Self {
+            cached: Mutex::new(None),
+        }
+    }
+
+    /// Returns the `Basis` fit from `vectors()` at config `generation`,
+    /// reusing the last fit — without calling `vectors()` at all — when
+    /// `generation` matches what the cache already has. `vectors` is a
+    /// closure rather than a plain slice so a cache hit skips not just
+    /// `Basis::fit` but also whatever cloning the caller would otherwise do
+    /// to assemble the vector list (`Classifier::route_vectors` clones every
+    /// route's embeddings) — see #27.
+    ///
+    /// Holds its lock across `Basis::fit` on a miss, same as
+    /// `crate::semantic::index`'s `StaleCheck` does across its own rebuild:
+    /// a concurrent caller blocks briefly rather than duplicating the fit,
+    /// which only matters right after a reload and is still bounded work
+    /// (see `POWER_ITERATIONS`).
+    pub fn get_or_fit(
+        &self,
+        generation: u64,
+        vectors: impl FnOnce() -> Vec<Vec<f32>>,
+    ) -> Option<Arc<Basis>> {
+        let mut cached = self.cached.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((seen, basis)) = cached.as_ref() {
+            if *seen == generation {
+                return Some(Arc::clone(basis));
+            }
+        }
+
+        let basis = Arc::new(Basis::fit(&vectors())?);
+        *cached = Some((generation, Arc::clone(&basis)));
+        Some(basis)
+    }
+}
+
+impl Default for BasisCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -114,12 +181,29 @@ fn deflate(v: &[f32], component: &[f32]) -> Vec<f32> {
 /// matrix `C` itself, which is both unnecessary work and, at `dim = 256`,
 /// considerably more of it.
 fn power_iteration(vectors: &[Vec<f32>], dim: usize) -> Vec<f32> {
-    // A fixed, data-derived starting vector (the centroid) rather than a
-    // random one — see the module docs on why this must be deterministic.
-    // Falls back to an arbitrary fixed direction only in the degenerate case
-    // (all-zero data: one vector, or every vector identical), where no
-    // direction is more correct than any other.
-    let mut v = mean_vector(vectors, dim);
+    // A fixed, data-derived starting vector rather than a random one — see
+    // the module docs on why this must be deterministic. Deliberately *not*
+    // the centroid (`mean_vector`), despite that having been the original
+    // intent here: `power_iteration` is only ever called on already-centered
+    // (`Basis::fit`'s `centered`) or already-deflated data, so that mean is
+    // mathematically exact zero and `norm(&v) < 1e-9` never actually catches
+    // it — what normalizing it produced was pure f32 rounding noise (~1e-7),
+    // not a meaningful starting direction, and the fallback below never ran
+    // in practice (#29). The row with the largest norm is real signal
+    // instead: on typical data it is unlikely to be near-orthogonal to the
+    // dominant eigenvector, so iteration converges quickly, and picking it
+    // is deterministic (`Iterator::max_by`'s tie-break is a fixed function
+    // of `vectors`' order, which does not change between calls on the same
+    // input).
+    let mut v = vectors
+        .iter()
+        .max_by(|a, b| norm(a).total_cmp(&norm(b)))
+        .cloned()
+        .unwrap_or_default();
+    // The degenerate case this actually guards: every row (including
+    // whichever has the largest norm) is numerically zero — one vector, or
+    // every vector identical before centering/deflation. No direction is
+    // more correct than any other there, so fall back to a fixed one.
     if norm(&v) < 1e-9 {
         v = vec![1.0; dim];
     }
@@ -212,5 +296,53 @@ mod tests {
         let basis = Basis::fit(&vectors).unwrap();
         let overlap = dot(&basis.components[0], &basis.components[1]);
         assert!(overlap.abs() < 1e-4, "{overlap}");
+    }
+
+    #[test]
+    fn power_iteration_is_deterministic_across_repeated_calls() {
+        // #29: the starting vector must be a fixed function of the input,
+        // not something that drifts with f32 rounding noise.
+        let vectors = vec![
+            vec![1.0, 2.0, 3.0],
+            vec![-1.0, 0.5, 2.0],
+            vec![0.2, -3.0, 1.0],
+        ];
+        let a = power_iteration(&vectors, 3);
+        let b = power_iteration(&vectors, 3);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn get_or_fit_reuses_the_cached_basis_for_the_same_generation() {
+        let cache = BasisCache::new();
+        let calls = std::cell::Cell::new(0);
+        let vectors = || {
+            calls.set(calls.get() + 1);
+            vec![vec![1.0, 0.0], vec![-1.0, 0.0], vec![0.0, 1.0]]
+        };
+
+        let first = cache.get_or_fit(1, vectors).unwrap();
+        let second = cache.get_or_fit(1, vectors).unwrap();
+
+        // Same generation: `vectors` must only have run once, and both
+        // calls hand back the very same fit (not just an equal one).
+        assert_eq!(calls.get(), 1);
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn get_or_fit_refits_when_the_generation_changes() {
+        let cache = BasisCache::new();
+        let calls = std::cell::Cell::new(0);
+        let vectors = || {
+            calls.set(calls.get() + 1);
+            vec![vec![1.0, 0.0], vec![-1.0, 0.0], vec![0.0, 1.0]]
+        };
+
+        let first = cache.get_or_fit(1, vectors).unwrap();
+        let second = cache.get_or_fit(2, vectors).unwrap();
+
+        assert_eq!(calls.get(), 2);
+        assert!(!Arc::ptr_eq(&first, &second));
     }
 }

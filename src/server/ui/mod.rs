@@ -213,8 +213,33 @@ async fn live_stream(
                     // way to redeliver them, and no reason to close the
                     // connection over it.
                     let event = item.ok()?;
-                    let json = serde_json::to_string(&event).ok()?;
-                    Some(Ok(Event::default().data(json)))
+
+                    // `serde_json::to_string` cannot represent NaN — no
+                    // valid JSON number spells it — so a NaN `point` (a
+                    // degenerate embedding, or route vectors that collapsed
+                    // to a single point) makes serialization below fail and
+                    // this whole event get silently dropped (#30). Catch it
+                    // here instead, where it is unambiguous *why* the drop
+                    // is happening, rather than downstream where all that is
+                    // visible is "the dashboard shows nothing."
+                    if event.point.is_some_and(|p| point_has_nan(&p)) {
+                        warn_nan_once(&NAN_WARNED_LIVE, "GET /api/live");
+                        return None;
+                    }
+
+                    match serde_json::to_string(&event) {
+                        Ok(json) => Some(Ok(Event::default().data(json))),
+                        Err(err) => {
+                            // Not the NaN case (ruled out above) — an
+                            // unexpected failure, so every occurrence is
+                            // logged rather than throttled like the NaN
+                            // warning: this path is not expected to ever
+                            // run, unlike NaN, which a misbehaving embedding
+                            // model could trigger continuously.
+                            tracing::warn!("dropping one live event: failed to serialize: {err}");
+                            None
+                        }
+                    }
                 }))
             }
             // Unreachable in practice — `router()` above is only merged in
@@ -279,35 +304,69 @@ struct UsageResponse {
 /// to call before a multi-threaded runtime starts (see `cli::stats::run`),
 /// which `serve`'s request handlers are well past — the browser already
 /// knows the viewer's timezone and is the better place to re-bucket a `day`
-/// grouping if that is ever wanted.
+/// grouping if that is ever wanted. That also means this handler, unlike
+/// `cli::stats::run`, never needs to resolve a local offset at all — nothing
+/// below touches `current_local_offset`, so moving the work onto a blocking
+/// task (next paragraph) raises no version of the "must run before a
+/// multi-threaded runtime starts" concern that comment describes.
+///
+/// The read (`read_dir` + every `usage-*.jsonl` read whole) and the parse +
+/// aggregate that follows it are all synchronous, and unbounded by log size
+/// (#28) — a fine trade against `spawn_blocking`'s move-everything-in cost
+/// while logs stay small, but not something an `async fn` should ever do
+/// directly: once logs grow to tens of MB this would block the worker
+/// thread handling it for as long as the read and parse take, delaying every
+/// other request that thread would otherwise have serviced. `spawn_blocking`
+/// moves both onto the blocking pool instead, where blocking is expected.
+/// The result-size cap this still needs is left for a follow-up (see the
+/// issue) — this change is scoped to getting the blocking work off the
+/// async worker, not to changing what gets returned.
 async fn usage(State(state): State<AppState>, Query(query): Query<UsageQuery>) -> Response {
     let config = state.config.get();
     let logs_dir = crate::paths::logs_dir(&config.logging.dir);
-    let (records, _skipped) = stats::read_usage_records(&logs_dir);
-
     let by = query.group_by();
-    let since = if query.all {
-        None
-    } else {
-        query.since.as_deref()
-    };
-    let until = if query.all {
-        None
-    } else {
-        query.until.as_deref()
-    };
+    let since = if query.all { None } else { query.since };
+    let until = if query.all { None } else { query.until };
 
-    let rows = stats::aggregate(&records, by, since, until, time::UtcOffset::UTC);
-    let total = rows.iter().fold(Row::default(), |mut acc, row| {
-        acc.calls += row.calls;
-        acc.failures += row.failures;
-        acc.unknown += row.unknown;
-        acc.in_tok += row.in_tok;
-        acc.out_tok += row.out_tok;
-        acc.cache_read_tok += row.cache_read_tok;
-        acc.cache_write_tok += row.cache_write_tok;
-        acc
-    });
+    let aggregated = tokio::task::spawn_blocking(move || {
+        let (records, _skipped) = stats::read_usage_records(&logs_dir);
+        let rows = stats::aggregate(
+            &records,
+            by,
+            since.as_deref(),
+            until.as_deref(),
+            time::UtcOffset::UTC,
+        );
+        let total = rows.iter().fold(Row::default(), |mut acc, row| {
+            acc.calls += row.calls;
+            acc.failures += row.failures;
+            acc.unknown += row.unknown;
+            acc.in_tok += row.in_tok;
+            acc.out_tok += row.out_tok;
+            acc.cache_read_tok += row.cache_read_tok;
+            acc.cache_write_tok += row.cache_write_tok;
+            acc
+        });
+        (rows, total)
+    })
+    .await;
+
+    // Only panics inside the blocking closure land here (a bug, not a
+    // runtime condition a caller can act on) — `stats::read_usage_records`
+    // and `stats::aggregate` do not themselves return `Result`. `?` upstream
+    // in `usage`'s callers is not an option here (this is the top-level
+    // handler), so a 500 is the honest answer: it is the same shape a panic
+    // in a directly-`await`ed async handler would produce.
+    let (rows, total) = match aggregated {
+        Ok(pair) => pair,
+        Err(err) => {
+            tracing::error!("usage aggregation task panicked: {err}");
+            return crate::server::error_response(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to aggregate usage logs",
+            );
+        }
+    };
 
     json_response(&UsageResponse {
         by: group_by_label(by),
@@ -347,19 +406,31 @@ async fn routes_vectors(State(state): State<AppState>) -> Response {
     };
 
     let named = classifier.route_vectors();
-    let all_vectors: Vec<Vec<f32>> = named.iter().flat_map(|(_, vs)| vs.clone()).collect();
+    let generation = state.config.generation();
+    // Only clones every route's vectors a second time (for the fit itself)
+    // on a cache miss — see `pca::BasisCache`. `named` is needed regardless,
+    // to build the per-route points below.
+    let basis = state.basis_cache.get_or_fit(generation, || {
+        named.iter().flat_map(|(_, vs)| vs.clone()).collect()
+    });
 
-    let Some(basis) = pca::Basis::fit(&all_vectors) else {
+    let Some(basis) = basis else {
         return json_response(&VectorMapResponse { routes: Vec::new() });
     };
 
+    let mut any_nan = false;
     let routes = named
         .into_iter()
-        .map(|(name, vectors)| RoutePoints {
-            name,
-            points: vectors.iter().map(|v| basis.project(v)).collect(),
+        .map(|(name, vectors)| {
+            let points: Vec<[f32; 2]> = vectors.iter().map(|v| basis.project(v)).collect();
+            any_nan |= points.iter().any(point_has_nan);
+            RoutePoints { name, points }
         })
         .collect();
+
+    if any_nan {
+        warn_nan_once(&NAN_WARNED_VECTORS, "GET /api/routes/vectors");
+    }
 
     json_response(&VectorMapResponse { routes })
 }
@@ -378,23 +449,70 @@ async fn routes_vectors(State(_state): State<AppState>) -> Response {
 /// `point` field (see `crate::server::live::LiveEvent`).
 ///
 /// Recomputes its own basis rather than sharing one cached from
-/// `routes_vectors`: fitting is cheap (see `pca`'s module docs) and
-/// deterministic on the same data, so a fresh fit here lands on the same
-/// axes as the map view's, without either endpoint needing to hold state for
-/// the other.
+/// `routes_vectors`: shares `state.basis_cache` with it rather than always
+/// fitting its own — both land on the same axes either way (fitting is
+/// deterministic on the same data, see `pca`'s module docs), so reusing
+/// whichever fit is already current for `state.config`'s generation costs
+/// nothing in correctness and, on every call after the first per generation,
+/// skips a second embedding-vector clone and `Basis::fit` entirely (#27).
+///
+/// Only called (see `crate::server::proxy::live_point`) once the caller has
+/// already checked `state.live`'s `LiveFeed::has_subscribers` — with no tab
+/// open there is nobody to show the point to, so the embed-and-project work
+/// this does is skipped upstream of here rather than wasted on it.
 #[cfg(feature = "semantic")]
 pub fn project_point(
+    state: &AppState,
     classifier: &crate::semantic::index::Classifier,
     text: &str,
 ) -> Option<[f32; 2]> {
     let vector = classifier.embed(text)?;
-    let all_vectors: Vec<Vec<f32>> = classifier
-        .route_vectors()
-        .into_iter()
-        .flat_map(|(_, vs)| vs)
-        .collect();
-    let basis = pca::Basis::fit(&all_vectors)?;
+    let generation = state.config.generation();
+    let basis = state.basis_cache.get_or_fit(generation, || {
+        classifier
+            .route_vectors()
+            .into_iter()
+            .flat_map(|(_, vs)| vs)
+            .collect()
+    })?;
     Some(basis.project(&vector))
+}
+
+/// True when either coordinate is NaN — the one shape a projected point can
+/// take that `serde_json` cannot serialize, since JSON has no spelling for
+/// it. A pure, standalone function so #30's detection logic is unit-testable
+/// without going through an HTTP handler or the SSE stream.
+fn point_has_nan(point: &[f32; 2]) -> bool {
+    point.iter().any(|c| c.is_nan())
+}
+
+/// Guards the `tracing::warn!` calls below so a run of NaN-producing
+/// projections (a degenerate embedding model, or route vectors that
+/// happened to collapse to a single point) logs once per endpoint instead of
+/// once per SSE event or per dashboard poll — the fact worth knowing is
+/// "this is happening at all," and either endpoint could otherwise flood the
+/// log for as long as the condition persists.
+static NAN_WARNED_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// Only `routes_vectors` (`#[cfg(feature = "semantic")]`) uses this one — the
+// build without `semantic` has no embeddings, so nothing there can ever
+// produce a NaN point to warn about.
+#[cfg(feature = "semantic")]
+static NAN_WARNED_VECTORS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Returns whether this call actually logged (the first call on a fresh
+/// `warned`) — a plain `bool` so the once-per-endpoint throttling is
+/// assertable in a test without capturing `tracing` output.
+fn warn_nan_once(warned: &std::sync::atomic::AtomicBool, endpoint: &str) -> bool {
+    let already_warned = warned.swap(true, std::sync::atomic::Ordering::Relaxed);
+    if !already_warned {
+        tracing::warn!(
+            "{endpoint}: a projected point contains NaN — the embedding model or the \
+             current route vectors may have degenerated; affected point(s) are dropped \
+             rather than sent (further occurrences on this endpoint are not logged)"
+        );
+    }
+    !already_warned
 }
 
 fn json_response<T: serde::Serialize>(body: &T) -> Response {
@@ -405,4 +523,43 @@ fn json_response<T: serde::Serialize>(body: &T) -> Response {
         http::HeaderValue::from_static("application/json"),
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn point_has_nan_detects_either_coordinate() {
+        assert!(!point_has_nan(&[0.0, 0.0]));
+        assert!(!point_has_nan(&[1.5, -2.5]));
+        assert!(point_has_nan(&[f32::NAN, 0.0]));
+        assert!(point_has_nan(&[0.0, f32::NAN]));
+        assert!(point_has_nan(&[f32::NAN, f32::NAN]));
+    }
+
+    #[test]
+    fn warn_nan_once_only_warns_the_first_time() {
+        let warned = AtomicBool::new(false);
+        assert!(warn_nan_once(&warned, "test"), "first call should warn");
+        assert!(
+            !warn_nan_once(&warned, "test"),
+            "second call on the same flag should stay quiet"
+        );
+        assert!(
+            !warn_nan_once(&warned, "test"),
+            "third call on the same flag should stay quiet too"
+        );
+    }
+
+    #[test]
+    fn warn_nan_once_is_independent_per_flag() {
+        // NAN_WARNED_LIVE and NAN_WARNED_VECTORS must not share state — a
+        // NaN on one endpoint should not silence the warning on the other.
+        let live = AtomicBool::new(false);
+        let vectors = AtomicBool::new(false);
+        assert!(warn_nan_once(&live, "live"));
+        assert!(warn_nan_once(&vectors, "vectors"));
+    }
 }
