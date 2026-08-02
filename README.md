@@ -584,9 +584,14 @@ attached) answers as if you said `No` rather than guessing.
 ## Dashboard (`serve --ui`)
 
 `llm-gateway serve --ui` (or `ui.enabled: true` in `config.json`) exposes a
-local dashboard at `GET /ui` — same listener, same `server.apiKey` as the
-proxy itself, so nothing new is opened to the network beyond what `serve`
-already binds. Three views:
+local dashboard at `GET /ui` — same listener as the proxy itself, so nothing
+new is opened to the network beyond what `serve` already binds. On startup it
+prints the URL to open, with a one-time token: `http://127.0.0.1:PORT/ui?token=…`.
+Open that URL once and the browser gets a session cookie good for the rest of
+the run; a configured `server.apiKey` also works via `Authorization`/
+`x-api-key`, for scripted access. See [Security notes](#security-notes) for
+why the dashboard needs its own token rather than just reusing `server.apiKey`.
+Three views:
 
 - **Live** — a real-time feed (Server-Sent Events, `GET /api/live`) of every
   completed request: the prompt that came in, which route classification
@@ -630,9 +635,24 @@ gateway never edits those files either way.
   `config check`, masked by `config show`, and covered by `config gitignore`.
 - Binding to anything but loopback without `server.apiKey` is refused at startup.
 - `--debug` writes prompt text to `logs/`. Treat that directory accordingly.
-- `--ui` does not write anything to disk on its own; it shares whatever auth
-  `server.apiKey` already provides, so it is reachable by exactly whoever the
-  proxy already is.
+- `--ui` does not write anything to disk on its own, but it does need its own
+  auth story: a browser cannot attach `Authorization`/`x-api-key` to a page
+  load or an `EventSource`, so the dashboard can't just reuse `server.apiKey`
+  the way the proxy routes do. Instead `serve --ui` prints a one-time token
+  at startup as part of the dashboard URL (`/ui?token=…`); opening that URL
+  trades the token for an `HttpOnly`/`SameSite=Strict` session cookie, which
+  is what actually gates `/ui` and every `/api/*` route afterwards. A
+  configured `server.apiKey` still works too, via the same headers as the
+  proxy. Every dashboard route also refuses any `Host` other than
+  `127.0.0.1`/`localhost`/`[::1]`, closing the DNS-rebinding hole a
+  cookie-only scheme would otherwise leave open for any web page you visit
+  while the dashboard is running.
+- `--ui` combined with `--debug-full` sends **untruncated** prompt text over
+  the live feed (`GET /api/live`), not just the 200-character preview `--ui`
+  alone shows — `--debug-full` disables truncation everywhere it applies,
+  including there. Anyone who can reach the dashboard while both are on sees
+  full prompt text in real time, on top of what `--debug-full` already writes
+  to `logs/trace-*.jsonl`.
 
 ## License
 

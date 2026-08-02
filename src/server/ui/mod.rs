@@ -10,10 +10,29 @@
 //! | `GET /api/usage` | the same aggregation `llm-gateway stats` prints, as JSON |
 //!
 //! Mounted only when `serve --ui` (or `config.ui.enabled`) is on — see
-//! [`crate::server::router`] — and, like every other endpoint, behind
-//! `server.apiKey` when one is configured. There is no separate auth story
-//! for the dashboard: it sees the same prompt text and routing decisions the
-//! proxy itself handles, so it gets the same lock on the door.
+//! [`crate::server::router`].
+//!
+//! ## Auth
+//!
+//! The dashboard shows the same prompt text and routing decisions the proxy
+//! itself handles, so it needs a lock on the door — but it cannot always use
+//! the proxy's own lock. `server.apiKey` gates the proxy routes via an
+//! `Authorization`/`x-api-key` header, and a browser has no way to attach
+//! either of those to a plain page navigation (`GET /ui`) or an
+//! `EventSource` (`GET /api/live`); a config with `server.apiKey` set would
+//! otherwise make the dashboard unusable, and a config without one would
+//! leave every route wide open (see [`ui_guard`]'s doc comment for the fix).
+//!
+//! So every route here answers to [`ui_guard`] instead of the proxy's
+//! `auth_middleware` (see how [`crate::server::router`] layers the two
+//! separately): a per-run token, generated in `serve` and printed once at
+//! startup, trades for an `HttpOnly`/`SameSite=Strict` session cookie at
+//! `GET /ui?token=…`, and either that cookie *or* the proxy's own header
+//! credential (when `server.apiKey` is configured) gets a request through.
+//! `ui_guard` also refuses any `Host` other than a loopback name, which is
+//! what actually stops a third-party page from reaching these routes via DNS
+//! rebinding — a cookie alone does not, since rebinding makes the browser
+//! treat the attacker's origin as this one.
 
 pub mod pca;
 
@@ -43,6 +62,130 @@ pub fn router() -> Router<AppState> {
         .route("/api/live", get(live_stream))
         .route("/api/usage", get(usage))
         .route("/api/routes/vectors", get(routes_vectors))
+}
+
+/// Name of the cookie [`ui_guard`] hands out once a caller proves it holds
+/// the dashboard token, and checks on every request after that.
+const SESSION_COOKIE: &str = "gw_ui_token";
+
+/// Guards every route in [`router`] — layered on in place of the proxy's own
+/// `auth_middleware` (see `crate::server::router` and this module's docs on
+/// why one shared layer cannot serve both).
+///
+/// Order of checks: `Host` first, unconditionally — a request whose `Host`
+/// is not a loopback name is refused before anything else, which is the
+/// actual defense against DNS rebinding (a rebound page still sends its
+/// *original* hostname in `Host`, even once the browser resolves it to
+/// 127.0.0.1). Then either credential gets the request through: the same
+/// header `server.apiKey` accepts on the proxy routes
+/// (`crate::server::header_key_ok`), or the session cookie. Lacking both,
+/// `GET /ui` gets one more chance — `?token=…` — since that is the only way
+/// a session cookie can ever come to exist; a valid token mints the cookie
+/// on the way out.
+pub async fn ui_guard(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !host_is_loopback(request.headers()) {
+        return crate::server::error_response(
+            http::StatusCode::FORBIDDEN,
+            "the dashboard only answers to Host: 127.0.0.1, localhost, or [::1]",
+        );
+    }
+
+    if let Some(expected) = state.inbound_key.as_deref() {
+        if crate::server::header_key_ok(request.headers(), expected) {
+            return next.run(request).await;
+        }
+    }
+
+    let Some(expected_token) = state.ui_token.as_deref() else {
+        // Unreachable in practice: `router()` above is only layered with
+        // this guard when `state.live` is `Some`, which `serve` always sets
+        // together with `ui_token` — but an honest 401 beats a panic if that
+        // invariant is ever broken.
+        return crate::server::error_response(
+            http::StatusCode::UNAUTHORIZED,
+            "dashboard token not configured",
+        );
+    };
+
+    if session_cookie_matches(request.headers(), expected_token) {
+        return next.run(request).await;
+    }
+
+    if request.uri().path() == "/ui" {
+        if let Some(token) = token_query_param(request.uri()) {
+            if token == expected_token {
+                let mut response = next.run(request).await;
+                response
+                    .headers_mut()
+                    .insert(http::header::SET_COOKIE, session_cookie(expected_token));
+                return response;
+            }
+        }
+    }
+
+    crate::server::error_response(
+        http::StatusCode::UNAUTHORIZED,
+        "missing or invalid dashboard token — open the URL `serve --ui` printed at startup",
+    )
+}
+
+/// True when the `Host` header names this loopback listener — with or
+/// without a port, and in either IPv4 or IPv6 form. Anything else (an
+/// attacker-controlled domain name that DNS rebinding pointed at 127.0.0.1,
+/// for instance) is refused: see [`ui_guard`]'s doc comment.
+fn host_is_loopback(headers: &http::HeaderMap) -> bool {
+    let Some(host) = headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let host_only = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host.split(':').next().unwrap_or("")
+    };
+    host_only.eq_ignore_ascii_case("127.0.0.1")
+        || host_only.eq_ignore_ascii_case("localhost")
+        || host_only.eq_ignore_ascii_case("::1")
+}
+
+/// True when some `Cookie` header carries `SESSION_COOKIE=expected`.
+fn session_cookie_matches(headers: &http::HeaderMap, expected: &str) -> bool {
+    headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .any(|(name, value)| name == SESSION_COOKIE && value == expected)
+}
+
+/// The bare `?token=…` query parameter, unescaped. Good enough here because
+/// the only value that ever needs to compare equal is the token itself — a
+/// UUID, which has nothing a browser would percent-encode.
+fn token_query_param(uri: &http::Uri) -> Option<&str> {
+    uri.query()?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "token").then_some(value)
+    })
+}
+
+/// Build the `Set-Cookie` value [`ui_guard`] hands back once a token checks
+/// out. `HttpOnly` keeps it out of reach of any script running on the page
+/// (including the dashboard's own, and anything DNS rebinding lets a
+/// third-party page run against this origin); `SameSite=Strict` keeps it
+/// from ever being attached to a request that did not originate from a page
+/// already on this origin. No `Secure`: the dashboard is loopback-only plain
+/// HTTP by design (see `crate::server::bind_or_offer_to_free_port`), and
+/// `Secure` would just make the cookie unusable there.
+fn session_cookie(token: &str) -> http::HeaderValue {
+    let value = format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/");
+    http::HeaderValue::from_str(&value).expect("cookie name and a UUID token are both plain ASCII")
 }
 
 /// The dashboard page itself: one file, styles and script inline. See the
@@ -89,8 +232,23 @@ struct UsageQuery {
     by: Option<String>,
     since: Option<String>,
     until: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_truthy")]
     all: bool,
+}
+
+/// `axum::extract::Query` deserializes via `serde_urlencoded`, which forwards
+/// a plain `bool` field straight to `str::parse::<bool>()` — accepting only
+/// the literal strings `"true"`/`"false"`. The dashboard's own "all"
+/// checkbox (`assets/index.html`) sends `all=1`, which made every checked
+/// request a guaranteed 400. Accept the usual truthy spellings a query
+/// string shows up with instead; anything else (including the field being
+/// absent, handled by `#[serde(default)]` before this ever runs) is `false`.
+fn deserialize_truthy<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(matches!(raw.as_str(), "1" | "true" | "on" | "yes"))
 }
 
 impl UsageQuery {

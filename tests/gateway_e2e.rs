@@ -234,6 +234,7 @@ async fn spawn_gateway(config: Config, inbound_key: Option<&str>) -> SocketAddr 
         #[cfg(feature = "semantic")]
         classifier: None,
         live: None,
+        ui_token: None,
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -247,8 +248,13 @@ async fn spawn_gateway(config: Config, inbound_key: Option<&str>) -> SocketAddr 
 /// Same as [`spawn_gateway`], but with `serve --ui`'s dashboard on — for
 /// exercising `/ui`/`/api/*` and the live feed. Returns the [`LiveFeed`]
 /// directly (not just the address) so a test can subscribe to it without a
-/// real SSE client.
-async fn spawn_gateway_with_live(config: Config) -> (SocketAddr, Arc<LiveFeed>) {
+/// real SSE client, plus the dashboard token `serve --ui` would have printed
+/// at startup — a test that wants past `ui_guard` needs it to bootstrap a
+/// session cookie via `/ui?token=…`, the same way a browser does.
+async fn spawn_gateway_with_live(
+    config: Config,
+    inbound_key: Option<&str>,
+) -> (SocketAddr, Arc<LiveFeed>, String) {
     let dir = tempfile::tempdir().unwrap();
     let recorder = Recorder::start(
         dir.path().to_path_buf(),
@@ -260,21 +266,23 @@ async fn spawn_gateway_with_live(config: Config) -> (SocketAddr, Arc<LiveFeed>) 
     )
     .unwrap();
     let live = Arc::new(LiveFeed::new());
+    let ui_token = uuid::Uuid::now_v7().to_string();
     let state = AppState {
         config: SharedConfig::from_config(config, dir.path().join("config.json")),
         http: reqwest::Client::new(),
         recorder,
-        inbound_key: None,
+        inbound_key: inbound_key.map(String::from),
         #[cfg(feature = "semantic")]
         classifier: None,
         live: Some(live.clone()),
+        ui_token: Some(ui_token.clone()),
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     std::mem::forget(dir);
-    (addr, live)
+    (addr, live, ui_token)
 }
 
 #[tokio::test]
@@ -893,27 +901,68 @@ async fn ui_routes_are_absent_when_the_dashboard_is_off() {
     }
 }
 
-/// The inverse: every dashboard route answers once `serve --ui` is on, and
-/// stays behind the same auth as the proxy routes.
-#[tokio::test]
-async fn ui_routes_answer_when_the_dashboard_is_on() {
-    let (upstream, _mock) = spawn_mock().await;
-    let (addr, _live) = spawn_gateway_with_live(translated_config(upstream)).await;
-    let client = reqwest::Client::new();
-
+/// Trades a dashboard token for its session cookie, exactly the way a
+/// browser opening the URL `serve --ui` prints at startup would — used by
+/// every test below that only cares about what happens *after* the
+/// dashboard is authenticated. Asserts the bootstrap itself succeeded, so a
+/// regression there fails loudly at the first caller rather than as a
+/// confusing downstream 401.
+async fn bootstrap_ui_cookie(client: &reqwest::Client, addr: SocketAddr, token: &str) -> String {
     let page = client
-        .get(format!("http://{addr}/ui"))
+        .get(format!("http://{addr}/ui?token={token}"))
         .send()
         .await
         .unwrap();
     assert_eq!(page.status(), 200);
-    assert_eq!(
-        page.headers().get(http::header::CONTENT_TYPE).unwrap(),
-        "text/html; charset=utf-8"
-    );
+    let cookie = page
+        .headers()
+        .get(http::header::SET_COOKIE)
+        .expect("a valid token should mint a session cookie")
+        .to_str()
+        .unwrap();
+    cookie.split(';').next().unwrap().to_string()
+}
+
+/// H1/H2: without the dashboard token — no header, no cookie, nothing a
+/// browser could not already do on its own — every dashboard route refuses
+/// the request. Before the fix these were reachable with zero auth whenever
+/// `server.apiKey` was unset, and unreachable from a browser whenever it was
+/// set; this is the "closed by default" half of the fix.
+#[tokio::test]
+async fn ui_routes_refuse_requests_without_the_dashboard_token() {
+    let (upstream, _mock) = spawn_mock().await;
+    let (addr, _live, _token) = spawn_gateway_with_live(translated_config(upstream), None).await;
+    let client = reqwest::Client::new();
+
+    for path in ["/ui", "/api/usage", "/api/live"] {
+        let response = client
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            401,
+            "{path} should require the dashboard token"
+        );
+    }
+}
+
+/// The bootstrap flow itself: `GET /ui?token=<token>` hands back a
+/// `Set-Cookie`, and that cookie — no header at all — is then enough to
+/// reach `/api/usage`. This is the exact path a browser takes, since it
+/// cannot attach `Authorization`/`x-api-key` to a page navigation.
+#[tokio::test]
+async fn the_dashboard_token_trades_for_a_cookie_that_then_authenticates() {
+    let (upstream, _mock) = spawn_mock().await;
+    let (addr, _live, token) = spawn_gateway_with_live(translated_config(upstream), None).await;
+    let client = reqwest::Client::new();
+
+    let cookie = bootstrap_ui_cookie(&client, addr, &token).await;
 
     let usage = client
         .get(format!("http://{addr}/api/usage"))
+        .header(http::header::COOKIE, &cookie)
         .send()
         .await
         .unwrap();
@@ -927,6 +976,7 @@ async fn ui_routes_answer_when_the_dashboard_is_on() {
     // with the right shape.
     let vectors = client
         .get(format!("http://{addr}/api/routes/vectors"))
+        .header(http::header::COOKIE, &cookie)
         .send()
         .await
         .unwrap();
@@ -935,13 +985,71 @@ async fn ui_routes_answer_when_the_dashboard_is_on() {
     assert!(vectors_body["routes"].is_array());
 }
 
+/// The other half of "existing header auth keeps working": a `curl` script
+/// carrying the configured `server.apiKey` reaches `/api/usage` without ever
+/// touching the token/cookie dance — the proxy path's own credential is
+/// still honored on the dashboard routes (see `ui::ui_guard`).
+#[tokio::test]
+async fn a_configured_api_key_authenticates_the_dashboard_too() {
+    let (upstream, _mock) = spawn_mock().await;
+    let (addr, _live, _token) =
+        spawn_gateway_with_live(translated_config(upstream), Some("gw-secret")).await;
+
+    let usage = reqwest::Client::new()
+        .get(format!("http://{addr}/api/usage"))
+        .bearer_auth("gw-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(usage.status(), 200);
+}
+
+/// H2: a `Host` header naming anything other than this loopback listener is
+/// refused outright — the actual defense against DNS rebinding, since a
+/// rebound page still sends its *original* hostname in `Host` even once the
+/// browser has resolved it to 127.0.0.1. A valid token is not enough to get
+/// past this check.
+#[tokio::test]
+async fn a_non_loopback_host_header_is_refused_even_with_a_valid_token() {
+    let (upstream, _mock) = spawn_mock().await;
+    let (addr, _live, token) = spawn_gateway_with_live(translated_config(upstream), None).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/ui?token={token}"))
+        .header(http::header::HOST, "evil.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+}
+
+/// H3 regression: the dashboard's own "all" checkbox
+/// (`assets/index.html`) sends `all=1`, which `str::parse::<bool>()` (what
+/// `serde_urlencoded` used for a plain `bool` field) rejects outright — every
+/// checked request was a guaranteed 400. See `ui::deserialize_truthy`.
+#[tokio::test]
+async fn usage_query_accepts_all_1_as_a_truthy_value() {
+    let (upstream, _mock) = spawn_mock().await;
+    let (addr, _live, token) = spawn_gateway_with_live(translated_config(upstream), None).await;
+    let client = reqwest::Client::new();
+    let cookie = bootstrap_ui_cookie(&client, addr, &token).await;
+
+    let response = client
+        .get(format!("http://{addr}/api/usage?all=1"))
+        .header(http::header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+}
+
 /// A request through the ordinary proxy path publishes a
 /// [`llm_gateway::server::live::LiveEvent`] carrying the prompt preview and
 /// the route/model it triggered — the core "what just got routed" feature.
 #[tokio::test]
 async fn a_completed_request_publishes_a_live_event() {
     let (upstream, _mock) = spawn_mock().await;
-    let (addr, live) = spawn_gateway_with_live(translated_config(upstream)).await;
+    let (addr, live, _token) = spawn_gateway_with_live(translated_config(upstream), None).await;
     let mut rx = live.subscribe();
 
     reqwest::Client::new()
