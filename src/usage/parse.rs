@@ -147,7 +147,7 @@ impl SseUsageScanner {
         // here is single-line JSON, so plain concatenation is fine.
         let mut data = String::new();
         for line in text.split('\n') {
-            let line = line.strip_prefix("\r").unwrap_or(line);
+            let line = line.strip_suffix('\r').unwrap_or(line);
             if let Some(rest) = line.strip_prefix("data: ") {
                 data.push_str(rest);
             } else if let Some(rest) = line.strip_prefix("data:") {
@@ -575,6 +575,24 @@ mod tests {
         let usage = scanner.finish();
         assert_eq!(usage.input_tokens, 50);
         assert_eq!(usage.output_tokens, 75);
+    }
+
+    #[test]
+    fn crlf_framed_event_with_multiple_data_lines_joins_cleanly() {
+        // Per the SSE spec, multiple `data:` lines within one event are
+        // joined with `\n`. Under CRLF framing that means each line (as
+        // produced by splitting the event on `\n`) carries a trailing `\r`,
+        // not a leading one — stripping the wrong end leaves the `\r` stuck
+        // between the two lines' payloads instead of removed, which splits a
+        // token (here, the digits of `15`) and breaks JSON parsing.
+        let mut scanner = SseUsageScanner::new(ApiKind::OpenaiChat);
+        scanner.push(
+            b"data: {\"choices\": [], \"usage\": {\"prompt_tokens\": 1\r\n\
+              data: 5, \"completion_tokens\": 25}}\r\n\r\n",
+        );
+        let usage = scanner.finish();
+        assert_eq!(usage.input_tokens, 15);
+        assert_eq!(usage.output_tokens, 25);
     }
 
     #[test]

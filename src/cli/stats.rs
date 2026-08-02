@@ -84,12 +84,7 @@ pub fn run(options: Options) -> Result<()> {
     // as exactly that, not silently exclude or include everything (a bare
     // string comparison against `YYYY-MM-DD` day keys would do either
     // depending on the typo, with no indication anything was wrong).
-    if let Some(since) = &options.since {
-        parse_date(since)?;
-    }
-    if let Some(until) = &options.until {
-        parse_date(until)?;
-    }
+    validate_date_range(options.since.as_deref(), options.until.as_deref())?;
 
     // `stats` displays and filters by calendar day in local time — records
     // are stamped in UTC, so without this a JST evening (or any zone ahead
@@ -147,9 +142,12 @@ pub fn run(options: Options) -> Result<()> {
             (None, Some(u)) => format!("until {u}"),
             (None, None) => unreachable!(),
         };
-        println!("showing {label} (use --all for everything retained), dates in local time (UTC{offset})");
+        println!(
+            "showing {label} (use --all for everything retained), dates in local time ({})",
+            format_offset(offset)
+        );
     } else {
-        println!("dates in local time (UTC{offset})");
+        println!("dates in local time ({})", format_offset(offset));
     }
 
     let rows = aggregate(
@@ -284,11 +282,60 @@ fn print_table(header_key: &str, rows: &[Row]) {
     println!("{table}");
 }
 
+/// Render a UTC offset as `UTC+09:00`, the conventional hours:minutes form.
+///
+/// `time::UtcOffset`'s own `Display` always prints seconds too (`+09:00:00`),
+/// because the type can represent second-precision offsets — a handful of
+/// zones really did use one before international standardization (e.g. the
+/// Netherlands used UTC+00:19:32 until 1937). No offset in modern use has a
+/// non-zero seconds component, so the common case is trimmed to `HH:MM` for
+/// readability; on the rare chance one shows up (a historical `TZ` set on
+/// purpose, say), the seconds are kept rather than silently rounded away.
+fn format_offset(offset: time::UtcOffset) -> String {
+    let (hours, minutes, seconds) = offset.as_hms();
+    let sign = if hours < 0 || minutes < 0 || seconds < 0 {
+        '-'
+    } else {
+        '+'
+    };
+    if seconds == 0 {
+        format!("UTC{sign}{:02}:{:02}", hours.abs(), minutes.abs())
+    } else {
+        format!(
+            "UTC{sign}{:02}:{:02}:{:02}",
+            hours.abs(),
+            minutes.abs(),
+            seconds.abs()
+        )
+    }
+}
+
 /// Parse a `--since`/`--until` value as `YYYY-MM-DD`.
 fn parse_date(s: &str) -> Result<time::Date> {
     let format = time::macros::format_description!("[year]-[month]-[day]");
     time::Date::parse(s, &format)
         .map_err(|_| Error::Other(format!("invalid date `{s}` (expected YYYY-MM-DD)")))
+}
+
+/// Validate `--since`/`--until` are each well-formed `YYYY-MM-DD`, and — if
+/// both are given — that `since` does not come after `until`. A reversed
+/// range is almost certainly a typo, not an intentionally empty one; left
+/// unchecked it silently produces a table with zero rows and no indication
+/// anything was wrong (the day-key comparison in `aggregate` is a plain
+/// string compare, which would just never match anything).
+fn validate_date_range(since: Option<&str>, until: Option<&str>) -> Result<()> {
+    let since_date = since.map(parse_date).transpose()?;
+    let until_date = until.map(parse_date).transpose()?;
+    if let (Some(s), Some(u)) = (since_date, until_date) {
+        if s > u {
+            return Err(Error::Other(format!(
+                "--since `{}` is after --until `{}` (expected --since <= --until)",
+                since.unwrap_or_default(),
+                until.unwrap_or_default(),
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Aggregate already-parsed records. Pure, so it can be tested directly.
@@ -640,6 +687,42 @@ mod tests {
         assert!(parse_date("2026-8-1").is_err());
         assert!(parse_date("not-a-date").is_err());
         assert!(parse_date("2026-08-01").is_ok());
+    }
+
+    #[test]
+    fn offset_formats_as_hours_and_minutes() {
+        let jst = time::UtcOffset::from_hms(9, 0, 0).unwrap();
+        assert_eq!(format_offset(jst), "UTC+09:00");
+        assert_eq!(format_offset(UTC), "UTC+00:00");
+
+        let west = time::UtcOffset::from_hms(-5, -30, 0).unwrap();
+        assert_eq!(format_offset(west), "UTC-05:30");
+    }
+
+    /// A handful of historical zones had a non-zero seconds component (e.g.
+    /// the Netherlands' UTC+00:19:32 before 1937). Nothing in modern use has
+    /// one, but if it ever shows up the seconds must still appear rather
+    /// than being silently rounded away.
+    #[test]
+    fn offset_formats_with_seconds_when_present() {
+        let historical = time::UtcOffset::from_hms(0, 19, 32).unwrap();
+        assert_eq!(format_offset(historical), "UTC+00:19:32");
+    }
+
+    #[test]
+    fn validate_date_range_rejects_since_after_until() {
+        let err = validate_date_range(Some("2026-08-10"), Some("2026-08-01")).unwrap_err();
+        assert!(err.to_string().contains("--since `2026-08-10`"));
+        assert!(err.to_string().contains("--until `2026-08-01`"));
+    }
+
+    #[test]
+    fn validate_date_range_accepts_equal_or_ordered_bounds() {
+        assert!(validate_date_range(Some("2026-08-01"), Some("2026-08-01")).is_ok());
+        assert!(validate_date_range(Some("2026-08-01"), Some("2026-08-10")).is_ok());
+        assert!(validate_date_range(Some("2026-08-01"), None).is_ok());
+        assert!(validate_date_range(None, Some("2026-08-01")).is_ok());
+        assert!(validate_date_range(None, None).is_ok());
     }
 
     #[test]
