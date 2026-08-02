@@ -67,6 +67,12 @@ pub struct Config {
 
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    /// The optional local dashboard `serve --ui` exposes. Off unless either
+    /// this or `--ui` is set — a dashboard nobody asked for is one more
+    /// thing to explain if it's ever found running.
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -476,7 +482,9 @@ pub struct LaunchOpencode {
     /// otherwise talk to OpenAI directly and silently bypass the gateway.
     /// Redirecting the built-in providers keeps per-agent model choices
     /// intact while routing every request through the gateway. Set to `[]`
-    /// to disable.
+    /// to disable. See [`default_opencode_overrides`] for which built-ins are
+    /// safe to redirect and why `google`, `github-copilot` and `ollama` are
+    /// deliberately absent from the default.
     #[serde(default = "default_opencode_overrides")]
     pub override_providers: Vec<String>,
 
@@ -484,8 +492,56 @@ pub struct LaunchOpencode {
     pub extra_args: Vec<String>,
 }
 
-fn default_opencode_overrides() -> Vec<String> {
-    vec!["openai".to_string(), "anthropic".to_string()]
+/// Built-in opencode providers whose `baseURL` redirect actually lands the
+/// request on one of the gateway's three endpoints (`/v1/messages`,
+/// `/v1/chat/completions`, `/v1/responses` — see `src/server/mod.rs`'s
+/// router) speaking the wire protocol that provider's npm package sends.
+/// `overrideProviders` only swaps `options.baseURL`; the npm package (and
+/// therefore the wire protocol) is untouched, so a provider is safe to
+/// redirect exactly when its native package already targets one of those
+/// three shapes:
+///
+/// - `openai` (`@ai-sdk/openai`) → `/v1/responses`
+/// - `anthropic` (`@ai-sdk/anthropic`) → `/v1/messages`
+/// - `openrouter` (`@openrouter/ai-sdk-provider`), `groq` (`@ai-sdk/groq`),
+///   `mistral` (`@ai-sdk/mistral`) → `/v1/chat/completions`, but each speaks
+///   its own dialect on top of it and may send fields the gateway's upstream
+///   rejects with a 400. That is still preferable to the silent bypass this
+///   list exists to close — an explicit 400 is a message, a bypass is not —
+///   so they stay in.
+/// - `deepseek` (`@ai-sdk/openai-compatible`), `togetherai`
+///   (`@ai-sdk/togetherai`) → `/v1/chat/completions`, both already
+///   plain-OpenAI-shaped.
+/// - `xai` (`@ai-sdk/xai`) → `/v1/responses` or `/v1/chat/completions`
+///   depending on the model, either of which matches.
+///
+/// Three opencode built-ins are deliberately **not** in this list:
+///
+/// - `google` (`@ai-sdk/google`) posts to
+///   `/v1/models/{id}:generateContent` — no route this gateway serves
+///   matches that path, so redirecting it would turn a working request into
+///   a 404 rather than fixing a bypass.
+/// - `github-copilot` uses opencode's own SDK plus an auth plugin, not one
+///   of the three shapes above; where it posts is not fixed enough to
+///   redirect safely.
+/// - `ollama` has no id in models.dev at all, so there is nothing here to
+///   pin against.
+///
+/// See `docs/clients/opencode.md` for the same table with more detail.
+pub(crate) fn default_opencode_overrides() -> Vec<String> {
+    [
+        "openai",
+        "anthropic",
+        "openrouter",
+        "groq",
+        "mistral",
+        "deepseek",
+        "xai",
+        "togetherai",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -534,6 +590,20 @@ impl Default for LoggingConfig {
 
 fn default_log_dir() -> String {
     "./logs".to_string()
+}
+
+/// `serve --ui`'s local dashboard: a live feed of routing decisions, a map of
+/// where each route sits in embedding space, and a usage view — all served
+/// from the same listener as the proxy, behind the same `server.apiKey` (see
+/// `crate::server::router`). Reachable only from wherever `server.host`
+/// already reaches, nothing new to expose.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UiConfig {
+    /// `--ui` on the command line ORs with this — either turns the dashboard
+    /// on for that run.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// A parsed `"<provider>/<model>"` reference.
@@ -612,6 +682,45 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `google`, `github-copilot` and `ollama` must never sneak into the
+    /// default `overrideProviders` list — redirecting `google` turns a
+    /// working request into a 404 (its wire path is
+    /// `/v1/models/{id}:generateContent`, not one this gateway routes),
+    /// `github-copilot`'s request path is not fixed enough to redirect
+    /// safely, and `ollama` has no models.dev id to pin against in the
+    /// first place. See `default_opencode_overrides`'s doc comment for the
+    /// full per-provider reasoning.
+    #[test]
+    fn default_opencode_overrides_excludes_unsafe_providers() {
+        let defaults = default_opencode_overrides();
+        for unsafe_provider in ["google", "github-copilot", "ollama"] {
+            assert!(
+                !defaults.contains(&unsafe_provider.to_string()),
+                "{unsafe_provider} must not be in the default overrideProviders list"
+            );
+        }
+    }
+
+    #[test]
+    fn default_opencode_overrides_includes_the_endpoint_matching_providers() {
+        let defaults = default_opencode_overrides();
+        for expected in [
+            "openai",
+            "anthropic",
+            "openrouter",
+            "groq",
+            "mistral",
+            "deepseek",
+            "xai",
+            "togetherai",
+        ] {
+            assert!(
+                defaults.contains(&expected.to_string()),
+                "{expected} should be in the default overrideProviders list"
+            );
+        }
+    }
 
     /// `logging.logging` defaults to `false` — a plain gateway process stays
     /// quiet unless the user opts into the console diagnostics.

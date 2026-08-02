@@ -528,9 +528,15 @@ never need it, but you can hand-edit it for per-client launcher tweaks:
 launch: {
   claude:   { extraArgs: [] },
   codex:    { wireApi: "responses", extraArgs: [] },
-  opencode: { models: [], overrideProviders: ["openai", "anthropic"], extraArgs: [] },
+  opencode: { models: [], overrideProviders: ["openai", "anthropic", "openrouter", "groq", "mistral", "deepseek", "xai", "togetherai"], extraArgs: [] },
 }
 ```
+
+That is the default `overrideProviders` list, shown explicitly. `google`,
+`github-copilot` and `ollama` are opencode built-ins too, but adding them
+here would not help — see [opencode manual setup](docs/clients/opencode.md)
+for why each is excluded, and which providers can send fields the upstream
+may reject with a 400 even once redirected.
 
 | field | notes |
 |---|---|
@@ -545,11 +551,12 @@ launch: {
 | `launch` | optional advanced escape hatch only: Claude/Codex/opencode extra args, Codex `wireApi`, opencode `models`/`overrideProviders`. |
 | `logging.debug` | `--debug` truncates user text to 200 chars; `--debug-full` keeps everything. Plain-text prompts on disk — enable deliberately. |
 | `logging.logging` | off by default; set `true` to print `serve`'s console diagnostics (which route/provider was picked, embedding-model prep, per-attempt fallback outcomes) to stderr. An explicit `RUST_LOG` still wins. |
+| `ui.enabled` | off by default; `--ui` ORs with it. Turns on the local dashboard at `GET /ui` — see [Dashboard](#dashboard-serve---ui). |
 
 ## Commands
 
 ```
-llm-gateway serve [--debug] [--debug-full] [--port N]
+llm-gateway serve [--debug] [--debug-full] [--port N] [--ui]
 llm-gateway init
 llm-gateway launch <claude|codex|opencode> [--isolate] [--auto|--no-auto] [--print] [-- ARGS]
 llm-gateway config check|show|gitignore
@@ -566,6 +573,29 @@ its own binary: that would leave a package manager believing the old version is
 still there. For a hand-placed binary it prints the release link instead.
 `--check` reports without changing anything.
 
+### `--isolate` by client
+
+`--isolate` means something different for each client — same flag name, three
+different scopes of what actually stops loading:
+
+| client | implementation | what is actually disabled |
+|---|---|---|
+| Claude Code | `--setting-sources project` | user settings are not read **at all** — permissions, hooks and model preferences are discarded along with everything else |
+| Codex | `--ignore-user-config` | only on `codex exec`; on the TUI the flag is never added, so nothing is isolated (no equivalent option upstream — there is no workaround) |
+| opencode | `--pure` | external plugins only; config files are still read |
+
+For Claude Code, `--setting-sources project` is a heavier hammer than most
+`launch` sessions need. If the only goal is avoiding a stale
+`ANTHROPIC_BASE_URL` (or similar) in `~/.claude/settings.json`'s `env` block,
+the conflict warning `launch claude` already prints on every run is usually
+enough — reach for `--isolate` when permissions/hooks/model prefs from that
+file are themselves the problem, not just its `env` block.
+
+See [`docs/clients/claude-code.md`](docs/clients/claude-code.md),
+[`docs/clients/codex.md`](docs/clients/codex.md) and
+[`docs/clients/opencode.md`](docs/clients/opencode.md) for the full detail
+behind each row.
+
 `serve` binds before doing anything else. If the port is already taken —
 almost always a previous `llm-gateway serve` still running — it identifies the
 process (via `lsof`) and asks before touching anything:
@@ -579,6 +609,37 @@ process (via `lsof`) and asks before touching anything:
 Answering `No` leaves the other process alone and exits without starting;
 answering `Yes` terminates it and binds. A non-interactive run (no terminal
 attached) answers as if you said `No` rather than guessing.
+
+## Dashboard (`serve --ui`)
+
+`llm-gateway serve --ui` (or `ui.enabled: true` in `config.json`) exposes a
+local dashboard at `GET /ui` — same listener as the proxy itself, so nothing
+new is opened to the network beyond what `serve` already binds. On startup it
+prints the URL to open, with a one-time token: `http://127.0.0.1:PORT/ui?token=…`.
+Open that URL once and the browser gets a session cookie good for the rest of
+the run; a configured `server.apiKey` also works via `Authorization`/
+`x-api-key`, for scripted access. See [Security notes](#security-notes) for
+why the dashboard needs its own token rather than just reusing `server.apiKey`.
+Three views:
+
+- **Live** — a real-time feed (Server-Sent Events, `GET /api/live`) of every
+  completed request: the prompt that came in, which route classification
+  picked, which provider/model actually answered, and how it turned out.
+  Independent of `--debug`: it never touches disk, and disappears the moment
+  nothing is subscribed — see the difference below.
+- **Vector Map** — every route's classification embedding, projected to 2-D
+  (`GET /api/routes/vectors`), with incoming requests plotted live on the
+  same map as they're classified. Needs the `semantic` feature and a loaded
+  classifier; without one the view says so rather than 404ing.
+- **Usage** — the same aggregation `llm-gateway stats` prints, as a live table
+  (`GET /api/usage?by=route|client|provider|model|day&since=...&until=...`).
+
+The live feed is a different, lower-stakes decision than `--debug`: `--debug`
+writes prompt text to `logs/trace-*.jsonl` on disk, permanently, until
+retention prunes it — a decision worth making deliberately (see
+[Security notes](#security-notes)). The dashboard's live feed is in-memory
+only, per-tab, and gone the moment the tab closes or nothing is subscribed;
+turning it on with `--ui` does not turn `--debug` on, and vice versa.
 
 ## What fallback does (and does not) do
 
@@ -603,6 +664,24 @@ gateway never edits those files either way.
   `config check`, masked by `config show`, and covered by `config gitignore`.
 - Binding to anything but loopback without `server.apiKey` is refused at startup.
 - `--debug` writes prompt text to `logs/`. Treat that directory accordingly.
+- `--ui` does not write anything to disk on its own, but it does need its own
+  auth story: a browser cannot attach `Authorization`/`x-api-key` to a page
+  load or an `EventSource`, so the dashboard can't just reuse `server.apiKey`
+  the way the proxy routes do. Instead `serve --ui` prints a one-time token
+  at startup as part of the dashboard URL (`/ui?token=…`); opening that URL
+  trades the token for an `HttpOnly`/`SameSite=Strict` session cookie, which
+  is what actually gates `/ui` and every `/api/*` route afterwards. A
+  configured `server.apiKey` still works too, via the same headers as the
+  proxy. Every dashboard route also refuses any `Host` other than
+  `127.0.0.1`/`localhost`/`[::1]`, closing the DNS-rebinding hole a
+  cookie-only scheme would otherwise leave open for any web page you visit
+  while the dashboard is running.
+- `--ui` combined with `--debug-full` sends **untruncated** prompt text over
+  the live feed (`GET /api/live`), not just the 200-character preview `--ui`
+  alone shows — `--debug-full` disables truncation everywhere it applies,
+  including there. Anyone who can reach the dashboard while both are on sees
+  full prompt text in real time, on top of what `--debug-full` already writes
+  to `logs/trace-*.jsonl`.
 
 ## License
 

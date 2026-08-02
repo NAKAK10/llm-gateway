@@ -51,13 +51,20 @@ pub struct Recorder {
     pub(crate) tx: tokio::sync::mpsc::UnboundedSender<Entry>,
 }
 
-/// One queued write.
+/// One queued write, or a request to prune.
 ///
 /// Both records are boxed so neither variant forces every queued entry to pay
 /// for the larger one.
 pub enum Entry {
     Usage(Box<usage_log::UsageRecord>),
     Trace(Box<trace_log::TraceRecord>),
+    /// Routed through the same channel as the writes rather than run from an
+    /// independent task: pruning rewrites `usage-*.jsonl` in place, and doing
+    /// that concurrently with this task's own `usage_log::append` (an
+    /// unsynchronized `O_APPEND` write to the same file) can silently drop
+    /// whatever line was appended mid-prune. One task processing everything
+    /// in order makes that race structurally impossible within this process.
+    Prune,
 }
 
 impl Recorder {
@@ -69,33 +76,44 @@ impl Recorder {
         let writer_dir = dir.clone();
         tokio::spawn(async move {
             while let Some(entry) = rx.recv().await {
-                let result = match entry {
-                    Entry::Usage(record) => usage_log::append(&writer_dir, &record),
-                    Entry::Trace(record) => trace_log::append(&writer_dir, &record),
-                };
-                if let Err(err) = result {
-                    tracing::warn!(error = %err, "failed to write log record");
+                match entry {
+                    Entry::Usage(record) => {
+                        if let Err(err) = usage_log::append(&writer_dir, &record) {
+                            tracing::warn!(error = %err, "failed to write log record");
+                        }
+                    }
+                    Entry::Trace(record) => {
+                        if let Err(err) = trace_log::append(&writer_dir, &record) {
+                            tracing::warn!(error = %err, "failed to write log record");
+                        }
+                    }
+                    // Same task as the appends above, deliberately — see
+                    // `Entry::Prune`.
+                    Entry::Prune => match retention::prune(&writer_dir) {
+                        Ok(summary) if summary.files_deleted > 0 || summary.files_trimmed > 0 => {
+                            tracing::info!(
+                                files_deleted = summary.files_deleted,
+                                files_trimmed = summary.files_trimmed,
+                                lines_removed = summary.lines_removed,
+                                "pruned old logs"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(err) => tracing::warn!(error = %err, "failed to prune old logs"),
+                    },
                 }
             }
         });
 
         // Prune on startup, then once a day for as long as the server runs —
         // otherwise a long-lived `serve` would only ever shed old data on the
-        // next restart.
-        let prune_dir = dir.clone();
+        // next restart. Requested through `tx` rather than run directly so it
+        // always lands on the writer task, never concurrently with it.
+        let prune_tx = tx.clone();
         tokio::spawn(async move {
             loop {
-                match retention::prune(&prune_dir) {
-                    Ok(summary) if summary.files_deleted > 0 || summary.files_trimmed > 0 => {
-                        tracing::info!(
-                            files_deleted = summary.files_deleted,
-                            files_trimmed = summary.files_trimmed,
-                            lines_removed = summary.lines_removed,
-                            "pruned old logs"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(err) => tracing::warn!(error = %err, "failed to prune old logs"),
+                if prune_tx.send(Entry::Prune).is_err() {
+                    return; // writer task is gone; nothing left to prune for.
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
             }
@@ -178,6 +196,7 @@ mod tests {
             out_tok: 2,
             cache_read_tok: 0,
             cache_write_tok: 0,
+            usage_missing: false,
             dur_ms: 10,
             status: "success".to_string(),
             stream: false,
@@ -264,5 +283,93 @@ mod tests {
             now.day(),
         ));
         assert!(!path.exists());
+    }
+
+    fn usage_record(ts: String, in_tok: u64) -> usage_log::UsageRecord {
+        usage_log::UsageRecord {
+            ts,
+            client: "claude-code".to_string(),
+            route: "claude-*".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            attempt: 1,
+            in_tok,
+            out_tok: 1,
+            cache_read_tok: 0,
+            cache_write_tok: 0,
+            usage_missing: false,
+            dur_ms: 1,
+            status: "success".to_string(),
+            stream: false,
+            error: None,
+        }
+    }
+
+    /// #20: `stats` used to run its own `retention::prune`, a second writer
+    /// racing `serve`'s appends across process boundaries. The fix routes
+    /// `serve`'s startup prune through the very same channel/task as every
+    /// `usage()` append (see the comment on `Entry::Prune` above) — this
+    /// proves that wiring actually holds, by queuing appends immediately
+    /// after `Recorder::start` (before the startup `Entry::Prune`, sent by a
+    /// separate task, is guaranteed to have reached the writer) and checking
+    /// none of them are lost to it. If the startup prune instead ran
+    /// independently — a plain `tokio::spawn(retention::prune(...))`, say —
+    /// its read-modify-write could race one of these appends and silently
+    /// drop it, exactly the bug #20 describes.
+    #[tokio::test]
+    async fn startup_prune_is_serialized_with_appends_through_the_same_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let mode = RecordMode {
+            usage: true,
+            debug: false,
+            debug_full: false,
+        };
+
+        let now = time::OffsetDateTime::now_utc();
+        let path = dir
+            .path()
+            .join(usage_log::file_name(now.year(), now.month() as u8));
+
+        // A stale line for the startup prune to actually have work to do —
+        // otherwise a no-op prune would pass this test for the wrong reason.
+        let stale = usage_record("2000-01-01T00:00:00Z".to_string(), 999);
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&stale).unwrap()),
+        )
+        .unwrap();
+
+        let recorder = Recorder::start(dir.path().to_path_buf(), mode).unwrap();
+
+        const APPENDS: usize = 20;
+        let ts = now
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        for i in 0..APPENDS {
+            recorder.usage(usage_record(ts.clone(), i as u64));
+        }
+
+        // Poll until the writer task has drained the startup prune and every
+        // append queued above.
+        let mut contents = String::new();
+        for _ in 0..200 {
+            if let Ok(c) = std::fs::read_to_string(&path) {
+                if c.lines().count() >= APPENDS {
+                    contents = c;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            contents.lines().count(),
+            APPENDS,
+            "an append was lost to the startup prune instead of being serialized after it"
+        );
+        assert!(
+            !contents.contains("2000-01-01"),
+            "the startup prune did not remove the stale line"
+        );
     }
 }

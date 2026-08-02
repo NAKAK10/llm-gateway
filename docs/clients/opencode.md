@@ -48,6 +48,68 @@ Notes:
 - `@ai-sdk/openai-compatible` speaks `/v1/chat/completions`. If you want the
   Responses API instead, use `@ai-sdk/openai` — the gateway serves both.
 
+## `overrideProviders`: redirecting opencode's built-in providers
+
+`llm-gateway launch opencode` (and `launch.opencode.overrideProviders` in
+`config.json`) can also redirect opencode's *built-in* provider ids, so an
+agent file or `opencode.json` that pins `model: openai/gpt-…` — instead of
+`model: gateway/…` — still goes through the gateway. Redirecting only swaps
+that provider's `options.baseURL`; its npm package, and therefore its native
+wire protocol, is untouched. Whether that is safe depends on where the
+package actually posts, since the gateway only serves three paths:
+`/v1/messages`, `/v1/chat/completions` and `/v1/responses`.
+
+| provider id | npm package | final path | redirect-safe? |
+|---|---|---|---|
+| `openai` | `@ai-sdk/openai` | `/v1/responses` | yes |
+| `anthropic` | `@ai-sdk/anthropic` | `/v1/messages` | yes |
+| `openrouter` | `@openrouter/ai-sdk-provider` | `/v1/chat/completions` | yes, but see dialect note below |
+| `groq` | `@ai-sdk/groq` | `/v1/chat/completions` | yes, but see dialect note below |
+| `mistral` | `@ai-sdk/mistral` | `/v1/chat/completions` | yes, but see dialect note below |
+| `deepseek` | `@ai-sdk/openai-compatible` | `/v1/chat/completions` | yes (plain OpenAI shape) |
+| `togetherai` | `@ai-sdk/togetherai` | `/v1/chat/completions` | yes (plain OpenAI shape) |
+| `xai` | `@ai-sdk/xai` | `/v1/responses` or `/v1/chat/completions` | yes, either way |
+| `google` | `@ai-sdk/google` | `/v1/models/{id}:generateContent` | **no** — no route matches this path; redirecting turns a working request into a 404 |
+| `github-copilot` | opencode's own SDK + an auth plugin | not fixed | **no** — where it posts isn't stable enough to redirect |
+| `ollama` | — | — | **not applicable** — has no id in models.dev to pin against |
+
+The default `overrideProviders` list is the eight `yes` rows above. `google`,
+`github-copilot` and `ollama` are deliberately absent — adding them to
+`overrideProviders` yourself will not make them work; see the table for why.
+
+**Dialect note:** `openrouter`, `groq`, `mistral` and `openai` itself can each
+send request fields beyond plain OpenAI-compatible JSON (routing hints,
+provider-specific sampling parameters, …). Once redirected, those fields are
+forwarded to whatever this gateway's route resolves to upstream, which may
+reject them with a 400 if that upstream doesn't understand them. That is
+still preferable to the silent bypass this redirect exists to close — a 400
+is a message, a bypass is not — but it means "redirected" is not the same
+guarantee as "works with every model this provider offers."
+
+**`x-gw-auto-route: 0` caveat:** with auto-routing off, the gateway looks up
+a route by exact name match on whatever model id the client sent (see
+`find_route` in `src/route.rs` — no prefix or fuzzy matching). A redirected
+built-in provider forwards its *native* model name (e.g. `gpt-5`, not a
+gateway route name), so unless a route happens to be named exactly that, the
+request 404s. This already applies to the default `openai`/`anthropic`
+redirects, not just the new ones — auto-routing on (the default) sidesteps it
+entirely by classifying every request regardless of the model id sent.
+
+`llm-gateway launch opencode` also scans agent files and `opencode.json` for
+provider pins that fall outside `overrideProviders` and warns about them
+before starting opencode — see `--help` output for what it checks.
+
+## `--isolate`
+
+`llm-gateway launch opencode --isolate` adds `--pure`, which disables
+opencode's *external plugins* only. Configuration files — `opencode.json`,
+agent frontmatter, the injected `OPENCODE_CONFIG_CONTENT` — are all still
+read normally. Unlike Claude Code's `--isolate`, this does not stop any
+config from loading.
+
+See the [README's `--isolate` by client table](../../README.md#--isolate-by-client)
+for how this compares to Claude Code and Codex.
+
 ## Verify
 
 ```sh

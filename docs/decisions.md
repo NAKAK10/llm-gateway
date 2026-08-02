@@ -2,6 +2,41 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-08-02 — `input_tokens` excludes cached tokens on the client-facing Anthropic shape too
+
+`usage::parse` normalizes OpenAI-shaped usage (`prompt_tokens`/`input_tokens`,
+which already include `cached_tokens`) by subtracting the cached portion out,
+so [`Usage::input_tokens`] means "new, non-cached input" for the gateway's own
+accounting regardless of upstream protocol. That normalization only ever
+touched the gateway's internal bookkeeping (`usage-*.jsonl`, `stats`) — the
+translated response bodies handed back to a client on an `openai-chat →
+anthropic-messages` route (`translate::response::chat_to_anthropic`,
+`translate::stream::ChatToAnthropic`) still put the raw, cache-inclusive
+`prompt_tokens` straight into `input_tokens` and reported
+`cache_read_input_tokens` right alongside it.
+
+**Decision: normalize the client-facing shape the same way.** Anthropic's own
+API treats `input_tokens` and `cache_read_input_tokens` as mutually exclusive
+— a client that sums the two (Claude Code does exactly this, to render
+context usage) is following the real Anthropic contract, so it is the
+gateway's inclusive `prompt_tokens → input_tokens` mapping that was wrong,
+not the client's assumption. `chat_to_anthropic` and `ChatToAnthropic` now
+subtract `cached_tokens` before writing `input_tokens`, the same subtraction
+`usage::parse` already does — so a translated route's client-visible token
+counts and the gateway's own `stats` agree. The Responses-shaped output
+(`chat_to_responses`, `ChatToResponses`) is deliberately left alone: it
+mirrors OpenAI's own nested `input_tokens` + `input_tokens_details
+.cached_tokens` convention, which is already internally consistent on its own
+terms.
+
+The one thing this does *not* fix is old data: `usage-*.jsonl` records written
+before the internal `usage::parse` normalization landed have `in_tok`
+inclusive of cached tokens, and `stats` has no marker distinguishing them from
+records written after. A `stats` run whose date range straddles that change
+undercounts the cache-hit portion of the older days. See
+`docs/config-reference.md`'s `usage-*.jsonl` field list for the same note
+aimed at someone reading the logs directly.
+
 ## 2026-08-01 — System-prompt classification: an agent's own role definition decides routing before user text does
 
 Semantic classification (the entries below, from "Always classify" onward)

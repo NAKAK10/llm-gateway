@@ -82,6 +82,15 @@ struct ServeArgs {
     /// Override `server.port`.
     #[arg(long)]
     port: Option<u16>,
+
+    /// Serve a local dashboard at `/ui`: a live feed of routing decisions
+    /// (prompt + which route/model it triggered), a map of where each route
+    /// sits in embedding space, and a usage view.
+    ///
+    /// Same listener, same `server.apiKey` as everything else — nothing new
+    /// is exposed to the network beyond what `serve` already binds.
+    #[arg(long)]
+    ui: bool,
 }
 
 #[derive(Args)]
@@ -184,6 +193,7 @@ fn run() -> Result<()> {
                 debug,
                 debug_full: args.debug_full,
                 port_override: args.port,
+                ui: args.ui,
             }))
         }
 

@@ -65,6 +65,19 @@ Notes:
   `openai-chat` fallback provider. Older Codex versions that still accept
   `"chat"` may keep using it, but there is no longer a reason to.
 
+## `--isolate`
+
+`llm-gateway launch codex --isolate` adds `--ignore-user-config`, but only
+when the forwarded arguments begin with `exec` — that flag exists on
+`codex exec`, not on the Codex TUI. Launching the TUI with `--isolate`
+inserts nothing: the CLI prints a warning and starts the TUI exactly as it
+would without the flag, still reading `~/.codex/config.toml`. There is no
+upstream TUI equivalent, so there is no workaround short of not using the
+TUI.
+
+See the [README's `--isolate` by client table](../../README.md#--isolate-by-client)
+for how this compares to Claude Code and opencode.
+
 ## Verify
 
 ```sh

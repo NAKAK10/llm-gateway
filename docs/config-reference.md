@@ -200,6 +200,16 @@ need launcher-specific overrides.
 `ts, client, route, provider, model, attempt, in_tok, out_tok, cache_read_tok,
 cache_write_tok, dur_ms, status(success|aborted|error), stream, error?`
 
+`in_tok` means *non-cached* input — `cache_read_tok` is reported separately,
+so `in_tok + cache_read_tok` is the true input total without double-counting.
+This normalization (subtracting `cached_tokens` out of an OpenAI-shaped
+`prompt_tokens`/`input_tokens` before it becomes `in_tok`) is what
+`usage::parse`'s module docs describe; records written before that
+normalization landed have `in_tok` inclusive of cached tokens instead. `stats`
+sums both kinds of record into the same column with no way to tell them
+apart, so a total that spans the migration is off by however much cache was
+hit in the older records — see `docs/decisions.md`.
+
 `trace-*.jsonl`:
 `ts, req_id, client, endpoint, requested_model, input{messages_n,
 last_user_text?, system_text?, tokens_est, tools, has_image, stream},

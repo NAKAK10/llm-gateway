@@ -120,6 +120,38 @@ fn filter_reachable_targets(resolution: &mut route::Resolution, expected_api: Ap
     before - resolution.targets.len()
 }
 
+/// Whether an attempt built for `target` can be expected to come back with a
+/// `usage` object at all, given the request as it will actually be sent.
+///
+/// `count_tokens` responses never carry `usage` — that part was already
+/// true before #22. The addition is the `openai-chat` streaming case:
+/// upstreams in that shape only report usage when
+/// `stream_options.include_usage` is on the wire, which the request only
+/// gets when `target.inject_usage` is set (see the injection just above
+/// wherever `request` was built). A provider deliberately configured with
+/// `injectUsage: false`, given a client that never asked for
+/// `stream_options` itself, is never going to see a `usage` object in its
+/// response — that is the normal, expected shape of that configuration, not
+/// a failed extraction, so `expect_usage` must say `false` for it. Both
+/// `usage::tee`'s "usage could not be extracted" warning and
+/// `UsageRecord::usage_missing` key off this same flag, so a provider set up
+/// this way stops looking like every request silently fails (#22).
+fn expect_usage_for(
+    target: &route::Target,
+    streaming: bool,
+    count_tokens: bool,
+    request: &serde_json::Value,
+) -> bool {
+    if count_tokens {
+        return false;
+    }
+    let known_to_have_no_stream_options = streaming
+        && target.api == ApiKind::OpenaiChat
+        && !target.inject_usage
+        && request.get("stream_options").is_none();
+    !known_to_have_no_stream_options
+}
+
 /// Proxy one request. `endpoint` must be one of the four POST paths.
 pub async fn proxy(
     state: AppState,
@@ -255,7 +287,15 @@ pub async fn proxy(
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
     let debug = state.recorder.mode().debug;
-    let trace_input = debug.then(|| {
+    // `serve --ui`'s live feed wants the same routing/prompt-preview data
+    // `--debug` records to disk, but it is a different, lower-stakes
+    // decision (ephemeral, in-memory, gone the moment nothing is
+    // subscribed) — so it gets its own gate rather than being tied to
+    // `debug`. `trace_input` is computed whenever either wants it; which of
+    // the two (or both) actually happens with the built record is decided
+    // per call site below.
+    let want_live = state.live.is_some();
+    let trace_input = (debug || want_live).then(|| {
         extract_input(
             expected_api,
             &payload,
@@ -296,6 +336,16 @@ pub async fn proxy(
     let started = Instant::now();
     let mut attempts = Vec::new();
 
+    // `build` runs once per target tried, in order, so recording an
+    // `expect_usage` alongside each `Attempt` (rather than recomputing it
+    // once from `accepted` after the fact) lets whichever attempt is finally
+    // accepted be looked up by its 1-based position below — the same
+    // position `Accepted::attempt` already uses. A `Mutex` rather than a
+    // `RefCell`: `build` is held across `.await` points inside
+    // `send_with_fallback`, and this whole future must stay `Send` for axum
+    // to accept it as a handler — `&RefCell<_>` is not `Send`, `&Mutex<_>` is.
+    let expect_usage_per_attempt = std::sync::Mutex::new(Vec::new());
+
     let build = |target: &route::Target| -> crate::error::Result<Attempt> {
         // Translation is decided per target, not once for the whole
         // resolution: a route's default and its fallbacks may speak
@@ -324,6 +374,11 @@ pub async fn proxy(
         {
             request["stream_options"] = serde_json::json!({ "include_usage": true });
         }
+
+        expect_usage_per_attempt
+            .lock()
+            .unwrap()
+            .push(expect_usage_for(target, streaming, count_tokens, &request));
 
         Ok(Attempt {
             body: serde_json::to_vec(&request)?,
@@ -357,6 +412,7 @@ pub async fn proxy(
                         out_tok: 0,
                         cache_read_tok: 0,
                         cache_write_tok: 0,
+                        usage_missing: false,
                         dur_ms,
                         status: "error".to_string(),
                         stream: streaming,
@@ -364,7 +420,7 @@ pub async fn proxy(
                     });
                 }
                 if let Some(input) = trace_input {
-                    state.recorder.trace(trace_record(
+                    let record = trace_record(
                         &client,
                         endpoint,
                         &requested_model,
@@ -374,7 +430,21 @@ pub async fn proxy(
                         attempts,
                         None,
                         semantic_attempt,
-                    ));
+                    );
+                    if debug {
+                        state.recorder.trace(record.clone());
+                    }
+                    if let Some(live) = &state.live {
+                        let point = live_point(&state, &record);
+                        live.publish(live_event_from(
+                            &record,
+                            record.attempts.len().max(1) as u32,
+                            "error",
+                            dur_ms,
+                            Some(err.to_string()),
+                            point,
+                        ));
+                    }
                 }
                 return error_response(http::StatusCode::BAD_GATEWAY, &err.to_string());
             }
@@ -419,6 +489,11 @@ pub async fn proxy(
 
     // Everything the report closure needs, captured before the stream starts.
     let recorder: Arc<Recorder> = state.recorder.clone();
+    // Whole-`AppState` clone rather than just the `live` field: `live_point`
+    // takes `&AppState` uniformly across both the `semantic`-feature-on and
+    // -off builds (see its doc comment), and every field here is already
+    // `Arc`/cheap-`Clone`.
+    let state_for_report = state.clone();
     let resolved = TraceResolved {
         provider: accepted.target_provider.clone(),
         model: accepted.target_model.clone(),
@@ -436,6 +511,18 @@ pub async fn proxy(
     let attempt_n = accepted.attempt;
     let ok_status = status.is_success();
     let requested = requested_model.clone();
+    // `accepted.attempt` is 1-based and `expect_usage_per_attempt` gained one
+    // entry per attempt `build` was called for, in the same order — so the
+    // accepted attempt's entry sits at `attempt - 1`. Defaults to the
+    // conservative `!count_tokens` if that invariant is ever violated, which
+    // only means a real extraction failure could log a warning it otherwise
+    // wouldn't — never the other way around.
+    let expect_usage = expect_usage_per_attempt
+        .lock()
+        .unwrap()
+        .get(accepted.attempt as usize - 1)
+        .copied()
+        .unwrap_or(!count_tokens);
 
     // Recording happens when the stream is dropped — the only moment that
     // exists for aborted requests too. See `usage::tee`.
@@ -455,10 +542,26 @@ pub async fn proxy(
                 provider: provider.clone(),
                 model: model.clone(),
                 attempt: attempt_n,
-                in_tok: usage.input_tokens,
-                out_tok: usage.output_tokens,
-                cache_read_tok: usage.cache_read_tokens,
-                cache_write_tok: usage.cache_write_tokens,
+                // The persisted record's fields stay plain `u64` — an
+                // unobserved field is recorded the same as an observed zero,
+                // which keeps `usage-*.jsonl` byte-compatible with records
+                // written before `Usage` gained `Option` fields (#23). The
+                // `usage_missing` flag below is what actually distinguishes
+                // "nothing observed" from a genuine zero-token response.
+                in_tok: usage.input_tokens.unwrap_or(0),
+                out_tok: usage.output_tokens.unwrap_or(0),
+                cache_read_tok: usage.cache_read_tokens.unwrap_or(0),
+                cache_write_tok: usage.cache_write_tokens.unwrap_or(0),
+                // A `success` response with no usage at all means extraction
+                // failed, not that it genuinely cost zero tokens — see
+                // `tee::ObserveStream`'s warning for the same signal at the
+                // point it's first observed. Gated on `expect_usage` the same
+                // way that warning is (#22): a provider configured with
+                // `injectUsage: false` and no client-supplied
+                // `stream_options` never gets a `usage` object back, and
+                // that is the expected shape of a normal response, not a
+                // failed extraction.
+                usage_missing: status_str == "success" && expect_usage && usage.is_empty(),
                 dur_ms,
                 status: status_str.to_string(),
                 stream: streaming,
@@ -466,7 +569,7 @@ pub async fn proxy(
             });
         }
         if let Some(input) = trace_input {
-            recorder.trace(trace_record(
+            let record = trace_record(
                 &client,
                 endpoint,
                 &requested,
@@ -475,20 +578,41 @@ pub async fn proxy(
                 resolved,
                 attempts,
                 (!usage.is_empty()).then_some(TraceUsage {
-                    in_tok: usage.input_tokens,
-                    out_tok: usage.output_tokens,
-                    cache_read_tok: usage.cache_read_tokens,
-                    cache_write_tok: usage.cache_write_tokens,
+                    in_tok: usage.input_tokens.unwrap_or(0),
+                    out_tok: usage.output_tokens.unwrap_or(0),
+                    cache_read_tok: usage.cache_read_tokens.unwrap_or(0),
+                    cache_write_tok: usage.cache_write_tokens.unwrap_or(0),
                 }),
                 semantic_attempt,
-            ));
+            );
+            if debug {
+                recorder.trace(record.clone());
+            }
+            if let Some(live) = &state_for_report.live {
+                let point = live_point(&state_for_report, &record);
+                live.publish(live_event_from(
+                    &record, attempt_n, status_str, dur_ms, None, point,
+                ));
+            }
         }
     });
 
     // Usage is observed on the *upstream* bytes, in the upstream's protocol,
     // before any translation — which is what keeps token accounting correct on
     // a translated route (`usage::parse` never sees a rebuilt body).
-    let observed = tee::observe(accepted.body, accepted.api, streaming, report);
+    //
+    // `expect_usage` is the same flag computed above for `usage_missing`
+    // (see `expect_usage_for`): `count_tokens` responses never carry a
+    // `usage` object at all, and neither does an `openai-chat` streaming
+    // response from a provider with `injectUsage: false` when the client
+    // didn't ask for `stream_options` itself (#22) — both are expected
+    // shapes, not extraction failures, so both must suppress the same
+    // warning here that `usage_missing` suppresses in the trace/usage log.
+    // Routing count_tokens through `observe` at all (rather than bypassing
+    // it) keeps this the one place that understands both the streaming and
+    // buffered body shapes, and keeps every endpoint observed on the same
+    // upstream-bytes-below-translation path.
+    let observed = tee::observe(accepted.body, accepted.api, streaming, expect_usage, report);
 
     match translation {
         // The passthrough path: nothing at all between the upstream stream and
@@ -549,7 +673,7 @@ fn count_tokens_locally(
     let target = &resolution.targets[0];
 
     if let Some(input) = trace_input {
-        state.recorder.trace(trace_record(
+        let record = trace_record(
             client,
             endpoint,
             requested_model,
@@ -564,7 +688,18 @@ fn count_tokens_locally(
             }],
             None,
             semantic_attempt,
-        ));
+        );
+        // `trace_input` is `Some` whenever `--debug` *or* `serve --ui`'s live
+        // feed wants it (see `proxy`) — disk persistence must stay gated on
+        // `--debug` alone, so it needs its own check here rather than
+        // reusing `trace_input.is_some()` the way this used to.
+        if state.recorder.mode().debug {
+            state.recorder.trace(record.clone());
+        }
+        if let Some(live) = &state.live {
+            let point = live_point(state, &record);
+            live.publish(live_event_from(&record, 1, "success", 0, None, point));
+        }
     }
 
     json_response(
@@ -597,6 +732,93 @@ fn json_response(status: http::StatusCode, body: &serde_json::Value) -> Response
         http::HeaderValue::from_static("application/json"),
     );
     response
+}
+
+/// Turn a just-built [`TraceRecord`] into a [`crate::server::live::LiveEvent`]
+/// for `serve --ui`'s live feed.
+///
+/// Reuses the record rather than rebuilding the same data from scratch: both
+/// describe "what came in, which route/model it triggered, how it turned
+/// out," and a `TraceRecord` is already exactly that shape (see
+/// `crate::record::trace_log`) — this only adds what a `TraceRecord` does
+/// not carry (`status`/`dur_ms`/`attempt` are derived elsewhere in this file
+/// rather than stored on it) and the vector-map point.
+fn live_event_from(
+    record: &TraceRecord,
+    attempt: u32,
+    status: &str,
+    dur_ms: u64,
+    error: Option<String>,
+    point: Option<[f32; 2]>,
+) -> crate::server::live::LiveEvent {
+    let usage = record.usage.unwrap_or_default();
+    crate::server::live::LiveEvent {
+        ts: record.ts.clone(),
+        req_id: record.req_id.clone(),
+        client: record.client.clone(),
+        endpoint: record.endpoint.clone(),
+        requested_model: record.requested_model.clone(),
+        prompt_preview: record.input.last_user_text.clone(),
+        routing_mode: record.routing.mode.clone(),
+        reason: record.routing.reason.clone(),
+        matched_route: record.routing.matched_route.clone(),
+        candidates: record
+            .routing
+            .candidates
+            .iter()
+            .map(|c| crate::server::live::LiveCandidate {
+                route: c.route.clone(),
+                score: c.score,
+            })
+            .collect(),
+        score: record.routing.score,
+        provider: record.resolved.provider.clone(),
+        model: record.resolved.model.clone(),
+        api: record.resolved.api.clone(),
+        translation: record.resolved.translation.clone(),
+        attempt,
+        streaming: record.input.stream,
+        status: status.to_string(),
+        dur_ms,
+        in_tok: usage.in_tok,
+        out_tok: usage.out_tok,
+        cache_read_tok: usage.cache_read_tok,
+        cache_write_tok: usage.cache_write_tok,
+        error,
+        point,
+    }
+}
+
+/// Where the text that decided routing (`record.routing.decided_by_text`)
+/// lands on the same 2-D map `GET /api/routes/vectors` draws — `None` when
+/// nothing decided routing by text, no classifier is loaded to re-embed it
+/// with, or nobody is subscribed to see the result.
+///
+/// Only called when `state.live` is already known to be `Some` (see the call
+/// sites below) — but `Some` only means `serve --ui` is on for this run, not
+/// that any tab is actually open. `LiveFeed::publish` is already a no-op
+/// with zero subscribers, but that is too late: by then this function's
+/// work (re-embedding `text`, then fitting or reusing a `Basis`) has already
+/// run, once per request, on the tokio worker handling it (#27). Checking
+/// `has_subscribers` first, before any of that, is what actually makes an
+/// unwatched dashboard free.
+#[cfg(feature = "semantic")]
+fn live_point(state: &AppState, record: &TraceRecord) -> Option<[f32; 2]> {
+    if !state
+        .live
+        .as_ref()
+        .is_some_and(|live| live.has_subscribers())
+    {
+        return None;
+    }
+    let classifier = state.classifier.as_ref()?;
+    let text = record.routing.decided_by_text.as_deref()?;
+    crate::server::ui::project_point(state, classifier, text)
+}
+
+#[cfg(not(feature = "semantic"))]
+fn live_point(_state: &AppState, _record: &TraceRecord) -> Option<[f32; 2]> {
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1443,11 +1665,185 @@ mod tests {
         }
     }
 
+    /// Regression tests for #22: `expect_usage_for` is what both
+    /// `usage::tee`'s "usage could not be extracted" warning and
+    /// `UsageRecord::usage_missing` key off, so the false-positive case in
+    /// the issue (`injectUsage: false`, streaming, no client-supplied
+    /// `stream_options`) must resolve to `false`, and every other
+    /// combination must keep resolving to `true` (the old, unconditional
+    /// `!count_tokens` behavior).
+    #[test]
+    fn expect_usage_for_is_false_only_for_the_no_usage_openai_chat_streaming_case() {
+        let mut target = test_target(ApiKind::OpenaiChat);
+        target.inject_usage = false;
+        let request = json!({ "messages": [] });
+        assert!(!expect_usage_for(&target, true, false, &request));
+    }
+
+    #[test]
+    fn expect_usage_for_is_true_when_inject_usage_is_set() {
+        // `inject_usage: true` means `stream_options` gets added before the
+        // request goes out (see the injection in `proxy`'s `build`
+        // closure), so usage is expected the normal way.
+        let mut target = test_target(ApiKind::OpenaiChat);
+        target.inject_usage = true;
+        let request = json!({ "messages": [] });
+        assert!(expect_usage_for(&target, true, false, &request));
+    }
+
+    #[test]
+    fn expect_usage_for_is_true_when_the_client_already_sent_stream_options() {
+        // Even with `injectUsage: false`, a client that asked for
+        // `stream_options` itself may still get usage back — only the
+        // "neither side asked" combination is a known no-usage case.
+        let mut target = test_target(ApiKind::OpenaiChat);
+        target.inject_usage = false;
+        let request = json!({ "messages": [], "stream_options": { "include_usage": true } });
+        assert!(expect_usage_for(&target, true, false, &request));
+    }
+
+    #[test]
+    fn expect_usage_for_is_true_for_non_streaming_openai_chat() {
+        let mut target = test_target(ApiKind::OpenaiChat);
+        target.inject_usage = false;
+        let request = json!({ "messages": [] });
+        assert!(expect_usage_for(&target, false, false, &request));
+    }
+
+    #[test]
+    fn expect_usage_for_is_true_for_anthropic_regardless_of_inject_usage() {
+        // `injectUsage`/`stream_options` are an `openai-chat` streaming
+        // concept only — Anthropic reports usage unprompted.
+        let mut target = test_target(ApiKind::AnthropicMessages);
+        target.inject_usage = false;
+        let request = json!({ "messages": [] });
+        assert!(expect_usage_for(&target, true, false, &request));
+    }
+
+    #[test]
+    fn expect_usage_for_is_false_for_count_tokens_regardless_of_everything_else() {
+        let target = test_target(ApiKind::OpenaiChat);
+        let request = json!({ "messages": [] });
+        assert!(!expect_usage_for(&target, true, true, &request));
+    }
+
     fn test_resolution(targets: Vec<route::Target>) -> route::Resolution {
         route::Resolution {
             route_name: "r".to_string(),
             targets,
         }
+    }
+
+    fn test_semantic_attempt(decided_by_text: Option<&str>) -> SemanticAttempt {
+        SemanticAttempt {
+            resolve_as: "role-writer".to_string(),
+            outcome: SemanticOutcome::Manual,
+            resolved_targets: None,
+            candidates: vec![TraceCandidate {
+                route: "role-writer".to_string(),
+                score: 0.9,
+            }],
+            score: Some(0.9),
+            embed_ms: 3,
+            decided_by_text: decided_by_text.map(String::from),
+            walk: Vec::new(),
+            system_score: None,
+        }
+    }
+
+    fn test_trace_record(usage: Option<TraceUsage>) -> TraceRecord {
+        let resolution = route::Resolution {
+            route_name: "role-writer".to_string(),
+            targets: vec![test_target(ApiKind::AnthropicMessages)],
+        };
+        let input = TraceInput {
+            messages_n: 1,
+            last_user_text: Some("hello".to_string()),
+            system_text: None,
+            tokens_est: 10,
+            tools: vec![],
+            has_image: false,
+            stream: false,
+        };
+        let resolved = TraceResolved {
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            api: "anthropic-messages".to_string(),
+            translation: None,
+        };
+        trace_record(
+            "claude-code",
+            "/v1/messages",
+            "claude-sonnet-4-6",
+            input,
+            &resolution,
+            resolved,
+            Vec::new(),
+            usage,
+            test_semantic_attempt(Some("hello")),
+        )
+    }
+
+    #[test]
+    fn live_event_from_maps_the_trace_record_and_the_extra_fields() {
+        let record = test_trace_record(Some(TraceUsage {
+            in_tok: 10,
+            out_tok: 20,
+            cache_read_tok: 1,
+            cache_write_tok: 2,
+        }));
+
+        let event = live_event_from(&record, 1, "success", 120, None, Some([0.1, -0.2]));
+
+        assert_eq!(event.matched_route, "role-writer");
+        assert_eq!(event.provider, "anthropic");
+        assert_eq!(event.model, "claude-sonnet-4-6");
+        assert_eq!(event.status, "success");
+        assert_eq!(event.dur_ms, 120);
+        assert_eq!(event.in_tok, 10);
+        assert_eq!(event.out_tok, 20);
+        assert_eq!(event.cache_read_tok, 1);
+        assert_eq!(event.cache_write_tok, 2);
+        assert_eq!(event.prompt_preview.as_deref(), Some("hello"));
+        assert_eq!(event.point, Some([0.1, -0.2]));
+        assert_eq!(event.candidates.len(), 1);
+        assert_eq!(event.candidates[0].route, "role-writer");
+        assert!((event.candidates[0].score - 0.9).abs() < 1e-6);
+    }
+
+    #[cfg(feature = "semantic")]
+    #[tokio::test]
+    async fn live_point_skips_projection_when_nobody_is_subscribed() {
+        // #27: `live_point` must bail out before it would need a classifier
+        // at all once `has_subscribers` says nobody is listening — proven
+        // here by a `state.classifier` of `None` (which `test_state` always
+        // leaves unset — see its doc comment) not causing a panic or an
+        // early `?`-return that would also pass with the gate missing: if
+        // the `has_subscribers` check were removed, this call would still
+        // return `None`, just by falling through the `classifier.as_ref()?`
+        // below instead — so the meaningful assertion is `has_subscribers`
+        // itself (see `live.rs`'s own tests for that), and this test exists
+        // to pin `live_point`'s observable contract: no subscribers, no
+        // point, regardless of why.
+        let (_dir, mut state) = test_state(crate::config::Config::default());
+        state.live = Some(std::sync::Arc::new(crate::server::live::LiveFeed::new()));
+        assert!(!state.live.as_ref().unwrap().has_subscribers());
+
+        let record = test_trace_record(None);
+        assert_eq!(live_point(&state, &record), None);
+    }
+
+    #[test]
+    fn live_event_from_defaults_usage_to_zero_without_a_usage_block() {
+        let record = test_trace_record(None);
+
+        let event = live_event_from(&record, 2, "error", 50, Some("boom".to_string()), None);
+
+        assert_eq!(event.in_tok, 0);
+        assert_eq!(event.out_tok, 0);
+        assert_eq!(event.attempt, 2);
+        assert_eq!(event.error.as_deref(), Some("boom"));
+        assert!(event.point.is_none());
     }
 
     /// The Claude Code shape from the config that motivated this change: an
@@ -2254,6 +2650,10 @@ mod tests {
             inbound_key: None,
             #[cfg(feature = "semantic")]
             classifier: None,
+            #[cfg(feature = "semantic")]
+            basis_cache: std::sync::Arc::new(crate::server::ui::pca::BasisCache::new()),
+            live: None,
+            ui_token: None,
         };
         (dir, state)
     }

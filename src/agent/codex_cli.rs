@@ -446,9 +446,12 @@ mod tests {
             crate::usage::parse::SseUsageScanner::new(crate::config::ApiKind::OpenaiChat);
         scanner.push(&sse);
         let usage = scanner.finish();
-        assert_eq!(usage.input_tokens, 7);
-        assert_eq!(usage.output_tokens, 2);
-        assert_eq!(usage.cache_read_tokens, 1);
+        // `prompt_tokens` (7) includes `cached_tokens` (1); the scanner
+        // reports `input_tokens` as the non-cached remainder, so the two
+        // don't double-count when summed downstream.
+        assert_eq!(usage.input_tokens, Some(6));
+        assert_eq!(usage.output_tokens, Some(2));
+        assert_eq!(usage.cache_read_tokens, Some(1));
 
         let mut translator = crate::translate::stream::ChatToAnthropic::new("gpt-5".to_string());
         let mut out = translator.push(&sse);

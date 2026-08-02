@@ -69,6 +69,19 @@ Codex は依然として model 文字列を要求しますが、`llm-gateway` �
   まだ受け付ける旧バージョンの Codex は引き続き使ってもよいが、もう
   そうする理由はない。
 
+## `--isolate`
+
+`llm-gateway launch codex --isolate` は `--ignore-user-config` を追加します
+が、それが起きるのは forward される引数が `exec` で始まるときだけです —
+このフラグは `codex exec` にしか存在せず、Codex TUI にはありません。TUI を
+`--isolate` 付きで起動しても何も追加されず、CLI は警告を出したうえで
+`--isolate` なしのときと全く同じ TUI を起動します。`~/.codex/config.toml`
+も普段どおり読み込まれます。TUI 側に対応するオプションが上流に無いため、
+回避策はありません(TUI を使わない以外に)。
+
+Claude Code・opencode との比較は README の「コマンド」節
+([README.ja.md](../../../README.ja.md#コマンド))を参照してください。
+
 ## 動作確認
 
 ```sh

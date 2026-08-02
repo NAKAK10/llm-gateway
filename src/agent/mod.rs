@@ -67,7 +67,7 @@ async fn spawn_claude(
     streaming: bool,
 ) -> Result<Spawned> {
     let cwd = scratch_dir()?;
-    let system = claude_cli::system(payload);
+    let system = claude_cli::system_prompt(payload);
     let args = claude_cli::args(
         &target.model_ref.model,
         system.as_deref(),
@@ -288,9 +288,24 @@ fn stream_body(mut child: tokio::process::Child, model: String) -> super::upstre
                     Err(err) => format!("`claude` could not be waited for: {err}"),
                 }
             } else {
-                stderr.chars().take(500).collect()
+                stderr.chars().take(500).collect::<String>()
             };
-            converter.error(&mut out, &detail);
+            // A non-zero exit after the turn already completed (`message_stop`
+            // seen, `result`'s usage applied) is not a failed request — the
+            // answer is real and about to be flushed by `finish()` below, so
+            // no error frame is injected into a stream the client has
+            // already seen close successfully. But it is not nothing,
+            // either: the CLI exiting badly on every turn is a real
+            // degradation (a crash loop, a broken install) that would
+            // otherwise be invisible, so it is at least logged.
+            if converter.is_finished() {
+                tracing::warn!(
+                    detail = %detail,
+                    "claude CLI exited non-zero after completing its turn"
+                );
+            } else {
+                converter.error(&mut out, &detail, None);
+            }
         }
         out.extend(converter.finish());
         if !out.is_empty() {

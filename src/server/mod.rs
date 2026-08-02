@@ -15,10 +15,12 @@
 //! live in `route`, `upstream` and `passthrough`.
 
 pub mod chat;
+pub mod live;
 pub mod messages;
 pub mod models;
 pub mod passthrough;
 pub mod responses;
+pub mod ui;
 
 mod proxy;
 
@@ -33,6 +35,7 @@ use crate::config::ApiKind;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::record::{RecordMode, Recorder};
+use crate::server::live::LiveFeed;
 use crate::{paths, upstream};
 
 pub use proxy::proxy;
@@ -42,6 +45,9 @@ pub struct ServeOptions {
     pub debug: bool,
     pub debug_full: bool,
     pub port_override: Option<u16>,
+    /// Turn on the local dashboard at `GET /ui` (`--ui`). ORs with
+    /// `config.ui.enabled` — either turns it on for this run.
+    pub ui: bool,
 }
 
 /// Everything a handler needs.
@@ -63,6 +69,28 @@ pub struct AppState {
     /// feature; see the warning `serve` logs in that case.
     #[cfg(feature = "semantic")]
     pub classifier: Option<Arc<crate::semantic::index::Classifier>>,
+    /// The vector map's fitted [`ui::pca::Basis`], reused across requests
+    /// for as long as `config`'s generation does not move — see
+    /// [`ui::pca::BasisCache`]'s doc comment for why a request-scoped refit
+    /// (#27) is wasted work. Always present under the `semantic` feature,
+    /// independent of `live`/`ui_token`: it costs nothing empty, and keeping
+    /// it unconditional avoids a second `Option` for `routes_vectors` and
+    /// `project_point` to unwrap.
+    #[cfg(feature = "semantic")]
+    pub basis_cache: Arc<ui::pca::BasisCache>,
+    /// `Some` only when `serve --ui` (or `config.ui.enabled`) is on — see
+    /// [`router`], which merges the dashboard's routes into the main router
+    /// exactly when this is `Some`. Every place a live event gets published
+    /// (`crate::server::proxy`) treats `None` the same way `Recorder` treats
+    /// a disabled mode: nothing to do, no cost beyond the check.
+    pub live: Option<Arc<LiveFeed>>,
+    /// The dashboard's own bearer secret, generated fresh in [`serve`] and
+    /// printed once at startup — `Some` exactly when `live` is. A browser
+    /// cannot attach `Authorization`/`x-api-key` to a page navigation or an
+    /// `EventSource`, so `server.apiKey` alone cannot gate `/ui`; this token
+    /// is what `/ui?token=…` trades for the session cookie that does instead
+    /// (see `crate::server::ui::ui_guard`). Never written to disk.
+    pub ui_token: Option<String>,
 }
 
 /// Load config, bind, and serve until interrupted.
@@ -108,6 +136,15 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
     #[cfg(not(feature = "semantic"))]
     warn_if_semantic_routes_are_unusable(&config);
 
+    let ui_enabled = options.ui || config.ui.enabled;
+    let live = ui_enabled.then(|| Arc::new(LiveFeed::new()));
+    // A fresh, unguessable secret per run — never persisted — so a browser
+    // can get in via `/ui?token=…` without ever needing to attach a header.
+    // `Uuid::now_v7` rather than a dedicated CSPRNG call: it is already a
+    // dependency (see `TraceRecord::req_id`), and 74 bits of randomness
+    // behind the timestamp is plenty for a loopback-only, single-run secret.
+    let ui_token = ui_enabled.then(|| uuid::Uuid::now_v7().to_string());
+
     let state = AppState {
         config: shared.clone(),
         http,
@@ -115,6 +152,10 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         inbound_key,
         #[cfg(feature = "semantic")]
         classifier,
+        #[cfg(feature = "semantic")]
+        basis_cache: Arc::new(ui::pca::BasisCache::new()),
+        live,
+        ui_token,
     };
 
     // Watch after the first successful load: a broken edit from here on keeps
@@ -139,6 +180,9 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
                 " (truncated to 200 chars)"
             }
         );
+    }
+    if let Some(token) = &state.ui_token {
+        eprintln!("dashboard is ON — http://{host}:{port}/ui?token={token}");
     }
 
     axum::serve(listener, router(state)).await?;
@@ -330,8 +374,24 @@ fn init_tracing(verbose: bool) {
 }
 
 /// Build the router. Split out so tests can drive it without binding a port.
+///
+/// The dashboard's routes (`ui::router`) are merged in only when
+/// `state.live` is `Some` — i.e. `serve --ui`/`config.ui.enabled` turned it
+/// on for this run — so a build with the dashboard off has no `/ui` or
+/// `/api/*` route registered at all (a plain 404), rather than a route that
+/// exists but answers "disabled."
+///
+/// The proxy routes and the dashboard routes each get their own auth layer,
+/// applied before the merge rather than one shared layer applied after: the
+/// proxy's [`auth_middleware`] only ever understands the `Authorization`/
+/// `x-api-key` headers `server.apiKey` expects, but a browser cannot attach
+/// either of those to a page navigation or an `EventSource` (see
+/// `crate::server::ui`'s module docs), so the dashboard needs a gate that
+/// also accepts its own session cookie — [`ui::ui_guard`]. Splitting the
+/// layers this way leaves the proxy routes' auth exactly as it was; only the
+/// dashboard's got a second way in.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let proxy = Router::new()
         .route("/v1/messages", post(messages::handle))
         .route("/v1/messages/count_tokens", post(messages::count_tokens))
         .route("/v1/chat/completions", post(chat::handle))
@@ -341,8 +401,19 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
-        ))
-        .with_state(state)
+        ));
+
+    let router = if state.live.is_some() {
+        let dashboard = ui::router().layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            ui::ui_guard,
+        ));
+        proxy.merge(dashboard)
+    } else {
+        proxy
+    };
+
+    router.with_state(state)
 }
 
 /// Reject requests that lack the inbound key, when one is configured.
@@ -364,7 +435,23 @@ async fn auth_middleware(
         return next.run(request).await;
     }
 
-    let headers = request.headers();
+    if header_key_ok(request.headers(), expected) {
+        next.run(request).await
+    } else {
+        error_response(
+            http::StatusCode::UNAUTHORIZED,
+            "invalid or missing gateway API key",
+        )
+    }
+}
+
+/// True when `Authorization: Bearer …` or `x-api-key` carries `expected`.
+///
+/// Factored out of [`auth_middleware`] so [`ui::ui_guard`] can accept exactly
+/// the same header credential the proxy routes do — a `server.apiKey`-armed
+/// `curl` script should not need a second, dashboard-specific secret on top
+/// of the one it already has.
+pub(crate) fn header_key_ok(headers: &http::HeaderMap, expected: &str) -> bool {
     let bearer_ok = headers
         .get(http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -374,15 +461,7 @@ async fn auth_middleware(
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|token| token == expected);
-
-    if bearer_ok || api_key_ok {
-        next.run(request).await
-    } else {
-        error_response(
-            http::StatusCode::UNAUTHORIZED,
-            "invalid or missing gateway API key",
-        )
-    }
+    bearer_ok || api_key_ok
 }
 
 /// Identify the caller for logging.

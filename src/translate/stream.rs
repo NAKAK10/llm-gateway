@@ -53,10 +53,7 @@
 
 use serde_json::{json, Value};
 
-use crate::usage::parse::find_subslice;
-
-/// An SSE event is complete once a blank line separates it from the next.
-const EVENT_SEPARATOR: &[u8] = b"\n\n";
+use crate::usage::parse::find_event_boundary;
 
 /// Defensive cap on a single partial event, mirroring `usage::parse`: a
 /// misbehaving upstream must not be able to grow our buffer without bound.
@@ -147,6 +144,17 @@ impl ChatUsage {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
     }
+
+    /// `prompt` with the cached portion subtracted out — what Anthropic's
+    /// `input_tokens` means (exclusive of `cache_read_input_tokens`), unlike
+    /// `prompt_tokens`, which already includes it. Only `ChatToAnthropic`
+    /// needs this: the Responses converter reports `self.prompt` verbatim
+    /// alongside `input_tokens_details.cached_tokens`, OpenAI's own
+    /// (inclusive) nested convention, which is already internally
+    /// consistent — see #24.
+    fn non_cached_prompt(&self) -> u64 {
+        self.prompt.saturating_sub(self.cached)
+    }
 }
 
 /// Incremental converter from an OpenAI Chat SSE stream to an Anthropic
@@ -205,8 +213,13 @@ impl ChatToAnthropic {
         let mut out = Vec::new();
         self.buffer.extend_from_slice(chunk);
 
-        while let Some(pos) = find_subslice(&self.buffer, EVENT_SEPARATOR) {
-            let event_end = pos + EVENT_SEPARATOR.len();
+        // `find_event_boundary` (shared with `usage::parse`, which frames an
+        // SSE stream the same way) accepts both a plain `\n\n` blank line
+        // and a CRLF-framed `\r\n\r\n` one — an upstream that uses CRLF line
+        // endings otherwise never produces a boundary this loop recognizes,
+        // and the buffer grows until `MAX_EVENT_BYTES` discards it whole.
+        while let Some((pos, sep_len)) = find_event_boundary(&self.buffer) {
+            let event_end = pos + sep_len;
             let event: Vec<u8> = self.buffer.drain(..event_end).collect();
             self.handle_event(&event[..pos], &mut out);
         }
@@ -222,8 +235,19 @@ impl ChatToAnthropic {
     /// own — a truncated generation, or a provider that simply closes the
     /// connection. Idempotent: a second call, or a call after `[DONE]` or an
     /// error frame already closed the stream, returns empty.
+    ///
+    /// A connection can also close right after the final `data:` line with
+    /// no trailing blank line — that leftover partial event is still a
+    /// complete, parseable one (often the one carrying `usage`, per
+    /// `openai-chat`'s convention of a final usage-only chunk), so it is run
+    /// through `handle_event` here rather than dropped. Same handling as
+    /// `usage::parse::SseUsageScanner::finish`.
     pub fn finish(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
+        if !self.buffer.is_empty() {
+            let event = std::mem::take(&mut self.buffer);
+            self.handle_event(&event, &mut out);
+        }
         self.emit_terminal(&mut out);
         out
     }
@@ -333,7 +357,7 @@ impl ChatToAnthropic {
                     // prompt tokens only in its final usage chunk. Corrected in
                     // `message_delta`, which current Anthropic streams also use
                     // to restate the full usage.
-                    "usage": { "input_tokens": self.usage.prompt, "output_tokens": 0 },
+                    "usage": { "input_tokens": self.usage.non_cached_prompt(), "output_tokens": 0 },
                 },
             }),
         );
@@ -530,7 +554,11 @@ impl ChatToAnthropic {
                 "type": "message_delta",
                 "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
                 "usage": {
-                    "input_tokens": self.usage.prompt,
+                    // `self.usage.prompt` includes `cached`, but Anthropic's
+                    // `input_tokens`/`cache_read_input_tokens` are exclusive
+                    // — reporting it verbatim would double-count the cached
+                    // portion for a client that sums the two (#24).
+                    "input_tokens": self.usage.non_cached_prompt(),
                     "output_tokens": self.usage.completion,
                     "cache_read_input_tokens": self.usage.cached,
                     "cache_creation_input_tokens": 0,
@@ -568,7 +596,7 @@ fn emit(out: &mut Vec<u8>, event: &str, data: Value) {
 fn event_data(event: &str) -> String {
     let mut data = String::new();
     for line in event.split('\n') {
-        let line = line.strip_prefix('\r').unwrap_or(line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if let Some(rest) = line.strip_prefix("data: ") {
             data.push_str(rest);
         } else if let Some(rest) = line.strip_prefix("data:") {
@@ -699,8 +727,13 @@ impl ChatToResponses {
         let mut out = Vec::new();
         self.buffer.extend_from_slice(chunk);
 
-        while let Some(pos) = find_subslice(&self.buffer, EVENT_SEPARATOR) {
-            let event_end = pos + EVENT_SEPARATOR.len();
+        // `find_event_boundary` (shared with `usage::parse`, which frames an
+        // SSE stream the same way) accepts both a plain `\n\n` blank line
+        // and a CRLF-framed `\r\n\r\n` one — an upstream that uses CRLF line
+        // endings otherwise never produces a boundary this loop recognizes,
+        // and the buffer grows until `MAX_EVENT_BYTES` discards it whole.
+        while let Some((pos, sep_len)) = find_event_boundary(&self.buffer) {
+            let event_end = pos + sep_len;
             let event: Vec<u8> = self.buffer.drain(..event_end).collect();
             self.handle_event(&event[..pos], &mut out);
         }
@@ -713,9 +746,14 @@ impl ChatToResponses {
     }
 
     /// The closing events, for a stream that ended without a `[DONE]` of its
-    /// own. Idempotent, same as [`ChatToAnthropic::finish`].
+    /// own. Idempotent, and flushes a leftover unterminated event first, same
+    /// as [`ChatToAnthropic::finish`].
     pub fn finish(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
+        if !self.buffer.is_empty() {
+            let event = std::mem::take(&mut self.buffer);
+            self.handle_event(&event, &mut out);
+        }
         self.emit_terminal(&mut out);
         out
     }
@@ -1172,6 +1210,22 @@ mod tests {
     }
 
     #[test]
+    fn event_data_joins_crlf_framed_multiline_data_lines() {
+        // Per the SSE spec, multiple `data:` lines within one event are
+        // joined with `\n`. Under CRLF framing that means each line (as
+        // produced by splitting the event on `\n`) carries a trailing `\r`,
+        // not a leading one — stripping the wrong end leaves the `\r` stuck
+        // between the two lines' payloads instead of removed, which splits a
+        // token (here, the digits of `15`) and breaks JSON parsing.
+        let event = "data: {\"choices\": [], \"usage\": {\"prompt_tokens\": 1\r\n\
+                      data: 5, \"completion_tokens\": 25}}";
+        let data = event_data(event);
+        let json: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(json["usage"]["prompt_tokens"], 15);
+        assert_eq!(json["usage"]["completion_tokens"], 25);
+    }
+
+    #[test]
     fn a_text_stream_produces_the_full_anthropic_event_sequence() {
         let mut converter = ChatToAnthropic::new("fallback".to_string());
         let mut out = converter.push(text_chunk("Hel", None).as_bytes());
@@ -1249,6 +1303,59 @@ mod tests {
         );
         assert_eq!(events[2].1["delta"]["text"], "a");
         assert_eq!(events[3].1["delta"]["text"], "b");
+    }
+
+    #[test]
+    fn crlf_framed_events_are_converted_same_as_lf() {
+        // Some upstreams (and the proxies in front of them) frame SSE with
+        // `\r\n` line endings, so the event separator is `\r\n\r\n` rather
+        // than `\n\n` — before `find_event_boundary` was wired in here, a
+        // converter fed this never found a boundary at all, and the whole
+        // stream sat unparsed in the buffer until `MAX_EVENT_BYTES` dropped
+        // it.
+        let crlf = text_chunk("hello", Some("stop")).replace('\n', "\r\n");
+        let mut converter = ChatToAnthropic::new("m".to_string());
+        let mut out = converter.push(crlf.as_bytes());
+        out.extend(converter.finish());
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"text\":\"hello\""), "{text}");
+        assert!(text.contains("event: message_stop"), "{text}");
+    }
+
+    #[test]
+    fn finish_flushes_a_final_event_with_no_trailing_blank_line() {
+        // A connection can close right after the final `data:` line with no
+        // terminating blank line — that leftover event (often the one
+        // carrying the finish reason) is still complete and parseable, and
+        // must not be silently dropped by `finish`.
+        let unterminated = text_chunk("hi", Some("stop"));
+        let unterminated = unterminated.strip_suffix("\n\n").unwrap();
+        let mut converter = ChatToAnthropic::new("m".to_string());
+        let mut out = converter.push(unterminated.as_bytes());
+        assert!(
+            !String::from_utf8_lossy(&out).contains("content_block_delta"),
+            "an event with no separator yet must not be handled early"
+        );
+        out.extend(converter.finish());
+
+        let events = frames(&out);
+        assert_eq!(
+            names(&out),
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        // "hi" only appears if the unterminated event was actually run
+        // through `handle_event` by `finish` — dropped, the stream would
+        // still be well-formed (`emit_terminal` alone produces a valid
+        // empty sequence) but silently missing the content.
+        assert_eq!(events[2].1["delta"]["text"], "hi");
     }
 
     #[test]
@@ -1490,7 +1597,11 @@ mod tests {
             .iter()
             .find(|(name, _)| name == "message_delta")
             .unwrap();
-        assert_eq!(delta["usage"]["input_tokens"], 41);
+        // #24: `prompt_tokens` (41) includes `cached_tokens` (12); Anthropic's
+        // `input_tokens` excludes it, so the client-facing value is the
+        // non-cached remainder (29), not 41 — otherwise a client that sums
+        // `input_tokens + cache_read_input_tokens` double-counts the cache.
+        assert_eq!(delta["usage"]["input_tokens"], 29);
         assert_eq!(delta["usage"]["output_tokens"], 7);
         assert_eq!(delta["usage"]["cache_read_input_tokens"], 12);
     }
@@ -1644,6 +1755,38 @@ mod tests {
 
         let text = String::from_utf8(out).unwrap();
         assert!(!text.contains("[DONE]"), "{text}");
+        assert!(text.contains("event: response.completed"), "{text}");
+    }
+
+    #[test]
+    fn crlf_framed_events_are_converted_same_as_lf_for_responses() {
+        // Same fix as `crlf_framed_events_are_converted_same_as_lf`, applied
+        // to the Responses converter — the drain loop is byte-for-byte the
+        // same code, so it had the same bug.
+        let crlf = text_chunk("hello", Some("stop")).replace('\n', "\r\n");
+        let mut converter = ChatToResponses::new("m".to_string());
+        let mut out = converter.push(crlf.as_bytes());
+        out.extend(converter.finish());
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"delta\":\"hello\""), "{text}");
+        assert!(text.contains("event: response.completed"), "{text}");
+    }
+
+    #[test]
+    fn finish_flushes_a_final_event_with_no_trailing_blank_line_for_responses() {
+        let unterminated = text_chunk("hi", Some("stop"));
+        let unterminated = unterminated.strip_suffix("\n\n").unwrap();
+        let mut converter = ChatToResponses::new("m".to_string());
+        let mut out = converter.push(unterminated.as_bytes());
+        assert!(
+            !String::from_utf8_lossy(&out).contains("output_text.delta"),
+            "an event with no separator yet must not be handled early"
+        );
+        out.extend(converter.finish());
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"delta\":\"hi\""), "{text}");
         assert!(text.contains("event: response.completed"), "{text}");
     }
 
