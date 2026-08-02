@@ -546,6 +546,50 @@ mod tests {
     }
 
     #[test]
+    fn find_event_boundary_finds_a_plain_lf_separator() {
+        assert_eq!(find_event_boundary(b"data: a\n\ndata: b"), Some((7, 2)));
+    }
+
+    #[test]
+    fn find_event_boundary_finds_a_crlf_separator() {
+        assert_eq!(find_event_boundary(b"data: a\r\n\r\ndata: b"), Some((7, 4)));
+    }
+
+    #[test]
+    fn find_event_boundary_prefers_whichever_separator_comes_first() {
+        // A CRLF-framed event followed by an LF-framed one: the LF pair
+        // inside `\r\n\r\n` must not be mistaken for its own, earlier
+        // boundary — `\r\n\r\n` contains no bare `\n\n` (the two `\n`s are
+        // each preceded by `\r`), so the CRLF boundary at position 7 is the
+        // only one found, and it must win despite starting the search for
+        // both patterns at position 0.
+        let buffer = b"data: a\r\n\r\ndata: b\n\n";
+        assert_eq!(find_event_boundary(buffer), Some((7, 4)));
+
+        // Once the CRLF event is drained, the LF boundary in what remains is
+        // the only one left.
+        let rest = &buffer[11..];
+        assert_eq!(find_event_boundary(rest), Some((7, 2)));
+    }
+
+    #[test]
+    fn find_event_boundary_is_none_without_a_blank_line() {
+        assert_eq!(find_event_boundary(b"data: still one event\r\nmore"), None);
+    }
+
+    #[test]
+    fn find_event_boundary_finds_a_separator_split_across_two_pushes() {
+        // `push` only searches the buffer it is holding at call time; a
+        // separator whose bytes were fed across two `push` calls does not
+        // exist as a contiguous slice until both halves have arrived. This
+        // mirrors that: search the concatenation, not each half separately.
+        let mut buffer = b"data: a\r\n".to_vec();
+        assert_eq!(find_event_boundary(&buffer), None);
+        buffer.extend_from_slice(b"\r\ndata: b");
+        assert_eq!(find_event_boundary(&buffer), Some((7, 4)));
+    }
+
+    #[test]
     fn crlf_framed_sse_events_are_parsed() {
         // Some upstreams (and the proxies in front of them) frame SSE with
         // `\r\n` line endings, so the event separator is `\r\n\r\n` rather
