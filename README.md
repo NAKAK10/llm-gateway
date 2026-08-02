@@ -528,9 +528,15 @@ never need it, but you can hand-edit it for per-client launcher tweaks:
 launch: {
   claude:   { extraArgs: [] },
   codex:    { wireApi: "responses", extraArgs: [] },
-  opencode: { models: [], overrideProviders: ["openai", "anthropic"], extraArgs: [] },
+  opencode: { models: [], overrideProviders: ["openai", "anthropic", "openrouter", "groq", "mistral", "deepseek", "xai", "togetherai"], extraArgs: [] },
 }
 ```
+
+That is the default `overrideProviders` list, shown explicitly. `google`,
+`github-copilot` and `ollama` are opencode built-ins too, but adding them
+here would not help — see [opencode manual setup](docs/clients/opencode.md)
+for why each is excluded, and which providers can send fields the upstream
+may reject with a 400 even once redirected.
 
 | field | notes |
 |---|---|
