@@ -69,6 +69,15 @@ pub struct AppState {
     /// feature; see the warning `serve` logs in that case.
     #[cfg(feature = "semantic")]
     pub classifier: Option<Arc<crate::semantic::index::Classifier>>,
+    /// The vector map's fitted [`ui::pca::Basis`], reused across requests
+    /// for as long as `config`'s generation does not move — see
+    /// [`ui::pca::BasisCache`]'s doc comment for why a request-scoped refit
+    /// (#27) is wasted work. Always present under the `semantic` feature,
+    /// independent of `live`/`ui_token`: it costs nothing empty, and keeping
+    /// it unconditional avoids a second `Option` for `routes_vectors` and
+    /// `project_point` to unwrap.
+    #[cfg(feature = "semantic")]
+    pub basis_cache: Arc<ui::pca::BasisCache>,
     /// `Some` only when `serve --ui` (or `config.ui.enabled`) is on — see
     /// [`router`], which merges the dashboard's routes into the main router
     /// exactly when this is `Some`. Every place a live event gets published
@@ -143,6 +152,8 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         inbound_key,
         #[cfg(feature = "semantic")]
         classifier,
+        #[cfg(feature = "semantic")]
+        basis_cache: Arc::new(ui::pca::BasisCache::new()),
         live,
         ui_token,
     };

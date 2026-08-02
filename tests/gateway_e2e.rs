@@ -264,6 +264,8 @@ async fn spawn_gateway(config: Config, inbound_key: Option<&str>) -> SocketAddr 
         inbound_key: inbound_key.map(String::from),
         #[cfg(feature = "semantic")]
         classifier: None,
+        #[cfg(feature = "semantic")]
+        basis_cache: std::sync::Arc::new(llm_gateway::server::ui::pca::BasisCache::new()),
         live: None,
         ui_token: None,
     };
@@ -298,6 +300,8 @@ async fn spawn_gateway_recording_usage(config: Config) -> (SocketAddr, std::path
         inbound_key: None,
         #[cfg(feature = "semantic")]
         classifier: None,
+        #[cfg(feature = "semantic")]
+        basis_cache: std::sync::Arc::new(llm_gateway::server::ui::pca::BasisCache::new()),
         live: None,
         ui_token: None,
     };
@@ -339,6 +343,8 @@ async fn spawn_gateway_with_live(
         inbound_key: inbound_key.map(String::from),
         #[cfg(feature = "semantic")]
         classifier: None,
+        #[cfg(feature = "semantic")]
+        basis_cache: std::sync::Arc::new(llm_gateway::server::ui::pca::BasisCache::new()),
         live: Some(live.clone()),
         ui_token: Some(ui_token.clone()),
     };
