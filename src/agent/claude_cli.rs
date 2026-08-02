@@ -372,7 +372,12 @@ impl CliToAnthropic {
                     .and_then(|r| r.as_str())
                     .unwrap_or("claude CLI reported an error")
                     .to_string();
-                self.error(out, &message);
+                // A run can fail after already billing real tokens (a usage
+                // limit hit mid-generation, for instance) — this `usage`, if
+                // present, is the only place those counts are ever reported.
+                // See `error`'s doc comment for where it goes.
+                let usage = event.get("usage").filter(|u| u.is_object()).cloned();
+                self.error(out, &message, usage.as_ref());
             }
             // A successful run. The assistant event's usage seen so far (now
             // sitting in `pending_delta`) is a mid-run snapshot — it reported
@@ -441,9 +446,41 @@ impl CliToAnthropic {
     }
 
     /// Emit an Anthropic `error` frame and stop.
-    pub fn error(&mut self, out: &mut Vec<u8>, message: &str) {
+    ///
+    /// No `message_stop` follows: Anthropic's own streams treat `error` as
+    /// terminal in its own right, and `ChatToAnthropic`'s error path in
+    /// `translate/stream.rs` already made that same call for the same
+    /// reason — a mid-stream `error` closes the stream by itself, so adding
+    /// a `message_stop` after it would not be completing the contract, it
+    /// would be inventing an event Anthropic's own API never sends there.
+    ///
+    /// `usage` still has to go out, though, and that part *is* this
+    /// converter's own problem to solve, unlike the openai-chat translator:
+    /// that one's accounting reads the *upstream* bytes directly
+    /// (`usage::parse`), but claude-cli's usage is read from *this
+    /// converter's own* SSE output by the `tee` in `src/server/proxy.rs`. A
+    /// `usage` that arrived only on an errored `result` line therefore has
+    /// nowhere else to land. It is folded into whatever `message_delta` is
+    /// already pending (or a fresh one, if the run never streamed one at
+    /// all) and flushed immediately before the `error` frame — so a client
+    /// that already received content still gets a coherent final delta
+    /// instead of being cut off mid-message, and the token count is not
+    /// silently dropped on the floor.
+    pub fn error(&mut self, out: &mut Vec<u8>, message: &str, usage: Option<&Value>) {
         if self.finished {
             return;
+        }
+        if usage.is_some() || self.pending_delta.is_some() {
+            let mut delta = self.pending_delta.take().unwrap_or_else(|| {
+                serde_json::json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": Value::Null, "stop_sequence": Value::Null },
+                })
+            });
+            if let Some(usage) = usage {
+                delta["usage"] = usage.clone();
+            }
+            emit(out, "message_delta", &delta);
         }
         emit(
             out,
@@ -1070,6 +1107,98 @@ mod tests {
             .unwrap()
             .contains("usage limit reached"));
         // Terminal: nothing may follow it.
+        assert!(converter.finish().is_empty());
+    }
+
+    #[test]
+    fn an_errored_results_usage_still_reaches_the_downstream_scanner() {
+        // Issue #19: a run can fail after already billing real tokens (a
+        // usage-limit hit mid-generation), and this converter's own SSE
+        // output is what `crate::usage::parse::SseUsageScanner` reads —
+        // there is no other path for that usage to be recorded. It must
+        // land on a `message_delta`, the only event the scanner reads usage
+        // from besides `message_start`.
+        let mut converter = CliToAnthropic::new("sonnet".into());
+        let out = converter.push(
+            b"{\"type\":\"result\",\"is_error\":true,\"result\":\"usage limit reached\",\
+              \"usage\":{\"input_tokens\":11,\"output_tokens\":22}}\n",
+        );
+        assert_eq!(names(&out), vec!["message_delta", "error"]);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"input_tokens\":11"), "{text}");
+        assert!(text.contains("\"output_tokens\":22"), "{text}");
+        assert!(text.contains("usage limit reached"), "{text}");
+
+        let mut scanner =
+            crate::usage::parse::SseUsageScanner::new(crate::config::ApiKind::AnthropicMessages);
+        scanner.push(text.as_bytes());
+        let usage = scanner.finish();
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 22);
+    }
+
+    #[test]
+    fn a_client_that_already_received_content_is_not_left_hanging_on_error() {
+        // Once content has streamed, the client is mid-message. `error` is
+        // still the last frame it gets — no `message_stop` follows, matching
+        // both Anthropic's own contract (an `error` event is itself
+        // terminal) and `ChatToAnthropic`'s error path in
+        // `translate/stream.rs` — but the pending `message_delta` snapshot
+        // is flushed first rather than silently dropped, so the client's
+        // last view of the turn is coherent instead of truncated with no
+        // explanation of where the content it already has stands.
+        let mut converter = CliToAnthropic::new("sonnet".into());
+        let mut out = converter.push(
+            stream_event(json!({
+                "type": "message_start",
+                "message": {"id": "msg_1", "content": []},
+            }))
+            .as_bytes(),
+        );
+        out.extend(
+            converter.push(
+                stream_event(json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "partial answer"},
+                }))
+                .as_bytes(),
+            ),
+        );
+        out.extend(
+            converter.push(
+                stream_event(json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 3},
+                }))
+                .as_bytes(),
+            ),
+        );
+        // No `message_stop` stream event this time — the run fails before
+        // one is ever sent.
+        out.extend(
+            converter.push(
+                b"{\"type\":\"result\",\"is_error\":true,\"result\":\"usage limit reached\"}\n",
+            ),
+        );
+
+        assert_eq!(
+            names(&out),
+            vec![
+                "message_start",
+                "content_block_delta",
+                "message_delta",
+                "error"
+            ]
+        );
+        let text = String::from_utf8(out).unwrap();
+        // The delta held from the stream (its own usage snapshot) is what
+        // gets flushed, since the errored `result` here carries none of its
+        // own to override it with.
+        assert!(text.contains("\"output_tokens\":3"), "{text}");
+        assert!(converter.is_finished());
+        // Idempotent: `finish()` after an error adds nothing more.
         assert!(converter.finish().is_empty());
     }
 
