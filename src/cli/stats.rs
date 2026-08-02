@@ -17,7 +17,6 @@ use clap::ValueEnum;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::paths;
-use crate::record::retention;
 use crate::record::usage_log::UsageRecord;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -101,14 +100,16 @@ pub fn run(options: Options) -> Result<()> {
         .map(|c| paths::logs_dir(&c.logging.dir))
         .unwrap_or_else(|| PathBuf::from("./logs"));
 
-    // Shed anything past the retention window before reading, so `stats`
-    // doubles as the everyday trigger for cleanup on machines that don't run
-    // `serve` continuously. Best-effort and non-destructive under
-    // concurrency: see `retention::prune_usage_file`.
-    if let Err(err) = retention::prune(&logs_dir) {
-        eprintln!("warning: failed to prune old logs: {err}");
-    }
-
+    // `stats` used to prune here too, but that made it a second writer to
+    // `usage-*.jsonl` racing `serve`'s own append/prune task (#20) — the
+    // length check in `retention::commit_usage_prune` narrowed that race's
+    // window but could not close it, since `stats` and `serve` are separate
+    // processes with no lock between them. `stats` is now read-only:
+    // `serve`'s `Recorder` prunes on startup and once a day (see
+    // `record::mod`), which is the only writer of `usage-*.jsonl`, so there
+    // is nothing left to race. A machine that only ever runs `stats` (never
+    // `serve`) simply keeps its logs unpruned — acceptable, since retention
+    // exists to bound a long-running server's disk use, not a CLI's.
     let (records, skipped) = read_usage_records(&logs_dir);
 
     if skipped > 0 {
@@ -782,5 +783,54 @@ mod tests {
         assert_eq!(rows[0].in_tok, 10);
         assert_eq!(rows[0].cache_read_tok, 0);
         assert_eq!(rows[0].cache_write_tok, 0);
+    }
+
+    /// Serializes tests below that point `LLM_GATEWAY_CONFIG_DIR` at a temp
+    /// directory — the env var is process-global, so two such tests running
+    /// on different threads (the default under `cargo test`) could otherwise
+    /// see each other's config dir.
+    static CONFIG_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// #20/#15: `stats` used to prune `usage-*.jsonl` on every run, racing
+    /// `serve`'s own append across process boundaries with no lock between
+    /// them. It must now only read — a fully-stale usage file (every line
+    /// past retention) must come back from `run()` exactly as it went in.
+    #[test]
+    fn stats_run_does_not_prune_the_usage_log_it_reads() {
+        let _guard = CONFIG_DIR_ENV_LOCK.lock().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        // `Config::read` (unlike `load_from`) does not validate, and every
+        // field defaults — an empty object is a complete, if minimal,
+        // config.json.
+        std::fs::write(config_dir.path().join("config.json"), "{}").unwrap();
+
+        let logs_dir = config_dir.path().join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let usage_path = logs_dir.join("usage-2020-01.jsonl");
+        let stale_line = r#"{"ts":"2020-01-01T00:00:00Z","client":"c","route":"r","provider":"p","model":"m","attempt":1,"in_tok":1,"out_tok":1,"cache_read_tok":0,"cache_write_tok":0,"dur_ms":1,"status":"success","stream":false}"#;
+        std::fs::write(&usage_path, format!("{stale_line}\n")).unwrap();
+
+        // SAFETY: `set_var`/`remove_var` are only unsound under concurrent
+        // access from another thread; `CONFIG_DIR_ENV_LOCK` above rules that
+        // out for every test that touches this variable.
+        unsafe {
+            std::env::set_var(crate::paths::CONFIG_DIR_ENV, config_dir.path());
+        }
+        let result = run(Options {
+            by: GroupBy::Route,
+            since: None,
+            until: None,
+            all: true,
+        });
+        unsafe {
+            std::env::remove_var(crate::paths::CONFIG_DIR_ENV);
+        }
+        result.unwrap();
+
+        // If `run()` still pruned, this decades-old line would have been
+        // stripped (the file emptied, per the `Deleted` outcome) — it must
+        // survive untouched.
+        let contents = std::fs::read_to_string(&usage_path).unwrap();
+        assert_eq!(contents, format!("{stale_line}\n"));
     }
 }

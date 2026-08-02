@@ -284,4 +284,92 @@ mod tests {
         ));
         assert!(!path.exists());
     }
+
+    fn usage_record(ts: String, in_tok: u64) -> usage_log::UsageRecord {
+        usage_log::UsageRecord {
+            ts,
+            client: "claude-code".to_string(),
+            route: "claude-*".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            attempt: 1,
+            in_tok,
+            out_tok: 1,
+            cache_read_tok: 0,
+            cache_write_tok: 0,
+            usage_missing: false,
+            dur_ms: 1,
+            status: "success".to_string(),
+            stream: false,
+            error: None,
+        }
+    }
+
+    /// #20: `stats` used to run its own `retention::prune`, a second writer
+    /// racing `serve`'s appends across process boundaries. The fix routes
+    /// `serve`'s startup prune through the very same channel/task as every
+    /// `usage()` append (see the comment on `Entry::Prune` above) — this
+    /// proves that wiring actually holds, by queuing appends immediately
+    /// after `Recorder::start` (before the startup `Entry::Prune`, sent by a
+    /// separate task, is guaranteed to have reached the writer) and checking
+    /// none of them are lost to it. If the startup prune instead ran
+    /// independently — a plain `tokio::spawn(retention::prune(...))`, say —
+    /// its read-modify-write could race one of these appends and silently
+    /// drop it, exactly the bug #20 describes.
+    #[tokio::test]
+    async fn startup_prune_is_serialized_with_appends_through_the_same_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let mode = RecordMode {
+            usage: true,
+            debug: false,
+            debug_full: false,
+        };
+
+        let now = time::OffsetDateTime::now_utc();
+        let path = dir
+            .path()
+            .join(usage_log::file_name(now.year(), now.month() as u8));
+
+        // A stale line for the startup prune to actually have work to do —
+        // otherwise a no-op prune would pass this test for the wrong reason.
+        let stale = usage_record("2000-01-01T00:00:00Z".to_string(), 999);
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&stale).unwrap()),
+        )
+        .unwrap();
+
+        let recorder = Recorder::start(dir.path().to_path_buf(), mode).unwrap();
+
+        const APPENDS: usize = 20;
+        let ts = now
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        for i in 0..APPENDS {
+            recorder.usage(usage_record(ts.clone(), i as u64));
+        }
+
+        // Poll until the writer task has drained the startup prune and every
+        // append queued above.
+        let mut contents = String::new();
+        for _ in 0..200 {
+            if let Ok(c) = std::fs::read_to_string(&path) {
+                if c.lines().count() >= APPENDS {
+                    contents = c;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            contents.lines().count(),
+            APPENDS,
+            "an append was lost to the startup prune instead of being serialized after it"
+        );
+        assert!(
+            !contents.contains("2000-01-01"),
+            "the startup prune did not remove the stale line"
+        );
+    }
 }
