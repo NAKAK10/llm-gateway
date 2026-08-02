@@ -1133,8 +1133,8 @@ mod tests {
             crate::usage::parse::SseUsageScanner::new(crate::config::ApiKind::AnthropicMessages);
         scanner.push(text.as_bytes());
         let usage = scanner.finish();
-        assert_eq!(usage.input_tokens, 11);
-        assert_eq!(usage.output_tokens, 22);
+        assert_eq!(usage.input_tokens, Some(11));
+        assert_eq!(usage.output_tokens, Some(22));
     }
 
     #[test]

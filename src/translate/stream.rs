@@ -144,6 +144,17 @@ impl ChatUsage {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
     }
+
+    /// `prompt` with the cached portion subtracted out — what Anthropic's
+    /// `input_tokens` means (exclusive of `cache_read_input_tokens`), unlike
+    /// `prompt_tokens`, which already includes it. Only `ChatToAnthropic`
+    /// needs this: the Responses converter reports `self.prompt` verbatim
+    /// alongside `input_tokens_details.cached_tokens`, OpenAI's own
+    /// (inclusive) nested convention, which is already internally
+    /// consistent — see #24.
+    fn non_cached_prompt(&self) -> u64 {
+        self.prompt.saturating_sub(self.cached)
+    }
 }
 
 /// Incremental converter from an OpenAI Chat SSE stream to an Anthropic
@@ -346,7 +357,7 @@ impl ChatToAnthropic {
                     // prompt tokens only in its final usage chunk. Corrected in
                     // `message_delta`, which current Anthropic streams also use
                     // to restate the full usage.
-                    "usage": { "input_tokens": self.usage.prompt, "output_tokens": 0 },
+                    "usage": { "input_tokens": self.usage.non_cached_prompt(), "output_tokens": 0 },
                 },
             }),
         );
@@ -543,7 +554,11 @@ impl ChatToAnthropic {
                 "type": "message_delta",
                 "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
                 "usage": {
-                    "input_tokens": self.usage.prompt,
+                    // `self.usage.prompt` includes `cached`, but Anthropic's
+                    // `input_tokens`/`cache_read_input_tokens` are exclusive
+                    // — reporting it verbatim would double-count the cached
+                    // portion for a client that sums the two (#24).
+                    "input_tokens": self.usage.non_cached_prompt(),
                     "output_tokens": self.usage.completion,
                     "cache_read_input_tokens": self.usage.cached,
                     "cache_creation_input_tokens": 0,
@@ -1582,7 +1597,11 @@ mod tests {
             .iter()
             .find(|(name, _)| name == "message_delta")
             .unwrap();
-        assert_eq!(delta["usage"]["input_tokens"], 41);
+        // #24: `prompt_tokens` (41) includes `cached_tokens` (12); Anthropic's
+        // `input_tokens` excludes it, so the client-facing value is the
+        // non-cached remainder (29), not 41 — otherwise a client that sums
+        // `input_tokens + cache_read_input_tokens` double-counts the cache.
+        assert_eq!(delta["usage"]["input_tokens"], 29);
         assert_eq!(delta["usage"]["output_tokens"], 7);
         assert_eq!(delta["usage"]["cache_read_input_tokens"], 12);
     }

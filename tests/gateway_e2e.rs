@@ -34,6 +34,17 @@ const CHAT_SSE_BODY: &str = concat!(
     "data: [DONE]\n\n",
 );
 
+/// Same shape as `CHAT_SSE_BODY`, but with no usage chunk at all — what an
+/// `openai-chat` upstream that never got `stream_options.include_usage`
+/// sends, matching a provider configured with `injectUsage: false` (#22).
+const CHAT_SSE_BODY_NO_USAGE: &str = concat!(
+    r#"data: {"id":"chatcmpl-e2e","model":"qwen3.5","choices":[{"index":0,"delta":{"role":"assistant","content":"日本語"}}]}"#,
+    "\n\n",
+    r#"data: {"id":"chatcmpl-e2e","choices":[{"index":0,"delta":{"content":"テスト"},"finish_reason":"stop"}]}"#,
+    "\n\n",
+    "data: [DONE]\n\n",
+);
+
 #[derive(Clone, Default)]
 struct MockState {
     /// Bodies the mock upstream received, so tests can assert on the rewrite.
@@ -112,6 +123,9 @@ async fn spawn_anthropic_mock() -> (SocketAddr, MockState) {
 #[derive(Clone, Copy)]
 enum ChatMockMode {
     Sse,
+    /// Streams with no usage chunk at all — an upstream that never got (or
+    /// never honors) `stream_options.include_usage` (#22).
+    SseNoUsage,
     Json,
     RateLimited,
 }
@@ -129,6 +143,14 @@ async fn mock_openai_chat(State(state): State<ChatMockState>, body: axum::body::
     match state.mode {
         ChatMockMode::Sse => {
             let mut response = Response::new(Body::from(CHAT_SSE_BODY));
+            response.headers_mut().insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/event-stream"),
+            );
+            response
+        }
+        ChatMockMode::SseNoUsage => {
+            let mut response = Response::new(Body::from(CHAT_SSE_BODY_NO_USAGE));
             response.headers_mut().insert(
                 http::header::CONTENT_TYPE,
                 http::HeaderValue::from_static("text/event-stream"),
@@ -205,6 +227,15 @@ fn provider(base: &str, api: ApiKind) -> ProviderConfig {
     }
 }
 
+/// Same as [`provider`], but with `injectUsage: false` — for #22's
+/// "no usage expected" configuration.
+fn provider_without_inject_usage(base: &str, api: ApiKind) -> ProviderConfig {
+    ProviderConfig {
+        inject_usage: false,
+        ..provider(base, api)
+    }
+}
+
 fn route_to(default: &str, fallbacks: &[&str]) -> RouteConfig {
     RouteConfig {
         model: ModelConfig {
@@ -243,6 +274,40 @@ async fn spawn_gateway(config: Config, inbound_key: Option<&str>) -> SocketAddr 
     // The tempdir must outlive the server; leak it for the test's lifetime.
     std::mem::forget(dir);
     addr
+}
+
+/// Same as [`spawn_gateway`], but with `usage-*.jsonl` recording on and the
+/// logs directory returned, so a test can read back what `usage_missing`
+/// ended up as (#22).
+async fn spawn_gateway_recording_usage(config: Config) -> (SocketAddr, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let logs_dir = dir.path().to_path_buf();
+    let recorder = Recorder::start(
+        logs_dir.clone(),
+        RecordMode {
+            usage: true,
+            debug: false,
+            debug_full: false,
+        },
+    )
+    .unwrap();
+    let state = AppState {
+        config: SharedConfig::from_config(config, dir.path().join("config.json")),
+        http: reqwest::Client::new(),
+        recorder,
+        inbound_key: None,
+        #[cfg(feature = "semantic")]
+        classifier: None,
+        live: None,
+        ui_token: None,
+    };
+    let app = router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    // The tempdir must outlive the server; leak it for the test's lifetime.
+    std::mem::forget(dir);
+    (addr, logs_dir)
 }
 
 /// Same as [`spawn_gateway`], but with `serve --ui`'s dashboard on — for
@@ -1099,4 +1164,101 @@ async fn requests_still_succeed_with_the_dashboard_off() {
         .unwrap();
 
     assert_eq!(response.status(), 200);
+}
+
+/// Reads back the one `usage-*.jsonl` line the recorder wrote under `dir`,
+/// polling briefly since the write lands on a background task (see
+/// `record::Recorder`).
+async fn read_usage_record(dir: &std::path::Path) -> llm_gateway::record::usage_log::UsageRecord {
+    let now = time::OffsetDateTime::now_utc();
+    let path = dir.join(llm_gateway::record::usage_log::file_name(
+        now.year(),
+        now.month() as u8,
+    ));
+    let mut contents = String::new();
+    for _ in 0..100 {
+        if let Ok(c) = std::fs::read_to_string(&path) {
+            if !c.is_empty() {
+                contents = c;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let line = contents.lines().next().expect("usage record was written");
+    serde_json::from_str(line).unwrap()
+}
+
+/// #22: a provider configured with `injectUsage: false`, given a client that
+/// never asked for `stream_options` itself, never gets a `usage` object back
+/// from an `openai-chat` stream — that is the expected shape of this
+/// configuration, not a failed extraction, so `usage_missing` must stay
+/// `false` for it.
+#[tokio::test]
+async fn inject_usage_false_with_no_client_stream_options_does_not_mark_usage_missing() {
+    let (upstream, _mock) = spawn_chat_mock(ChatMockMode::SseNoUsage).await;
+    let mut config = Config::default();
+    config.providers.insert(
+        "chat-mock".into(),
+        provider_without_inject_usage(&format!("http://{upstream}/v1"), ApiKind::OpenaiChat),
+    );
+    config.routes.insert(
+        llm_gateway::config::DEFAULT_ROUTE.into(),
+        route_to("chat-mock/qwen3.5", &[]),
+    );
+    let (addr, logs_dir) = spawn_gateway_recording_usage(config).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "default",
+            "max_tokens": 1024,
+            "stream": true,
+            "messages": [{"role": "user", "content": "ping"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+
+    let record = read_usage_record(&logs_dir).await;
+    assert_eq!(record.status, "success");
+    assert!(
+        !record.usage_missing,
+        "a provider with injectUsage: false and no client stream_options is expected to have no usage"
+    );
+}
+
+/// Same shape as above, but with `injectUsage: true` (the default) — the
+/// upstream mock still never sends usage (simulating a genuinely broken
+/// upstream), and this time that really is an extraction failure:
+/// `usage_missing` must still fire, so #22's fix only silences the case it
+/// was meant to.
+#[tokio::test]
+async fn inject_usage_true_with_missing_upstream_usage_still_marks_usage_missing() {
+    let (upstream, _mock) = spawn_chat_mock(ChatMockMode::SseNoUsage).await;
+    let config = translated_config(upstream);
+    let (addr, logs_dir) = spawn_gateway_recording_usage(config).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "default",
+            "max_tokens": 1024,
+            "stream": true,
+            "messages": [{"role": "user", "content": "ping"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+
+    let record = read_usage_record(&logs_dir).await;
+    assert_eq!(record.status, "success");
+    assert!(
+        record.usage_missing,
+        "injectUsage: true still expects usage, so a stream with none is a real extraction failure"
+    );
 }

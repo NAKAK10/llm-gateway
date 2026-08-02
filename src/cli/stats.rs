@@ -87,10 +87,21 @@ pub fn run(options: Options) -> Result<()> {
 
     // `stats` displays and filters by calendar day in local time — records
     // are stamped in UTC, so without this a JST evening (or any zone ahead
-    // of UTC) shows up as "yesterday". `current_local_offset` is safe to
-    // call here: `stats` is a single-threaded CLI invocation that has not
-    // spawned any threads yet.
-    let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    // of UTC) shows up as "yesterday". `current_local_offset` can still
+    // return `Err(IndeterminateOffset)` on its own terms (no `TZ` and no
+    // `/etc/localtime` to read, for instance) — as of `time` 0.3.54 that is
+    // not a thread-count restriction (`localtime_r` carries no
+    // single-threaded-caller requirement in this version), just an ordinary
+    // "could not figure out the local zone on this system" failure, so it
+    // must be handled the same way any other fallible lookup here would be:
+    // reported, not silently swallowed. Falling back to UTC without saying
+    // so would silently reintroduce the day-boundary bug #14 fixed.
+    let offset = time::UtcOffset::current_local_offset().unwrap_or_else(|_| {
+        eprintln!(
+            "could not determine the local timezone; showing dates and filtering `--since`/`--until` in UTC"
+        );
+        time::UtcOffset::UTC
+    });
 
     // `Config::load()` also validates, and a broken config should not stop
     // `stats` from reading logs that already exist — fall back to the
