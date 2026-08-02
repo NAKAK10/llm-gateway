@@ -530,7 +530,20 @@ pub async fn proxy(
     // Usage is observed on the *upstream* bytes, in the upstream's protocol,
     // before any translation — which is what keeps token accounting correct on
     // a translated route (`usage::parse` never sees a rebuilt body).
-    let observed = tee::observe(accepted.body, accepted.api, streaming, report);
+    //
+    // `count_tokens` responses never carry a `usage` object at all, so
+    // `expect_usage` is `!count_tokens` here — same gate as `record_usage`
+    // above. Routing count_tokens through `observe` at all (rather than
+    // bypassing it) keeps this the one place that understands both the
+    // streaming and buffered body shapes, and keeps every endpoint observed
+    // on the same upstream-bytes-below-translation path.
+    let observed = tee::observe(
+        accepted.body,
+        accepted.api,
+        streaming,
+        !count_tokens,
+        report,
+    );
 
     match translation {
         // The passthrough path: nothing at all between the upstream stream and

@@ -103,6 +103,12 @@ struct ObserveStream {
     scan: Option<Scan>,
     report: Option<ReportFn>,
     outcome: StreamOutcome,
+    /// Whether a completed response is even supposed to carry usage. Set to
+    /// `false` for endpoints like `/v1/messages/count_tokens`, whose
+    /// responses never contain a `usage` object — without this, every such
+    /// request would trip the "usage could not be extracted" warning below,
+    /// even though nothing went wrong.
+    expect_usage: bool,
 }
 
 impl Stream for ObserveStream {
@@ -146,8 +152,12 @@ impl Drop for ObserveStream {
             // is not a quiet zero — it means extraction failed somewhere (a
             // parse error, a buffer overflow, a provider that never sent
             // usage), and `stats` has no way to tell that apart from a
-            // genuine 0-token response unless this is logged.
-            if self.outcome == StreamOutcome::Complete && usage.is_empty() {
+            // genuine 0-token response unless this is logged. That signal
+            // only means something when the response was ever expected to
+            // carry usage in the first place — `count_tokens` responses
+            // never do, so `expect_usage` is what keeps that normal case
+            // from looking like a failure.
+            if self.expect_usage && self.outcome == StreamOutcome::Complete && usage.is_empty() {
                 tracing::warn!("usage could not be extracted from a completed response");
             }
             report(usage, self.outcome);
@@ -157,10 +167,20 @@ impl Drop for ObserveStream {
 
 /// Wrap a byte stream so its usage is scanned and reported, passing every chunk
 /// through untouched.
+///
+/// `expect_usage` says whether a clean `Complete` outcome with empty `Usage`
+/// is a bug worth logging. It is `false` for endpoints such as
+/// `/v1/messages/count_tokens`, which never return a `usage` object at all —
+/// forwarding those through the same scanning path as everything else (rather
+/// than bypassing `observe` for them) keeps this one function the single
+/// place that understands both streaming and buffered bodies, and keeps the
+/// "observe upstream bytes below translation" invariant intact for every
+/// endpoint uniformly.
 pub fn observe<S>(
     inner: S,
     api: ApiKind,
     streaming: bool,
+    expect_usage: bool,
     report: ReportFn,
 ) -> impl Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send
 where
@@ -182,6 +202,7 @@ where
         // Overwritten by `poll_next` on clean end or upstream error; if the
         // stream is dropped before either happens, this is what gets reported.
         outcome: StreamOutcome::Aborted,
+        expect_usage,
     }
 }
 
@@ -220,7 +241,7 @@ data: {"type":"message_delta","usage":{"output_tokens":20}}
 
         let source = futures_util::stream::iter(input.clone().into_iter().map(Ok));
         let (report, slot) = collect_report();
-        let observed = observe(source, ApiKind::AnthropicMessages, true, report);
+        let observed = observe(source, ApiKind::AnthropicMessages, true, true, report);
 
         let out: Vec<Bytes> = observed.map(|r| r.unwrap()).collect().await;
         let actual: Vec<u8> = out.iter().flat_map(|b| b.to_vec()).collect();
@@ -245,7 +266,7 @@ data: {"type":"message_delta","usage":{"output_tokens":20}}
         let input = vec![Bytes::from(body)];
         let source = futures_util::stream::iter(input.into_iter().map(Ok));
         let (report, slot) = collect_report();
-        let observed = observe(source, ApiKind::OpenaiChat, false, report);
+        let observed = observe(source, ApiKind::OpenaiChat, false, true, report);
 
         let out: Vec<Bytes> = observed.map(|r| r.unwrap()).collect().await;
         assert_eq!(out.len(), 1);
@@ -262,7 +283,7 @@ data: {"type":"message_delta","usage":{"output_tokens":20}}
         let input = vec![Bytes::from_static(b"data: incomplete-event")];
         let source = futures_util::stream::iter(input.into_iter().map(Ok));
         let (report, slot) = collect_report();
-        let observed = observe(source, ApiKind::AnthropicMessages, true, report);
+        let observed = observe(source, ApiKind::AnthropicMessages, true, true, report);
 
         // Never poll it to completion — just drop it, as a cancelled handler
         // future would.
@@ -284,12 +305,63 @@ data: {"type":"message_delta","usage":{"output_tokens":20}}
         })
         .map(Err);
         let (report, slot) = collect_report();
-        let observed = observe(err_stream, ApiKind::AnthropicMessages, true, report);
+        let observed = observe(err_stream, ApiKind::AnthropicMessages, true, true, report);
         let out: Vec<_> = observed.collect().await;
         assert_eq!(out.len(), 1);
         assert!(out[0].is_err());
 
         let (_, outcome) = slot.lock().unwrap().take().expect("report was called");
         assert_eq!(outcome, StreamOutcome::UpstreamError);
+    }
+
+    /// Counts WARN-level events, so a test can assert that none fired without
+    /// pulling in a separate tracing-capture crate.
+    struct CountWarns(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl tracing::Subscriber for CountWarns {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn expect_usage_false_suppresses_the_missing_usage_warning() {
+        // `/v1/messages/count_tokens` responses never carry a `usage` object,
+        // so `observe` is told not to expect one. Without that, this would be
+        // indistinguishable from a completed response whose usage extraction
+        // genuinely failed, and would spuriously warn on every count_tokens
+        // call.
+        let body = r#"{"input_tokens":3}"#;
+        let input = vec![Bytes::from(body)];
+        let source = futures_util::stream::iter(input.into_iter().map(Ok));
+        let (report, slot) = collect_report();
+
+        let warn_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(CountWarns(warn_count.clone()));
+
+        let observed = observe(source, ApiKind::AnthropicMessages, false, false, report);
+        let out: Vec<Bytes> = observed.map(|r| r.unwrap()).collect().await;
+        assert_eq!(&out[0][..], body.as_bytes());
+
+        let (usage, outcome) = slot.lock().unwrap().take().expect("report was called");
+        assert_eq!(outcome, StreamOutcome::Complete);
+        assert!(usage.is_empty());
+        assert_eq!(
+            warn_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "count_tokens-style responses must not warn about missing usage"
+        );
     }
 }

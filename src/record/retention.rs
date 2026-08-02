@@ -189,12 +189,33 @@ fn commit_usage_prune(path: &Path, plan: UsagePrunePlan) -> Result<UsagePruneOut
     }
 }
 
+/// Build a unique sibling temp file name for `path`.
+///
+/// A fixed name like `usage-2026-08.jsonl.tmp` would let two writers
+/// targeting the same usage file — two `stats` invocations, or `stats`'s
+/// prune racing `serve`'s daily one — interleave their writes into the same
+/// temp file before racing to rename over the target. Mixing in the process
+/// id and a fresh UUID means no two callers ever share one. The `.tmp`
+/// suffix stays last so the result still fails the `usage-*.jsonl` filter
+/// used by both `prune_at` above and `stats`'s file listing.
+fn tmp_file_name(path: &Path) -> String {
+    let original = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("usage file paths always have a UTF-8 file name");
+    format!(
+        "{original}.{}.{}.tmp",
+        std::process::id(),
+        uuid::Uuid::now_v7()
+    )
+}
+
 /// Replace `path`'s contents by writing to a sibling temp file and renaming
 /// over it — a reader (or a writer reopening the path) never observes a
 /// half-written file, which a direct `fs::write` (truncate then write) does
 /// not guarantee.
 fn write_atomically(path: &Path, contents: &str) -> Result<()> {
-    let tmp = path.with_extension("jsonl.tmp");
+    let tmp = path.with_file_name(tmp_file_name(path));
     std::fs::write(&tmp, contents)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
@@ -335,6 +356,29 @@ mod tests {
         // left it as, stale line and all — the next prune pass will pick it
         // up with a fresh read.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), appended_contents);
+    }
+
+    /// The temp file `write_atomically` uses must never itself look like a
+    /// usage file, or it would get picked up as one by `prune_at`'s filter
+    /// (and `stats`'s) instead of being an invisible implementation detail.
+    #[test]
+    fn tmp_file_name_never_matches_the_usage_file_filter() {
+        let path = Path::new("/logs/usage-2026-08.jsonl");
+        let name = tmp_file_name(path);
+
+        assert!(!(name.starts_with("usage-") && name.ends_with(".jsonl")));
+        assert!(name.ends_with(".tmp"));
+    }
+
+    /// Two writers targeting the same usage file (two `stats` runs, or
+    /// `stats`'s prune racing `serve`'s) must get different temp file names,
+    /// or their writes could land in the same file and mix together before
+    /// one of them wins the rename.
+    #[test]
+    fn tmp_file_name_is_unique_across_calls() {
+        let path = Path::new("/logs/usage-2026-08.jsonl");
+
+        assert_ne!(tmp_file_name(path), tmp_file_name(path));
     }
 
     #[test]
