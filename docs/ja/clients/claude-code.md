@@ -146,6 +146,23 @@ user message に `<system-reminder>` ブロック(プロジェクトの `CLAUDE.
 サーバーサイドツール、そして正確なトークン数です。`llm-gateway trace` は
 これらのリクエストに `xlat=anthropic-messages->openai-chat` を付けます。
 
+## `--isolate`
+
+`llm-gateway launch claude --isolate` は `--setting-sources project` を
+追加します。これは Claude Code のユーザーレベル設定を**一切読ませなく**
+します — 上の `env` ブロックだけでなく、`~/.claude/settings.json` の
+permissions・hooks・model preferences もすべて一緒に捨てられます。
+
+ほとんどのセッションにとってこれは過剰です。`--isolate` に手を伸ばす理由が
+その `env` ブロックに残った古い `ANTHROPIC_BASE_URL` などだけなら、
+`launch claude` が(`--isolate` なしでも)毎回出す衝突警告で足りることが
+多いです(上の補足を参照)。permissions・hooks・model preferences 自体が
+問題になる場合にだけ `--isolate` を使ってください。
+
+Codex・opencode との比較は README の「クライアント別 `--isolate`」の表
+([README.ja.md](../../../README.ja.md#コマンド) の「コマンド」節)を
+参照してください。
+
 ## 動作確認
 
 ```sh

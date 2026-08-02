@@ -147,6 +147,23 @@ version is prompt caching, thinking blocks, Anthropic server-side tools, and an
 exact token count. `llm-gateway trace` marks these requests
 `xlat=anthropic-messages->openai-chat`.
 
+## `--isolate`
+
+`llm-gateway launch claude --isolate` adds `--setting-sources project`, which
+stops Claude Code from reading user-level settings **at all** — not just the
+`env` block above. Permissions, hooks and model preferences from
+`~/.claude/settings.json` are discarded along with everything else.
+
+That is more than most sessions need. If the only reason to reach for
+`--isolate` is a stale `ANTHROPIC_BASE_URL` (or similar) sitting in that
+file's `env` block, the conflict warning `launch claude` already prints on
+every run — without `--isolate` — is usually enough (see the notes above).
+Reach for `--isolate` when permissions, hooks or model preferences from that
+file are themselves the problem, not just its `env` block.
+
+See the [README's `--isolate` by client table](../../README.md#--isolate-by-client)
+for how this compares to Codex and opencode.
+
 ## Verify
 
 ```sh

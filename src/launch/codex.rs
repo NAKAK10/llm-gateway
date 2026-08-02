@@ -85,10 +85,17 @@ pub fn build(
     let mut forwarded = args.to_vec();
     let mut warnings = Vec::new();
     if isolate {
-        warnings
-            .push("--ignore-user-config は codex exec 専用。TUI起動では隔離されない".to_string());
         if forwarded.first().map(String::as_str) == Some("exec") {
+            // The flag does what was asked, so there is nothing to warn
+            // about — `launch` prints this vector under a `warning:` prefix,
+            // and reporting success there is just noise.
             forwarded.insert(1, "--ignore-user-config".to_string());
+        } else {
+            warnings.push(
+                "--ignore-user-config は codex exec 専用のため、TUI起動ではこのフラグは追加されない。\
+                 ユーザー設定は隔離されない（上流に該当オプションが無く回避策なし）"
+                    .to_string(),
+            );
         }
     }
     all_args.extend(forwarded);
@@ -209,7 +216,10 @@ mod tests {
 
         let exec_pos = invocation.args.iter().position(|a| a == "exec").unwrap();
         assert_eq!(invocation.args[exec_pos + 1], "--ignore-user-config");
-        assert!(invocation.warnings.iter().any(|w| w.contains("codex exec")));
+        // exec: the flag lands, isolation happens, and there is nothing to
+        // say about it — `launch` prints warnings under a `warning:` prefix,
+        // so announcing success there would only be noise.
+        assert!(invocation.warnings.is_empty(), "{:?}", invocation.warnings);
     }
 
     #[test]
@@ -218,6 +228,12 @@ mod tests {
 
         let invocation = build(&config, "m", true, true, &["--foo".to_string()]).unwrap();
 
+        // TUI: no flag is ever added, so the warning must say the flag is not
+        // added at all, not merely that isolation is incomplete.
+        assert!(invocation
+            .warnings
+            .iter()
+            .any(|w| w.contains("追加されない") && w.contains("隔離されない")));
         assert!(!invocation
             .args
             .contains(&"--ignore-user-config".to_string()));

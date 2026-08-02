@@ -25,6 +25,65 @@ OpenClaw は独自のスケジューラーを持つデーモンとして、多�
 curl -s -H "Authorization: Bearer $KEY" http://<tailnet-ip>:4000/v1/models
 ```
 
+## auto-route と、OpenClaw ではなぜ切りたくなるか
+
+このゲートウェイは既定で**クライアントが送ってきたモデル名を無視**し、
+受信したリクエストの内容を各 route の `description` に対して分類することで
+route を決めます(README の
+[コンテンツ分類ルーティング](../../../README.ja.md#コンテンツ分類ルーティング)
+参照)。これは Claude Code のように model 文字列がほぼ飾りであるハーネス
+には合っています。しかし OpenClaw のように、内部呼び出しごと(タイトル
+生成、エージェントごとの判定呼び出しなど)に明示的なモデル名を指定する
+エージェントループを持つクライアントには、この既定は合いません —
+分類がそれぞれの選択を勝手に上書きしてしまいます。
+
+このオプトアウトはすでに存在しており、ゲートウェイ側の新機能は不要です:
+リクエストに `x-gw-auto-route: 0` を付けると、ゲートウェイは分類を
+スキップし、クライアントが送ってきたモデル名をそのまま route 名として
+解決します(`src/server/proxy.rs` の `auto_route_requested` 参照)。
+`llm-gateway launch` はこれをセッションごとに対話的に尋ねますが — 冒頭で
+書いたとおり OpenClaw は `launch` に非対応(多くの場合別マシンで動く
+常駐デーモン)なので、尋ねるタイミング自体がありません。ヘッダーは
+OpenClaw 側で固定し、送信するすべてのリクエストに付くようにする必要が
+あります。
+
+OpenClaw が provider ごとに固定の追加ヘッダーを設定できるかどうか、
+できるとしてどう設定するかは、このドキュメントでは断定できません —
+OpenClaw 自身の設定スキーマに依存し、ここでは未確認です。上の `gateway`
+provider ブロックに静的ヘッダーを付ける方法を OpenClaw 側のドキュメントや
+設定リファレンスで確認し、次の値を設定してください:
+
+```
+x-gw-auto-route: 0
+```
+
+**これはモデル名の解決方法も変えます。** auto-route を無効にすると、
+`src/route.rs` の `find_route` は送られてきたモデル名を route のキーとして
+プレーンな完全一致でルックアップします — prefix マッチもワイルドカードも
+あいまい一致もありません(opencode の `overrideProviders` について
+[`docs/ja/clients/opencode.md`](opencode.md) に書いたのと同じ挙動です)。
+そのため、OpenClaw が送るよう設定されたすべてのモデル名 — 下の手順 1 の
+`models` リスト — は `config.json` 内の route の**リテラルな名前と一致**
+していなければなりません。一致する route が無いモデル名は、分類にフォール
+スルーせず 404 になります。
+
+ヘッダーが実際にゲートウェイへ届くかどうかを、OpenClaw の設定とは切り離して
+確認できる curl の例です:
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" \
+     -H "x-gw-auto-route: 0" \
+     -H "Content-Type: application/json" \
+     -d '{"model":"role-researcher","messages":[{"role":"user","content":"ping"}]}' \
+     http://<tailnet-ip>:4000/v1/chat/completions
+```
+
+`x-gw-auto-route: 0` を付けると `role-researcher` は完全一致の route 名として
+解決されます(分類は一切走りません)ので、これが成功するのは
+`config.json` に実在する route `role-researcher` がある場合だけです。
+ヘッダーを外す(または `1` にする)と、同じ呼び出しは `model` フィールドを
+一切見ずに分類経由になります。
+
 ## 1. プロバイダーを追加する(動いているものには触れない)
 
 OpenClaw ホストの `openclaw.json` に:

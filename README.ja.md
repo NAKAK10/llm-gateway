@@ -487,6 +487,28 @@ llm-gateway update [--check]
 古いバージョンがまだあると思い込むためです。手で配置したバイナリの場合は
 リリースのリンクを表示します。`--check` は何も変更せず報告だけします。
 
+### クライアント別 `--isolate`
+
+`--isolate` の意味はクライアントごとに違います — 同じフラグ名でも、実際に
+無効化される範囲は三者三様です:
+
+| クライアント | 実装 | 実際に無効化されるもの |
+|---|---|---|
+| Claude Code | `--setting-sources project` | ユーザー設定を**一切読まない** — permissions・hooks・model preferences も含め、すべて捨てられる |
+| Codex | `--ignore-user-config` | `codex exec` でのみ有効。TUI ではフラグ自体が追加されず、何も隔離されない(上流に該当オプションが無く、回避策も無い) |
+| opencode | `--pure` | 外部プラグインのみ。設定ファイルは引き続き読まれる |
+
+Claude Code については、`--setting-sources project` はほとんどの `launch`
+セッションが必要とする以上に強力なハンマーです。`~/.claude/settings.json`
+の `env` ブロックに残った古い `ANTHROPIC_BASE_URL` などを避けたいだけなら、
+`launch claude` が毎回出す衝突警告で足りることが多いです — permissions・
+hooks・model preferences 自体が問題になる場合にだけ `--isolate` に
+手を伸ばしてください。
+
+各行の詳細は [`docs/ja/clients/claude-code.md`](docs/ja/clients/claude-code.md)、
+[`docs/ja/clients/codex.md`](docs/ja/clients/codex.md)、
+[`docs/ja/clients/opencode.md`](docs/ja/clients/opencode.md) を参照してください。
+
 `serve` は他の何より先にポートへバインドします。そのポートがすでに
 使われている場合 — ほとんどの場合、起動したままの前回の `llm-gateway serve`
 です — `lsof` でそのプロセスを特定し、何もする前に確認を挟みます:
