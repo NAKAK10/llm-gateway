@@ -1,0 +1,471 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>llm-gateway</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1115;
+    --panel: #161922;
+    --panel-2: #1d212c;
+    --border: #2a2f3d;
+    --text: #e6e8ee;
+    --muted: #8a90a3;
+    --accent: #6ea8fe;
+    --ok: #4fd18b;
+    --warn: #f2b84b;
+    --err: #f2685b;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+    padding: 0.75rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  header h1 {
+    font-size: 0.95rem;
+    font-weight: 600;
+    margin: 0;
+    white-space: nowrap;
+  }
+  header h1 span { color: var(--muted); font-weight: 400; }
+  nav { display: flex; gap: 0.25rem; }
+  nav button {
+    background: none;
+    border: 1px solid transparent;
+    color: var(--muted);
+    padding: 0.4rem 0.8rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  nav button:hover { color: var(--text); }
+  nav button.active {
+    background: var(--panel-2);
+    border-color: var(--border);
+    color: var(--text);
+  }
+  #conn {
+    margin-left: auto;
+    font-size: 0.78rem;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  #conn .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--err);
+  }
+  #conn.live .dot { background: var(--ok); }
+  main { padding: 1.25rem; max-width: 1400px; margin: 0 auto; }
+  section { display: none; }
+  section.active { display: block; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1rem;
+  }
+  .panel + .panel { margin-top: 1rem; }
+  h2 { font-size: 0.9rem; margin: 0 0 0.75rem; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--panel); }
+  td.num { text-align: right; font-family: var(--mono); }
+  td.wrap { white-space: normal; max-width: 32rem; color: var(--muted); }
+  td.clip { max-width: 12rem; overflow: hidden; text-overflow: ellipsis; }
+  tr:hover td { background: var(--panel-2); }
+  .badge {
+    display: inline-block;
+    padding: 0.05rem 0.45rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-family: var(--mono);
+  }
+  .badge.success { background: rgba(79, 209, 139, 0.15); color: var(--ok); }
+  .badge.error { background: rgba(242, 104, 91, 0.15); color: var(--err); }
+  .badge.aborted { background: rgba(242, 184, 75, 0.15); color: var(--warn); }
+  .route-pill { font-family: var(--mono); color: var(--accent); }
+  .empty { color: var(--muted); padding: 1.5rem; text-align: center; font-style: italic; }
+  #live-table-wrap { max-height: 75vh; overflow: auto; }
+  .controls { display: flex; gap: 0.6rem; align-items: center; margin-bottom: 0.75rem; flex-wrap: wrap; }
+  select, input[type="date"] {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.3rem 0.5rem;
+    font-size: 0.82rem;
+  }
+  .bar-track { background: var(--panel-2); border-radius: 3px; height: 6px; width: 100%; overflow: hidden; }
+  .bar-fill { background: var(--accent); height: 100%; }
+  #map-svg { width: 100%; height: 60vh; background: var(--panel-2); border-radius: 8px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; margin-top: 0.75rem; font-size: 0.78rem; }
+  .legend-item { display: flex; align-items: center; gap: 0.35rem; color: var(--muted); }
+  .legend-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+</style>
+
+<header>
+  <h1>llm-gateway <span>dashboard</span></h1>
+  <nav>
+    <button data-view="live" class="active">Live</button>
+    <button data-view="map">Vector Map</button>
+    <button data-view="usage">Usage</button>
+  </nav>
+  <div id="conn"><span class="dot"></span><span id="conn-label">connecting…</span></div>
+</header>
+
+<main>
+  <section id="view-live" class="active">
+    <div class="panel">
+      <h2>Live requests</h2>
+      <div id="live-table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>time</th>
+              <th>client</th>
+              <th>prompt</th>
+              <th>route</th>
+              <th>provider/model</th>
+              <th>status</th>
+              <th class="num">ms</th>
+              <th class="num">tok</th>
+            </tr>
+          </thead>
+          <tbody id="live-rows"></tbody>
+        </table>
+        <div id="live-empty" class="empty">Waiting for the first request…</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="view-map">
+    <div class="panel">
+      <h2>Route embedding space</h2>
+      <svg id="map-svg" viewBox="0 0 1000 600"></svg>
+      <div class="legend" id="map-legend"></div>
+    </div>
+  </section>
+
+  <section id="view-usage">
+    <div class="panel">
+      <h2>Usage</h2>
+      <div class="controls">
+        <label>group by
+          <select id="usage-by">
+            <option value="route">route</option>
+            <option value="client">client</option>
+            <option value="provider">provider</option>
+            <option value="model">model</option>
+            <option value="day">day</option>
+          </select>
+        </label>
+        <label>since <input type="date" id="usage-since" /></label>
+        <label>until <input type="date" id="usage-until" /></label>
+        <label><input type="checkbox" id="usage-all" /> all retained</label>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th id="usage-key-header">route</th>
+            <th class="num">calls</th>
+            <th class="num">fail</th>
+            <th class="num">unk</th>
+            <th class="num">in_tok</th>
+            <th class="num">out_tok</th>
+            <th class="num">cache_r</th>
+            <th class="num">cache_w</th>
+            <th class="num">total</th>
+            <th style="width: 12rem">share</th>
+          </tr>
+        </thead>
+        <tbody id="usage-rows"></tbody>
+        <tfoot id="usage-total"></tfoot>
+      </table>
+      <div id="usage-empty" class="empty" style="display: none">No usage recorded yet.</div>
+    </div>
+  </section>
+</main>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---- nav ----------------------------------------------------------
+  const views = ["live", "map", "usage"];
+  function showView(name) {
+    for (const v of views) {
+      document.getElementById("view-" + v).classList.toggle("active", v === name);
+    }
+    for (const btn of document.querySelectorAll("nav button")) {
+      btn.classList.toggle("active", btn.dataset.view === name);
+    }
+    location.hash = name;
+    if (name === "map") loadRouteMap();
+    if (name === "usage") loadUsage();
+  }
+  for (const btn of document.querySelectorAll("nav button")) {
+    btn.addEventListener("click", () => showView(btn.dataset.view));
+  }
+  showView(views.includes(location.hash.slice(1)) ? location.hash.slice(1) : "live");
+
+  // ---- formatting helpers --------------------------------------------
+  function fmtNum(n) {
+    return new Intl.NumberFormat().format(n);
+  }
+  function fmtTime(ts) {
+    try {
+      return new Date(ts).toLocaleTimeString();
+    } catch {
+      return ts;
+    }
+  }
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[c]));
+  }
+  // A stable color per route name, so the same route always gets the same
+  // dot color across the live table, the vector map, and re-renders.
+  function colorFor(name) {
+    let hash = 0;
+    for (let i = 0; i < name.length; i++) {
+      hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
+    }
+    const hue = hash % 360;
+    return `hsl(${hue} 70% 60%)`;
+  }
+
+  // ---- live feed ------------------------------------------------------
+  const liveRows = document.getElementById("live-rows");
+  const liveEmpty = document.getElementById("live-empty");
+  const MAX_ROWS = 300;
+  const mapPoints = []; // recent {x, y, route, ts} for the vector map overlay
+  const MAX_MAP_POINTS = 200;
+
+  function addLiveRow(ev) {
+    liveEmpty.style.display = "none";
+    const tr = document.createElement("tr");
+    const badgeClass = ev.status === "success" ? "success" : ev.status === "aborted" ? "aborted" : "error";
+    const tokens = (ev.in_tok || 0) + (ev.out_tok || 0) + (ev.cache_read_tok || 0) + (ev.cache_write_tok || 0);
+    tr.innerHTML = `
+      <td>${escapeHtml(fmtTime(ev.ts))}</td>
+      <td class="clip" title="${escapeHtml(ev.client)}">${escapeHtml(ev.client)}</td>
+      <td class="wrap" title="${escapeHtml(ev.prompt_preview || "")}">${escapeHtml(ev.prompt_preview || "—")}</td>
+      <td class="route-pill">${escapeHtml(ev.matched_route)}</td>
+      <td>${escapeHtml(ev.provider)}/${escapeHtml(ev.model)}</td>
+      <td><span class="badge ${badgeClass}">${escapeHtml(ev.status)}</span></td>
+      <td class="num">${fmtNum(ev.dur_ms)}</td>
+      <td class="num">${fmtNum(tokens)}</td>
+    `;
+    liveRows.prepend(tr);
+    while (liveRows.children.length > MAX_ROWS) {
+      liveRows.removeChild(liveRows.lastChild);
+    }
+  }
+
+  function connectLive() {
+    const conn = document.getElementById("conn");
+    const connLabel = document.getElementById("conn-label");
+    const source = new EventSource("/api/live");
+    source.onopen = () => {
+      conn.classList.add("live");
+      connLabel.textContent = "live";
+    };
+    source.onerror = () => {
+      conn.classList.remove("live");
+      connLabel.textContent = "reconnecting…";
+    };
+    source.onmessage = (msg) => {
+      let ev;
+      try {
+        ev = JSON.parse(msg.data);
+      } catch {
+        return;
+      }
+      addLiveRow(ev);
+      if (ev.point) {
+        mapPoints.push({ x: ev.point[0], y: ev.point[1], route: ev.matched_route, ts: Date.now() });
+        while (mapPoints.length > MAX_MAP_POINTS) mapPoints.shift();
+        plotLivePoints();
+      }
+    };
+  }
+  connectLive();
+
+  // ---- vector map -----------------------------------------------------
+  const mapSvg = document.getElementById("map-svg");
+  const mapLegend = document.getElementById("map-legend");
+  let mapBounds = null; // {minX, maxX, minY, maxY} fit from the last /api/routes/vectors load
+  let mapLoaded = false;
+
+  function toScreen(x, y) {
+    if (!mapBounds) return [500, 300];
+    const pad = 60;
+    const w = 1000 - pad * 2;
+    const h = 600 - pad * 2;
+    const spanX = mapBounds.maxX - mapBounds.minX || 1;
+    const spanY = mapBounds.maxY - mapBounds.minY || 1;
+    const sx = pad + ((x - mapBounds.minX) / spanX) * w;
+    const sy = pad + h - ((y - mapBounds.minY) / spanY) * h;
+    return [sx, sy];
+  }
+
+  async function loadRouteMap() {
+    if (mapLoaded) return;
+    mapLoaded = true;
+    let data;
+    try {
+      const res = await fetch("/api/routes/vectors");
+      data = await res.json();
+    } catch {
+      mapSvg.innerHTML = `<text x="500" y="300" fill="var(--muted)" text-anchor="middle">failed to load</text>`;
+      return;
+    }
+    const routes = data.routes || [];
+    if (routes.length === 0) {
+      mapSvg.innerHTML = `<text x="500" y="300" fill="var(--muted)" text-anchor="middle">no routes to plot (no classifier loaded, or no candidate routes configured)</text>`;
+      return;
+    }
+
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const r of routes) {
+      for (const [x, y] of r.points) {
+        minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+        minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+      }
+    }
+    // A little breathing room so points don't sit on the edge.
+    const padX = (maxX - minX) * 0.15 || 1;
+    const padY = (maxY - minY) * 0.15 || 1;
+    mapBounds = { minX: minX - padX, maxX: maxX + padX, minY: minY - padY, maxY: maxY + padY };
+
+    const parts = [];
+    mapLegend.innerHTML = "";
+    for (const r of routes) {
+      const color = colorFor(r.name);
+      for (const [x, y] of r.points) {
+        const [sx, sy] = toScreen(x, y);
+        parts.push(`<circle cx="${sx}" cy="${sy}" r="7" fill="${color}" fill-opacity="0.85" stroke="var(--bg)" stroke-width="1.5"><title>${escapeHtml(r.name)}</title></circle>`);
+      }
+      const [lx, ly] = toScreen(r.points[0][0], r.points[0][1]);
+      parts.push(`<text x="${lx + 10}" y="${ly + 4}" fill="var(--text)" font-size="11" font-family="var(--mono)">${escapeHtml(r.name)}</text>`);
+
+      const item = document.createElement("div");
+      item.className = "legend-item";
+      item.innerHTML = `<span class="legend-dot" style="background:${color}"></span>${escapeHtml(r.name)}`;
+      mapLegend.appendChild(item);
+    }
+    mapSvg.innerHTML = parts.join("");
+    plotLivePoints();
+  }
+
+  function plotLivePoints() {
+    if (!mapBounds) return;
+    // Remove previously drawn live points, then redraw — fading older ones
+    // out so the map reads as "recent activity," not an ever-growing smear.
+    for (const el of mapSvg.querySelectorAll(".live-point")) el.remove();
+    const now = Date.now();
+    for (const p of mapPoints) {
+      const age = (now - p.ts) / 1000;
+      const opacity = Math.max(0.08, 1 - age / 30);
+      const [sx, sy] = toScreen(p.x, p.y);
+      const el = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      el.setAttribute("class", "live-point");
+      el.setAttribute("cx", sx);
+      el.setAttribute("cy", sy);
+      el.setAttribute("r", 4);
+      el.setAttribute("fill", colorFor(p.route));
+      el.setAttribute("fill-opacity", opacity.toFixed(2));
+      mapSvg.appendChild(el);
+    }
+  }
+  setInterval(plotLivePoints, 2000);
+
+  // ---- usage ------------------------------------------------------------
+  const usageRows = document.getElementById("usage-rows");
+  const usageTotal = document.getElementById("usage-total");
+  const usageEmpty = document.getElementById("usage-empty");
+  const usageKeyHeader = document.getElementById("usage-key-header");
+
+  function usageRowHtml(row, maxTotal) {
+    const total = row.in_tok + row.out_tok + row.cache_read_tok + row.cache_write_tok;
+    const pct = maxTotal > 0 ? Math.max(2, (total / maxTotal) * 100) : 0;
+    return `
+      <td>${escapeHtml(row.key)}</td>
+      <td class="num">${fmtNum(row.calls)}</td>
+      <td class="num">${fmtNum(row.failures)}</td>
+      <td class="num">${fmtNum(row.unknown)}</td>
+      <td class="num">${fmtNum(row.in_tok)}</td>
+      <td class="num">${fmtNum(row.out_tok)}</td>
+      <td class="num">${fmtNum(row.cache_read_tok)}</td>
+      <td class="num">${fmtNum(row.cache_write_tok)}</td>
+      <td class="num">${fmtNum(total)}</td>
+      <td><div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div></td>
+    `;
+  }
+
+  async function loadUsage() {
+    const by = document.getElementById("usage-by").value;
+    const since = document.getElementById("usage-since").value;
+    const until = document.getElementById("usage-until").value;
+    const all = document.getElementById("usage-all").checked;
+    usageKeyHeader.textContent = by;
+
+    const params = new URLSearchParams({ by });
+    if (since) params.set("since", since);
+    if (until) params.set("until", until);
+    if (all) params.set("all", "1");
+
+    let data;
+    try {
+      data = await (await fetch("/api/usage?" + params.toString())).json();
+    } catch {
+      usageEmpty.style.display = "block";
+      usageEmpty.textContent = "failed to load usage";
+      return;
+    }
+
+    const rows = data.rows || [];
+    usageRows.innerHTML = "";
+    usageTotal.innerHTML = "";
+    usageEmpty.style.display = rows.length === 0 ? "block" : "none";
+    usageEmpty.textContent = "No usage recorded yet.";
+
+    const maxTotal = Math.max(0, ...rows.map((r) => r.in_tok + r.out_tok + r.cache_read_tok + r.cache_write_tok));
+    for (const row of rows) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = usageRowHtml(row, maxTotal);
+      usageRows.appendChild(tr);
+    }
+    if (data.total) {
+      const tr = document.createElement("tr");
+      tr.style.fontWeight = "600";
+      tr.innerHTML = usageRowHtml({ ...data.total, key: "TOTAL" }, 0).replace(
+        '<div class="bar-track"><div class="bar-fill" style="width:0%"></div></div>', ""
+      );
+      usageTotal.appendChild(tr);
+    }
+  }
+  for (const id of ["usage-by", "usage-since", "usage-until", "usage-all"]) {
+    document.getElementById(id).addEventListener("change", loadUsage);
+  }
+})();
+</script>

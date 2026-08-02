@@ -147,7 +147,7 @@ pub struct TraceAttempt {
     pub ms: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TraceUsage {
     pub in_tok: u64,
     pub out_tok: u64,

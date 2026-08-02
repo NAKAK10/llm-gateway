@@ -27,6 +27,13 @@ pub struct UsageRecord {
     pub cache_read_tok: u64,
     #[serde(default)]
     pub cache_write_tok: u64,
+    /// Set when a `success` response yielded no usage at all — extraction
+    /// failed (a parse error, a buffer overflow, a provider that never sent
+    /// usage), not that the request genuinely cost zero tokens. Distinguishes
+    /// "unknown" from "really zero" for `stats`; always `false` for a
+    /// non-success status, since those have no usage to speak of either way.
+    #[serde(default)]
+    pub usage_missing: bool,
     pub dur_ms: u64,
     /// `success`, `aborted`, or `error`.
     pub status: String,
@@ -72,6 +79,7 @@ mod tests {
             out_tok: 34,
             cache_read_tok: 5,
             cache_write_tok: 0,
+            usage_missing: false,
             dur_ms: 250,
             status: "success".to_string(),
             stream: true,

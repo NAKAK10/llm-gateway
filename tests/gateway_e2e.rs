@@ -14,6 +14,7 @@ use axum::Router;
 use llm_gateway::config::watch::SharedConfig;
 use llm_gateway::config::{ApiKind, Config, ModelConfig, ProviderConfig, RouteConfig, SecretRef};
 use llm_gateway::record::{RecordMode, Recorder};
+use llm_gateway::server::live::LiveFeed;
 use llm_gateway::server::{router, AppState};
 
 /// A fixed SSE body with awkward blank lines and a multi-event layout —
@@ -232,6 +233,7 @@ async fn spawn_gateway(config: Config, inbound_key: Option<&str>) -> SocketAddr 
         inbound_key: inbound_key.map(String::from),
         #[cfg(feature = "semantic")]
         classifier: None,
+        live: None,
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -240,6 +242,39 @@ async fn spawn_gateway(config: Config, inbound_key: Option<&str>) -> SocketAddr 
     // The tempdir must outlive the server; leak it for the test's lifetime.
     std::mem::forget(dir);
     addr
+}
+
+/// Same as [`spawn_gateway`], but with `serve --ui`'s dashboard on — for
+/// exercising `/ui`/`/api/*` and the live feed. Returns the [`LiveFeed`]
+/// directly (not just the address) so a test can subscribe to it without a
+/// real SSE client.
+async fn spawn_gateway_with_live(config: Config) -> (SocketAddr, Arc<LiveFeed>) {
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = Recorder::start(
+        dir.path().to_path_buf(),
+        RecordMode {
+            usage: false,
+            debug: false,
+            debug_full: false,
+        },
+    )
+    .unwrap();
+    let live = Arc::new(LiveFeed::new());
+    let state = AppState {
+        config: SharedConfig::from_config(config, dir.path().join("config.json")),
+        http: reqwest::Client::new(),
+        recorder,
+        inbound_key: None,
+        #[cfg(feature = "semantic")]
+        classifier: None,
+        live: Some(live.clone()),
+    };
+    let app = router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    std::mem::forget(dir);
+    (addr, live)
 }
 
 #[tokio::test]
@@ -838,4 +873,122 @@ async fn transcript_prefixed_request_bypasses_default_and_reaches_the_configured
         "the shared `default` route must never see this request: {:?}",
         *slow_seen
     );
+}
+
+/// The dashboard must not exist at all — not "exist but say disabled" — when
+/// `serve --ui` was never passed. See `router`'s doc comment.
+#[tokio::test]
+async fn ui_routes_are_absent_when_the_dashboard_is_off() {
+    let (upstream, _mock) = spawn_mock().await;
+    let addr = spawn_gateway(translated_config(upstream), None).await;
+    let client = reqwest::Client::new();
+
+    for path in ["/ui", "/api/usage", "/api/live", "/api/routes/vectors"] {
+        let response = client
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "{path} should not exist");
+    }
+}
+
+/// The inverse: every dashboard route answers once `serve --ui` is on, and
+/// stays behind the same auth as the proxy routes.
+#[tokio::test]
+async fn ui_routes_answer_when_the_dashboard_is_on() {
+    let (upstream, _mock) = spawn_mock().await;
+    let (addr, _live) = spawn_gateway_with_live(translated_config(upstream)).await;
+    let client = reqwest::Client::new();
+
+    let page = client
+        .get(format!("http://{addr}/ui"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    assert_eq!(
+        page.headers().get(http::header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+
+    let usage = client
+        .get(format!("http://{addr}/api/usage"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(usage.status(), 200);
+    let usage_body: serde_json::Value = usage.json().await.unwrap();
+    assert!(usage_body["rows"].is_array());
+    assert!(usage_body["total"].is_object());
+
+    // No classifier is loaded in this test state (see `spawn_gateway_with_live`),
+    // so the map is legitimately empty — this only checks the endpoint answers
+    // with the right shape.
+    let vectors = client
+        .get(format!("http://{addr}/api/routes/vectors"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(vectors.status(), 200);
+    let vectors_body: serde_json::Value = vectors.json().await.unwrap();
+    assert!(vectors_body["routes"].is_array());
+}
+
+/// A request through the ordinary proxy path publishes a
+/// [`llm_gateway::server::live::LiveEvent`] carrying the prompt preview and
+/// the route/model it triggered — the core "what just got routed" feature.
+#[tokio::test]
+async fn a_completed_request_publishes_a_live_event() {
+    let (upstream, _mock) = spawn_mock().await;
+    let (addr, live) = spawn_gateway_with_live(translated_config(upstream)).await;
+    let mut rx = live.subscribe();
+
+    reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "anything",
+            "messages": [{"role": "user", "content": "hello from the live feed test"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a live event should arrive promptly")
+        .expect("the channel should not have closed");
+
+    assert_eq!(event.provider, "chat-mock");
+    assert_eq!(event.model, "qwen3.5");
+    assert_eq!(event.status, "success");
+    assert_eq!(
+        event.prompt_preview.as_deref(),
+        Some("hello from the live feed test")
+    );
+}
+
+/// A build that turns the dashboard off entirely (`--ui` never passed)
+/// pays nothing for it: `state.live` is `None`, so the proxy path never
+/// even considers building a live event. Exercised indirectly by
+/// `ui_routes_are_absent_when_the_dashboard_is_off` for the router side;
+/// this checks the proxy side reaches the same request successfully with
+/// `live: None`, i.e. nothing panics or misbehaves when there is no
+/// subscriber to publish to.
+#[tokio::test]
+async fn requests_still_succeed_with_the_dashboard_off() {
+    let (upstream, _mock) = spawn_mock().await;
+    let addr = spawn_gateway(translated_config(upstream), None).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "anything",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
 }

@@ -15,10 +15,12 @@
 //! live in `route`, `upstream` and `passthrough`.
 
 pub mod chat;
+pub mod live;
 pub mod messages;
 pub mod models;
 pub mod passthrough;
 pub mod responses;
+pub mod ui;
 
 mod proxy;
 
@@ -33,6 +35,7 @@ use crate::config::ApiKind;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::record::{RecordMode, Recorder};
+use crate::server::live::LiveFeed;
 use crate::{paths, upstream};
 
 pub use proxy::proxy;
@@ -42,6 +45,9 @@ pub struct ServeOptions {
     pub debug: bool,
     pub debug_full: bool,
     pub port_override: Option<u16>,
+    /// Turn on the local dashboard at `GET /ui` (`--ui`). ORs with
+    /// `config.ui.enabled` — either turns it on for this run.
+    pub ui: bool,
 }
 
 /// Everything a handler needs.
@@ -63,6 +69,12 @@ pub struct AppState {
     /// feature; see the warning `serve` logs in that case.
     #[cfg(feature = "semantic")]
     pub classifier: Option<Arc<crate::semantic::index::Classifier>>,
+    /// `Some` only when `serve --ui` (or `config.ui.enabled`) is on — see
+    /// [`router`], which merges the dashboard's routes into the main router
+    /// exactly when this is `Some`. Every place a live event gets published
+    /// (`crate::server::proxy`) treats `None` the same way `Recorder` treats
+    /// a disabled mode: nothing to do, no cost beyond the check.
+    pub live: Option<Arc<LiveFeed>>,
 }
 
 /// Load config, bind, and serve until interrupted.
@@ -108,6 +120,9 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
     #[cfg(not(feature = "semantic"))]
     warn_if_semantic_routes_are_unusable(&config);
 
+    let ui_enabled = options.ui || config.ui.enabled;
+    let live = ui_enabled.then(|| Arc::new(LiveFeed::new()));
+
     let state = AppState {
         config: shared.clone(),
         http,
@@ -115,6 +130,7 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
         inbound_key,
         #[cfg(feature = "semantic")]
         classifier,
+        live,
     };
 
     // Watch after the first successful load: a broken edit from here on keeps
@@ -139,6 +155,9 @@ pub async fn serve(options: ServeOptions) -> Result<()> {
                 " (truncated to 200 chars)"
             }
         );
+    }
+    if ui_enabled {
+        eprintln!("dashboard is ON — http://{host}:{port}/ui");
     }
 
     axum::serve(listener, router(state)).await?;
@@ -330,14 +349,26 @@ fn init_tracing(verbose: bool) {
 }
 
 /// Build the router. Split out so tests can drive it without binding a port.
+///
+/// The dashboard's routes (`ui::router`) are merged in only when
+/// `state.live` is `Some` — i.e. `serve --ui`/`config.ui.enabled` turned it
+/// on for this run — so a build with the dashboard off has no `/ui` or
+/// `/api/*` route registered at all (a plain 404), rather than a route that
+/// exists but answers "disabled."
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/v1/messages", post(messages::handle))
         .route("/v1/messages/count_tokens", post(messages::count_tokens))
         .route("/v1/chat/completions", post(chat::handle))
         .route("/v1/responses", post(responses::handle))
         .route("/v1/models", get(models::handle))
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(|| async { "ok" }));
+
+    if state.live.is_some() {
+        router = router.merge(ui::router());
+    }
+
+    router
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

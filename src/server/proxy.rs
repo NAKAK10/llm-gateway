@@ -255,7 +255,15 @@ pub async fn proxy(
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
     let debug = state.recorder.mode().debug;
-    let trace_input = debug.then(|| {
+    // `serve --ui`'s live feed wants the same routing/prompt-preview data
+    // `--debug` records to disk, but it is a different, lower-stakes
+    // decision (ephemeral, in-memory, gone the moment nothing is
+    // subscribed) — so it gets its own gate rather than being tied to
+    // `debug`. `trace_input` is computed whenever either wants it; which of
+    // the two (or both) actually happens with the built record is decided
+    // per call site below.
+    let want_live = state.live.is_some();
+    let trace_input = (debug || want_live).then(|| {
         extract_input(
             expected_api,
             &payload,
@@ -357,6 +365,7 @@ pub async fn proxy(
                         out_tok: 0,
                         cache_read_tok: 0,
                         cache_write_tok: 0,
+                        usage_missing: false,
                         dur_ms,
                         status: "error".to_string(),
                         stream: streaming,
@@ -364,7 +373,7 @@ pub async fn proxy(
                     });
                 }
                 if let Some(input) = trace_input {
-                    state.recorder.trace(trace_record(
+                    let record = trace_record(
                         &client,
                         endpoint,
                         &requested_model,
@@ -374,7 +383,21 @@ pub async fn proxy(
                         attempts,
                         None,
                         semantic_attempt,
-                    ));
+                    );
+                    if debug {
+                        state.recorder.trace(record.clone());
+                    }
+                    if let Some(live) = &state.live {
+                        let point = live_point(&state, &record);
+                        live.publish(live_event_from(
+                            &record,
+                            record.attempts.len().max(1) as u32,
+                            "error",
+                            dur_ms,
+                            Some(err.to_string()),
+                            point,
+                        ));
+                    }
                 }
                 return error_response(http::StatusCode::BAD_GATEWAY, &err.to_string());
             }
@@ -419,6 +442,11 @@ pub async fn proxy(
 
     // Everything the report closure needs, captured before the stream starts.
     let recorder: Arc<Recorder> = state.recorder.clone();
+    // Whole-`AppState` clone rather than just the `live` field: `live_point`
+    // takes `&AppState` uniformly across both the `semantic`-feature-on and
+    // -off builds (see its doc comment), and every field here is already
+    // `Arc`/cheap-`Clone`.
+    let state_for_report = state.clone();
     let resolved = TraceResolved {
         provider: accepted.target_provider.clone(),
         model: accepted.target_model.clone(),
@@ -459,6 +487,11 @@ pub async fn proxy(
                 out_tok: usage.output_tokens,
                 cache_read_tok: usage.cache_read_tokens,
                 cache_write_tok: usage.cache_write_tokens,
+                // A `success` response with no usage at all means extraction
+                // failed, not that it genuinely cost zero tokens — see
+                // `tee::ObserveStream`'s warning for the same signal at the
+                // point it's first observed.
+                usage_missing: status_str == "success" && usage.is_empty(),
                 dur_ms,
                 status: status_str.to_string(),
                 stream: streaming,
@@ -466,7 +499,7 @@ pub async fn proxy(
             });
         }
         if let Some(input) = trace_input {
-            recorder.trace(trace_record(
+            let record = trace_record(
                 &client,
                 endpoint,
                 &requested,
@@ -481,14 +514,36 @@ pub async fn proxy(
                     cache_write_tok: usage.cache_write_tokens,
                 }),
                 semantic_attempt,
-            ));
+            );
+            if debug {
+                recorder.trace(record.clone());
+            }
+            if let Some(live) = &state_for_report.live {
+                let point = live_point(&state_for_report, &record);
+                live.publish(live_event_from(
+                    &record, attempt_n, status_str, dur_ms, None, point,
+                ));
+            }
         }
     });
 
     // Usage is observed on the *upstream* bytes, in the upstream's protocol,
     // before any translation — which is what keeps token accounting correct on
     // a translated route (`usage::parse` never sees a rebuilt body).
-    let observed = tee::observe(accepted.body, accepted.api, streaming, report);
+    //
+    // `count_tokens` responses never carry a `usage` object at all, so
+    // `expect_usage` is `!count_tokens` here — same gate as `record_usage`
+    // above. Routing count_tokens through `observe` at all (rather than
+    // bypassing it) keeps this the one place that understands both the
+    // streaming and buffered body shapes, and keeps every endpoint observed
+    // on the same upstream-bytes-below-translation path.
+    let observed = tee::observe(
+        accepted.body,
+        accepted.api,
+        streaming,
+        !count_tokens,
+        report,
+    );
 
     match translation {
         // The passthrough path: nothing at all between the upstream stream and
@@ -549,7 +604,7 @@ fn count_tokens_locally(
     let target = &resolution.targets[0];
 
     if let Some(input) = trace_input {
-        state.recorder.trace(trace_record(
+        let record = trace_record(
             client,
             endpoint,
             requested_model,
@@ -564,7 +619,18 @@ fn count_tokens_locally(
             }],
             None,
             semantic_attempt,
-        ));
+        );
+        // `trace_input` is `Some` whenever `--debug` *or* `serve --ui`'s live
+        // feed wants it (see `proxy`) — disk persistence must stay gated on
+        // `--debug` alone, so it needs its own check here rather than
+        // reusing `trace_input.is_some()` the way this used to.
+        if state.recorder.mode().debug {
+            state.recorder.trace(record.clone());
+        }
+        if let Some(live) = &state.live {
+            let point = live_point(state, &record);
+            live.publish(live_event_from(&record, 1, "success", 0, None, point));
+        }
     }
 
     json_response(
@@ -597,6 +663,81 @@ fn json_response(status: http::StatusCode, body: &serde_json::Value) -> Response
         http::HeaderValue::from_static("application/json"),
     );
     response
+}
+
+/// Turn a just-built [`TraceRecord`] into a [`crate::server::live::LiveEvent`]
+/// for `serve --ui`'s live feed.
+///
+/// Reuses the record rather than rebuilding the same data from scratch: both
+/// describe "what came in, which route/model it triggered, how it turned
+/// out," and a `TraceRecord` is already exactly that shape (see
+/// `crate::record::trace_log`) — this only adds what a `TraceRecord` does
+/// not carry (`status`/`dur_ms`/`attempt` are derived elsewhere in this file
+/// rather than stored on it) and the vector-map point.
+fn live_event_from(
+    record: &TraceRecord,
+    attempt: u32,
+    status: &str,
+    dur_ms: u64,
+    error: Option<String>,
+    point: Option<[f32; 2]>,
+) -> crate::server::live::LiveEvent {
+    let usage = record.usage.unwrap_or_default();
+    crate::server::live::LiveEvent {
+        ts: record.ts.clone(),
+        req_id: record.req_id.clone(),
+        client: record.client.clone(),
+        endpoint: record.endpoint.clone(),
+        requested_model: record.requested_model.clone(),
+        prompt_preview: record.input.last_user_text.clone(),
+        routing_mode: record.routing.mode.clone(),
+        reason: record.routing.reason.clone(),
+        matched_route: record.routing.matched_route.clone(),
+        candidates: record
+            .routing
+            .candidates
+            .iter()
+            .map(|c| crate::server::live::LiveCandidate {
+                route: c.route.clone(),
+                score: c.score,
+            })
+            .collect(),
+        score: record.routing.score,
+        provider: record.resolved.provider.clone(),
+        model: record.resolved.model.clone(),
+        api: record.resolved.api.clone(),
+        translation: record.resolved.translation.clone(),
+        attempt,
+        streaming: record.input.stream,
+        status: status.to_string(),
+        dur_ms,
+        in_tok: usage.in_tok,
+        out_tok: usage.out_tok,
+        cache_read_tok: usage.cache_read_tok,
+        cache_write_tok: usage.cache_write_tok,
+        error,
+        point,
+    }
+}
+
+/// Where the text that decided routing (`record.routing.decided_by_text`)
+/// lands on the same 2-D map `GET /api/routes/vectors` draws — `None` when
+/// nothing decided routing by text, or no classifier is loaded to re-embed
+/// it with.
+///
+/// Only called when `state.live` is already known to be `Some` (see the
+/// call sites below), so this never runs the extra embed for a request
+/// nobody is watching.
+#[cfg(feature = "semantic")]
+fn live_point(state: &AppState, record: &TraceRecord) -> Option<[f32; 2]> {
+    let classifier = state.classifier.as_ref()?;
+    let text = record.routing.decided_by_text.as_deref()?;
+    crate::server::ui::project_point(classifier, text)
+}
+
+#[cfg(not(feature = "semantic"))]
+fn live_point(_state: &AppState, _record: &TraceRecord) -> Option<[f32; 2]> {
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1450,6 +1591,96 @@ mod tests {
         }
     }
 
+    fn test_semantic_attempt(decided_by_text: Option<&str>) -> SemanticAttempt {
+        SemanticAttempt {
+            resolve_as: "role-writer".to_string(),
+            outcome: SemanticOutcome::Manual,
+            resolved_targets: None,
+            candidates: vec![TraceCandidate {
+                route: "role-writer".to_string(),
+                score: 0.9,
+            }],
+            score: Some(0.9),
+            embed_ms: 3,
+            decided_by_text: decided_by_text.map(String::from),
+            walk: Vec::new(),
+            system_score: None,
+        }
+    }
+
+    fn test_trace_record(usage: Option<TraceUsage>) -> TraceRecord {
+        let resolution = route::Resolution {
+            route_name: "role-writer".to_string(),
+            targets: vec![test_target(ApiKind::AnthropicMessages)],
+        };
+        let input = TraceInput {
+            messages_n: 1,
+            last_user_text: Some("hello".to_string()),
+            system_text: None,
+            tokens_est: 10,
+            tools: vec![],
+            has_image: false,
+            stream: false,
+        };
+        let resolved = TraceResolved {
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            api: "anthropic-messages".to_string(),
+            translation: None,
+        };
+        trace_record(
+            "claude-code",
+            "/v1/messages",
+            "claude-sonnet-4-6",
+            input,
+            &resolution,
+            resolved,
+            Vec::new(),
+            usage,
+            test_semantic_attempt(Some("hello")),
+        )
+    }
+
+    #[test]
+    fn live_event_from_maps_the_trace_record_and_the_extra_fields() {
+        let record = test_trace_record(Some(TraceUsage {
+            in_tok: 10,
+            out_tok: 20,
+            cache_read_tok: 1,
+            cache_write_tok: 2,
+        }));
+
+        let event = live_event_from(&record, 1, "success", 120, None, Some([0.1, -0.2]));
+
+        assert_eq!(event.matched_route, "role-writer");
+        assert_eq!(event.provider, "anthropic");
+        assert_eq!(event.model, "claude-sonnet-4-6");
+        assert_eq!(event.status, "success");
+        assert_eq!(event.dur_ms, 120);
+        assert_eq!(event.in_tok, 10);
+        assert_eq!(event.out_tok, 20);
+        assert_eq!(event.cache_read_tok, 1);
+        assert_eq!(event.cache_write_tok, 2);
+        assert_eq!(event.prompt_preview.as_deref(), Some("hello"));
+        assert_eq!(event.point, Some([0.1, -0.2]));
+        assert_eq!(event.candidates.len(), 1);
+        assert_eq!(event.candidates[0].route, "role-writer");
+        assert!((event.candidates[0].score - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn live_event_from_defaults_usage_to_zero_without_a_usage_block() {
+        let record = test_trace_record(None);
+
+        let event = live_event_from(&record, 2, "error", 50, Some("boom".to_string()), None);
+
+        assert_eq!(event.in_tok, 0);
+        assert_eq!(event.out_tok, 0);
+        assert_eq!(event.attempt, 2);
+        assert_eq!(event.error.as_deref(), Some("boom"));
+        assert!(event.point.is_none());
+    }
+
     /// The Claude Code shape from the config that motivated this change: an
     /// `anthropic-messages` client can reach both an `openai-chat` default
     /// (through translation) and an `anthropic-messages` fallback (directly),
@@ -2254,6 +2485,7 @@ mod tests {
             inbound_key: None,
             #[cfg(feature = "semantic")]
             classifier: None,
+            live: None,
         };
         (dir, state)
     }

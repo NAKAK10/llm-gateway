@@ -275,7 +275,10 @@ fn stream_body(mut child: tokio::process::Child, model: String) -> super::upstre
         let status = child.wait().await;
         let failed = !matches!(&status, Ok(status) if status.success());
         let mut out = Vec::new();
-        if failed {
+        // A non-zero exit after the turn already completed (`message_stop`
+        // seen, `result`'s usage applied) is not a failed request — the
+        // answer is real and about to be flushed by `finish()` below.
+        if failed && !converter.is_finished() {
             let mut stderr = String::new();
             if let Some(mut handle) = child.stderr.take() {
                 let mut raw = Vec::new();

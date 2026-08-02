@@ -51,13 +51,20 @@ pub struct Recorder {
     pub(crate) tx: tokio::sync::mpsc::UnboundedSender<Entry>,
 }
 
-/// One queued write.
+/// One queued write, or a request to prune.
 ///
 /// Both records are boxed so neither variant forces every queued entry to pay
 /// for the larger one.
 pub enum Entry {
     Usage(Box<usage_log::UsageRecord>),
     Trace(Box<trace_log::TraceRecord>),
+    /// Routed through the same channel as the writes rather than run from an
+    /// independent task: pruning rewrites `usage-*.jsonl` in place, and doing
+    /// that concurrently with this task's own `usage_log::append` (an
+    /// unsynchronized `O_APPEND` write to the same file) can silently drop
+    /// whatever line was appended mid-prune. One task processing everything
+    /// in order makes that race structurally impossible within this process.
+    Prune,
 }
 
 impl Recorder {
@@ -69,33 +76,44 @@ impl Recorder {
         let writer_dir = dir.clone();
         tokio::spawn(async move {
             while let Some(entry) = rx.recv().await {
-                let result = match entry {
-                    Entry::Usage(record) => usage_log::append(&writer_dir, &record),
-                    Entry::Trace(record) => trace_log::append(&writer_dir, &record),
-                };
-                if let Err(err) = result {
-                    tracing::warn!(error = %err, "failed to write log record");
+                match entry {
+                    Entry::Usage(record) => {
+                        if let Err(err) = usage_log::append(&writer_dir, &record) {
+                            tracing::warn!(error = %err, "failed to write log record");
+                        }
+                    }
+                    Entry::Trace(record) => {
+                        if let Err(err) = trace_log::append(&writer_dir, &record) {
+                            tracing::warn!(error = %err, "failed to write log record");
+                        }
+                    }
+                    // Same task as the appends above, deliberately — see
+                    // `Entry::Prune`.
+                    Entry::Prune => match retention::prune(&writer_dir) {
+                        Ok(summary) if summary.files_deleted > 0 || summary.files_trimmed > 0 => {
+                            tracing::info!(
+                                files_deleted = summary.files_deleted,
+                                files_trimmed = summary.files_trimmed,
+                                lines_removed = summary.lines_removed,
+                                "pruned old logs"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(err) => tracing::warn!(error = %err, "failed to prune old logs"),
+                    },
                 }
             }
         });
 
         // Prune on startup, then once a day for as long as the server runs —
         // otherwise a long-lived `serve` would only ever shed old data on the
-        // next restart.
-        let prune_dir = dir.clone();
+        // next restart. Requested through `tx` rather than run directly so it
+        // always lands on the writer task, never concurrently with it.
+        let prune_tx = tx.clone();
         tokio::spawn(async move {
             loop {
-                match retention::prune(&prune_dir) {
-                    Ok(summary) if summary.files_deleted > 0 || summary.files_trimmed > 0 => {
-                        tracing::info!(
-                            files_deleted = summary.files_deleted,
-                            files_trimmed = summary.files_trimmed,
-                            lines_removed = summary.lines_removed,
-                            "pruned old logs"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(err) => tracing::warn!(error = %err, "failed to prune old logs"),
+                if prune_tx.send(Entry::Prune).is_err() {
+                    return; // writer task is gone; nothing left to prune for.
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
             }
@@ -178,6 +196,7 @@ mod tests {
             out_tok: 2,
             cache_read_tok: 0,
             cache_write_tok: 0,
+            usage_missing: false,
             dur_ms: 10,
             status: "success".to_string(),
             stream: false,

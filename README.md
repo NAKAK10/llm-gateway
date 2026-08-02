@@ -545,11 +545,12 @@ launch: {
 | `launch` | optional advanced escape hatch only: Claude/Codex/opencode extra args, Codex `wireApi`, opencode `models`/`overrideProviders`. |
 | `logging.debug` | `--debug` truncates user text to 200 chars; `--debug-full` keeps everything. Plain-text prompts on disk — enable deliberately. |
 | `logging.logging` | off by default; set `true` to print `serve`'s console diagnostics (which route/provider was picked, embedding-model prep, per-attempt fallback outcomes) to stderr. An explicit `RUST_LOG` still wins. |
+| `ui.enabled` | off by default; `--ui` ORs with it. Turns on the local dashboard at `GET /ui` — see [Dashboard](#dashboard-serve---ui). |
 
 ## Commands
 
 ```
-llm-gateway serve [--debug] [--debug-full] [--port N]
+llm-gateway serve [--debug] [--debug-full] [--port N] [--ui]
 llm-gateway init
 llm-gateway launch <claude|codex|opencode> [--isolate] [--auto|--no-auto] [--print] [-- ARGS]
 llm-gateway config check|show|gitignore
@@ -580,6 +581,32 @@ Answering `No` leaves the other process alone and exits without starting;
 answering `Yes` terminates it and binds. A non-interactive run (no terminal
 attached) answers as if you said `No` rather than guessing.
 
+## Dashboard (`serve --ui`)
+
+`llm-gateway serve --ui` (or `ui.enabled: true` in `config.json`) exposes a
+local dashboard at `GET /ui` — same listener, same `server.apiKey` as the
+proxy itself, so nothing new is opened to the network beyond what `serve`
+already binds. Three views:
+
+- **Live** — a real-time feed (Server-Sent Events, `GET /api/live`) of every
+  completed request: the prompt that came in, which route classification
+  picked, which provider/model actually answered, and how it turned out.
+  Independent of `--debug`: it never touches disk, and disappears the moment
+  nothing is subscribed — see the difference below.
+- **Vector Map** — every route's classification embedding, projected to 2-D
+  (`GET /api/routes/vectors`), with incoming requests plotted live on the
+  same map as they're classified. Needs the `semantic` feature and a loaded
+  classifier; without one the view says so rather than 404ing.
+- **Usage** — the same aggregation `llm-gateway stats` prints, as a live table
+  (`GET /api/usage?by=route|client|provider|model|day&since=...&until=...`).
+
+The live feed is a different, lower-stakes decision than `--debug`: `--debug`
+writes prompt text to `logs/trace-*.jsonl` on disk, permanently, until
+retention prunes it — a decision worth making deliberately (see
+[Security notes](#security-notes)). The dashboard's live feed is in-memory
+only, per-tab, and gone the moment the tab closes or nothing is subscribed;
+turning it on with `--ui` does not turn `--debug` on, and vice versa.
+
 ## What fallback does (and does not) do
 
 Fallback triggers on connection failure, header timeout, 408, 429 and 5xx —
@@ -603,6 +630,9 @@ gateway never edits those files either way.
   `config check`, masked by `config show`, and covered by `config gitignore`.
 - Binding to anything but loopback without `server.apiKey` is refused at startup.
 - `--debug` writes prompt text to `logs/`. Treat that directory accordingly.
+- `--ui` does not write anything to disk on its own; it shares whatever auth
+  `server.apiKey` already provides, so it is reachable by exactly whoever the
+  proxy already is.
 
 ## License
 

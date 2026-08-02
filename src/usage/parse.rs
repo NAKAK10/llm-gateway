@@ -12,12 +12,18 @@
 //! Field names also differ: Anthropic uses `input_tokens`/`output_tokens`,
 //! OpenAI uses `prompt_tokens`/`completion_tokens` for chat and
 //! `input_tokens`/`output_tokens` for responses.
+//!
+//! The two families also disagree about what `input_tokens` *counts*:
+//! Anthropic's excludes cache reads/writes (they are their own fields), while
+//! OpenAI's `prompt_tokens`/`input_tokens` already include `cached_tokens`.
+//! Reporting either verbatim as [`Usage::input_tokens`] would make
+//! `in_tok + cache_read_tok` double-count cache on OpenAI-shaped responses
+//! but not on Anthropic ones, so the cached portion is subtracted out here —
+//! [`Usage::input_tokens`] always means "new, non-cached input" regardless of
+//! which upstream produced it.
 
 use crate::config::ApiKind;
 use crate::usage::Usage;
-
-/// An SSE event is done once a blank line separates it from the next.
-const EVENT_SEPARATOR: &[u8] = b"\n\n";
 
 /// Defensive cap on how large a single buffered (partial) SSE event may grow.
 /// A well-behaved upstream never gets close to this; it exists so a
@@ -50,7 +56,8 @@ fn openai_chat_usage(usage: &serde_json::Value) -> Usage {
         .map(|d| field(d, "cached_tokens"))
         .unwrap_or(0);
     Usage {
-        input_tokens: field(usage, "prompt_tokens"),
+        // `prompt_tokens` includes `cached_tokens`; see the module docs.
+        input_tokens: field(usage, "prompt_tokens").saturating_sub(cache_read),
         output_tokens: field(usage, "completion_tokens"),
         cache_read_tokens: cache_read,
         cache_write_tokens: 0,
@@ -64,7 +71,8 @@ fn openai_responses_usage(usage: &serde_json::Value) -> Usage {
         .map(|d| field(d, "cached_tokens"))
         .unwrap_or(0);
     Usage {
-        input_tokens: field(usage, "input_tokens"),
+        // `input_tokens` includes `cached_tokens`; see the module docs.
+        input_tokens: field(usage, "input_tokens").saturating_sub(cache_read),
         output_tokens: field(usage, "output_tokens"),
         cache_read_tokens: cache_read,
         cache_write_tokens: 0,
@@ -108,10 +116,12 @@ impl SseUsageScanner {
     pub fn push(&mut self, chunk: &[u8]) {
         self.buffer.extend_from_slice(chunk);
 
-        // An event ends at a blank line (`\n\n`). Drain every complete event
-        // currently in the buffer, keeping only the trailing partial one.
-        while let Some(pos) = find_subslice(&self.buffer, EVENT_SEPARATOR) {
-            let event_end = pos + EVENT_SEPARATOR.len();
+        // An event ends at a blank line — `\n\n`, or `\r\n\r\n` for an
+        // upstream that frames its stream with CRLF line endings. Drain
+        // every complete event currently in the buffer, keeping only the
+        // trailing partial one.
+        while let Some((pos, sep_len)) = find_event_boundary(&self.buffer) {
+            let event_end = pos + sep_len;
             let event: Vec<u8> = self.buffer.drain(..event_end).collect();
             self.handle_event(&event[..pos]);
         }
@@ -137,7 +147,7 @@ impl SseUsageScanner {
         // here is single-line JSON, so plain concatenation is fine.
         let mut data = String::new();
         for line in text.split('\n') {
-            let line = line.strip_prefix("\r").unwrap_or(line);
+            let line = line.strip_suffix('\r').unwrap_or(line);
             if let Some(rest) = line.strip_prefix("data: ") {
                 data.push_str(rest);
             } else if let Some(rest) = line.strip_prefix("data:") {
@@ -175,7 +185,17 @@ impl SseUsageScanner {
                 }
             }
             ApiKind::OpenaiResponses => {
-                if json.get("type").and_then(|t| t.as_str()) == Some("response.completed") {
+                // `.completed` is the normal end of a successful run, but a
+                // response that hit its token limit or failed mid-generation
+                // still reports the usage it burned through `.incomplete` /
+                // `.failed` instead — skipping those undercounts exactly the
+                // requests worth accounting for most.
+                let event_type = json.get("type").and_then(|t| t.as_str());
+                let terminal = matches!(
+                    event_type,
+                    Some("response.completed" | "response.incomplete" | "response.failed")
+                );
+                if terminal {
                     if let Some(usage) = json.get("response").and_then(|r| r.get("usage")) {
                         self.usage.merge(openai_responses_usage(usage));
                     }
@@ -185,8 +205,33 @@ impl SseUsageScanner {
     }
 
     /// Usage seen so far. Complete once the stream has ended.
-    pub fn finish(self) -> Usage {
+    ///
+    /// A well-formed SSE stream ends its last event with a blank line like
+    /// every other, but a connection can also simply close right after the
+    /// final `data:` line with no trailing separator — that leftover partial
+    /// event is still a complete, parseable one, so it is handled here
+    /// rather than silently dropped with whatever usage it carried.
+    pub fn finish(mut self) -> Usage {
+        if !self.buffer.is_empty() {
+            let event = std::mem::take(&mut self.buffer);
+            self.handle_event(&event);
+        }
         self.usage
+    }
+}
+
+/// Find where the next complete SSE event ends: a blank line, either the
+/// ordinary `\n\n` or a CRLF-framed `\r\n\r\n`. Returns `(event_start_end,
+/// separator_len)` so the caller can drain the event plus its separator in
+/// one slice.
+pub(crate) fn find_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = find_subslice(buffer, b"\n\n").map(|pos| (pos, 2));
+    let crlf = find_subslice(buffer, b"\r\n\r\n").map(|pos| (pos, 4));
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
     }
 }
 
@@ -266,7 +311,9 @@ mod tests {
         assert_eq!(
             usage,
             Usage {
-                input_tokens: 10,
+                // `prompt_tokens` (10) already includes `cached_tokens` (3);
+                // `input_tokens` is the non-cached remainder.
+                input_tokens: 7,
                 output_tokens: 20,
                 cache_read_tokens: 3,
                 cache_write_tokens: 0,
@@ -287,12 +334,29 @@ mod tests {
         assert_eq!(
             usage,
             Usage {
-                input_tokens: 100,
+                // Same normalization as `openai-chat`: `input_tokens` (100)
+                // includes `cached_tokens` (40).
+                input_tokens: 60,
                 output_tokens: 200,
                 cache_read_tokens: 40,
                 cache_write_tokens: 0,
             }
         );
+    }
+
+    #[test]
+    fn openai_chat_input_tokens_never_underflows_when_cache_exceeds_prompt() {
+        // Should never happen from a well-behaved upstream, but a
+        // `saturating_sub` keeps a malformed one from panicking or wrapping.
+        let body = json!({
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 1,
+                "prompt_tokens_details": { "cached_tokens": 9 },
+            }
+        });
+        let usage = from_json(ApiKind::OpenaiChat, &body);
+        assert_eq!(usage.input_tokens, 0);
     }
 
     fn anthropic_message_start_event(
@@ -444,6 +508,112 @@ mod tests {
                 cache_write_tokens: 0,
             }
         );
+    }
+
+    #[test]
+    fn openai_responses_incomplete_event_usage_is_captured() {
+        // A response that hit `max_output_tokens` still burned real tokens —
+        // skipping `.incomplete` would silently undercount every truncated
+        // response.
+        let mut scanner = SseUsageScanner::new(ApiKind::OpenaiResponses);
+        let event = format!(
+            "data: {}\n\n",
+            json!({
+                "type": "response.incomplete",
+                "response": {
+                    "usage": { "input_tokens": 30, "output_tokens": 60 }
+                }
+            })
+        );
+        scanner.push(event.as_bytes());
+        assert_eq!(scanner.finish().output_tokens, 60);
+    }
+
+    #[test]
+    fn openai_responses_failed_event_usage_is_captured() {
+        let mut scanner = SseUsageScanner::new(ApiKind::OpenaiResponses);
+        let event = format!(
+            "data: {}\n\n",
+            json!({
+                "type": "response.failed",
+                "response": {
+                    "usage": { "input_tokens": 12, "output_tokens": 3 }
+                }
+            })
+        );
+        scanner.push(event.as_bytes());
+        assert_eq!(scanner.finish().output_tokens, 3);
+    }
+
+    #[test]
+    fn crlf_framed_sse_events_are_parsed() {
+        // Some upstreams (and the proxies in front of them) frame SSE with
+        // `\r\n` line endings, so the event separator is `\r\n\r\n` rather
+        // than `\n\n` — a scanner that only looks for `\n\n` never finds the
+        // boundary and the event sits unparsed in the buffer forever.
+        let mut scanner = SseUsageScanner::new(ApiKind::OpenaiChat);
+        let event = format!(
+            "data: {}\r\n\r\n",
+            json!({
+                "choices": [],
+                "usage": { "prompt_tokens": 15, "completion_tokens": 25 }
+            })
+        );
+        scanner.push(event.as_bytes());
+        let usage = scanner.finish();
+        assert_eq!(usage.input_tokens, 15);
+        assert_eq!(usage.output_tokens, 25);
+    }
+
+    #[test]
+    fn crlf_and_lf_events_in_the_same_stream_both_parse() {
+        let mut scanner = SseUsageScanner::new(ApiKind::AnthropicMessages);
+        let start = anthropic_message_start_event(50, 8, 2).replace('\n', "\r\n");
+        let delta = anthropic_message_delta_event(75); // plain `\n\n`
+        scanner.push(start.as_bytes());
+        scanner.push(delta.as_bytes());
+        let usage = scanner.finish();
+        assert_eq!(usage.input_tokens, 50);
+        assert_eq!(usage.output_tokens, 75);
+    }
+
+    #[test]
+    fn crlf_framed_event_with_multiple_data_lines_joins_cleanly() {
+        // Per the SSE spec, multiple `data:` lines within one event are
+        // joined with `\n`. Under CRLF framing that means each line (as
+        // produced by splitting the event on `\n`) carries a trailing `\r`,
+        // not a leading one — stripping the wrong end leaves the `\r` stuck
+        // between the two lines' payloads instead of removed, which splits a
+        // token (here, the digits of `15`) and breaks JSON parsing.
+        let mut scanner = SseUsageScanner::new(ApiKind::OpenaiChat);
+        scanner.push(
+            b"data: {\"choices\": [], \"usage\": {\"prompt_tokens\": 1\r\n\
+              data: 5, \"completion_tokens\": 25}}\r\n\r\n",
+        );
+        let usage = scanner.finish();
+        assert_eq!(usage.input_tokens, 15);
+        assert_eq!(usage.output_tokens, 25);
+    }
+
+    #[test]
+    fn a_final_event_with_no_trailing_blank_line_is_still_parsed_on_finish() {
+        // A connection can close right after the last `data:` line with no
+        // terminating blank line — the event is still complete and
+        // parseable, so `finish` must not just drop it on the floor.
+        let mut scanner = SseUsageScanner::new(ApiKind::OpenaiChat);
+        scanner.push(
+            format!(
+                "data: {}",
+                json!({
+                    "choices": [],
+                    "usage": { "prompt_tokens": 9, "completion_tokens": 4 }
+                })
+            )
+            .as_bytes(),
+        );
+        let usage = scanner.finish();
+        assert_eq!(usage.input_tokens, 9);
+        assert_eq!(usage.output_tokens, 4);
     }
 
     #[test]

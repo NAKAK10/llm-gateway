@@ -568,7 +568,7 @@ fn emit(out: &mut Vec<u8>, event: &str, data: Value) {
 fn event_data(event: &str) -> String {
     let mut data = String::new();
     for line in event.split('\n') {
-        let line = line.strip_prefix('\r').unwrap_or(line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if let Some(rest) = line.strip_prefix("data: ") {
             data.push_str(rest);
         } else if let Some(rest) = line.strip_prefix("data:") {
@@ -1169,6 +1169,22 @@ mod tests {
                 "finish_reason": finish_reason,
             }],
         }))
+    }
+
+    #[test]
+    fn event_data_joins_crlf_framed_multiline_data_lines() {
+        // Per the SSE spec, multiple `data:` lines within one event are
+        // joined with `\n`. Under CRLF framing that means each line (as
+        // produced by splitting the event on `\n`) carries a trailing `\r`,
+        // not a leading one — stripping the wrong end leaves the `\r` stuck
+        // between the two lines' payloads instead of removed, which splits a
+        // token (here, the digits of `15`) and breaks JSON parsing.
+        let event = "data: {\"choices\": [], \"usage\": {\"prompt_tokens\": 1\r\n\
+                      data: 5, \"completion_tokens\": 25}}";
+        let data = event_data(event);
+        let json: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(json["usage"]["prompt_tokens"], 15);
+        assert_eq!(json["usage"]["completion_tokens"], 25);
     }
 
     #[test]
