@@ -368,6 +368,7 @@ mod tests {
             headers: Vec::new(),
             inject_usage: true,
             timeout: FIRST_BYTE_TIMEOUT,
+            is_utility_bypass: false,
         }
     }
 

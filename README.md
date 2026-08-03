@@ -625,8 +625,12 @@ Three views:
 - **Live** — a real-time feed (Server-Sent Events, `GET /api/live`) of every
   completed request: the prompt that came in, which route classification
   picked, which provider/model actually answered, and how it turned out.
-  Independent of `--debug`: it never touches disk, and disappears the moment
-  nothing is subscribed — see the difference below.
+  Each row is **click-to-expand**: the table shows the first three lines of
+  the prompt, and opening a row reveals the whole thing — the full user
+  prompt, the full system prompt, the routing reason, every candidate route's
+  score, and the request's own ids/token counts. Independent of `--debug`: it
+  never touches disk, and disappears the moment nothing is subscribed — see
+  the difference below.
 - **Vector Map** — every route's classification embedding, projected to 2-D
   (`GET /api/routes/vectors`), with incoming requests plotted live on the
   same map as they're classified. Needs the `semantic` feature and a loaded
@@ -676,12 +680,17 @@ gateway never edits those files either way.
   `127.0.0.1`/`localhost`/`[::1]`, closing the DNS-rebinding hole a
   cookie-only scheme would otherwise leave open for any web page you visit
   while the dashboard is running.
-- `--ui` combined with `--debug-full` sends **untruncated** prompt text over
-  the live feed (`GET /api/live`), not just the 200-character preview `--ui`
-  alone shows — `--debug-full` disables truncation everywhere it applies,
-  including there. Anyone who can reach the dashboard while both are on sees
-  full prompt text in real time, on top of what `--debug-full` already writes
-  to `logs/trace-*.jsonl`.
+- `--ui` sends **untruncated** prompt text over the live feed
+  (`GET /api/live`) — the collapsed row shows a 200-character preview, but the
+  whole user prompt and system prompt travel with every event so a row can be
+  expanded to read them. This does not depend on `--debug`/`--debug-full`: a
+  truncated preview made a long prompt undiagnosable from the dashboard, which
+  is the one thing the dashboard exists for, and unlike the trace log nothing
+  here is written down (in-memory, per-tab, gone when nothing is subscribed).
+  So anyone who can reach the dashboard sees full prompt text in real time —
+  which is what the token, the cookie and the `Host` check above are guarding.
+  `--debug-full` remains a separate, more consequential decision: it is what
+  puts that same text on disk permanently in `logs/trace-*.jsonl`.
 
 ## License
 

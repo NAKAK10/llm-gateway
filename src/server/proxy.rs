@@ -103,6 +103,25 @@ fn auto_route_requested(headers: &HeaderMap) -> bool {
     }
 }
 
+/// Mark every target in `resolution` as a `<transcript>` utility-bypass
+/// target when `outcome` says this request is one — all three
+/// `UtilityBypassResolution` shapes count, whether or not `resolved_targets`
+/// was set (see `classify_request`'s `<transcript>` branch). One central
+/// point rather than three, so it does not need repeating at every
+/// `classify_request` return site. A no-op for every other outcome, and for
+/// an empty target list.
+///
+/// `crate::agent::claude_cli` reads `Target::is_utility_bypass` to trim its
+/// own overhead for a call that expects a fast, short verdict rather than a
+/// full agent turn — see the 2026-08-03 entry in `docs/decisions.md`.
+fn mark_utility_bypass_targets(resolution: &mut route::Resolution, outcome: &SemanticOutcome) {
+    if matches!(outcome, SemanticOutcome::UtilityBypass(_)) {
+        for target in &mut resolution.targets {
+            target.is_utility_bypass = true;
+        }
+    }
+}
+
 /// Drop every target `expected_api` cannot reach, in place: reachable means
 /// the target speaks `expected_api` itself, or `Translation::select` finds a
 /// translation from `expected_api` to it. Returns how many targets were
@@ -240,6 +259,8 @@ pub async fn proxy(
         }
     };
 
+    mark_utility_bypass_targets(&mut resolution, &semantic_attempt.outcome);
+
     // Reachability filter. A route's default and its fallbacks may each speak
     // a different protocol now (cross-protocol fallback), so which targets
     // this request can even reach is decided per target rather than once for
@@ -287,23 +308,15 @@ pub async fn proxy(
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
     let debug = state.recorder.mode().debug;
-    // `serve --ui`'s live feed wants the same routing/prompt-preview data
-    // `--debug` records to disk, but it is a different, lower-stakes
-    // decision (ephemeral, in-memory, gone the moment nothing is
-    // subscribed) — so it gets its own gate rather than being tied to
-    // `debug`. `trace_input` is computed whenever either wants it; which of
-    // the two (or both) actually happens with the built record is decided
-    // per call site below.
+    // `serve --ui`'s live feed wants the same routing/prompt data `--debug`
+    // records to disk, but it is a different, lower-stakes decision
+    // (ephemeral, in-memory, gone the moment nothing is subscribed) — so it
+    // gets its own gate rather than being tied to `debug`. `trace_input` is
+    // computed whenever either wants it; which of the two (or both) actually
+    // happens with the built record is decided per call site below.
     let want_live = state.live.is_some();
-    let trace_input = (debug || want_live).then(|| {
-        extract_input(
-            expected_api,
-            &payload,
-            body.len(),
-            streaming,
-            state.recorder.mode().truncate_at(),
-        )
-    });
+    let trace_input =
+        (debug || want_live).then(|| extract_input(expected_api, &payload, body.len(), streaming));
 
     // Token counting is a question, not a generation: the answer is
     // model-specific, so falling back to a different provider would return a
@@ -752,13 +765,29 @@ fn live_event_from(
     point: Option<[f32; 2]>,
 ) -> crate::server::live::LiveEvent {
     let usage = record.usage.unwrap_or_default();
+    // The record holds the prompt in full (see `extract_input`); the row gets
+    // a clip, the expanded row gets everything. `prompt_full` is left `None`
+    // when the clip already *is* the whole text, so the common short-prompt
+    // case does not send the same string twice.
+    let prompt_preview = record
+        .input
+        .last_user_text
+        .as_deref()
+        .map(|text| crate::record::truncate(text, Some(crate::record::TRUNCATE_CHARS)));
+    let prompt_full = record
+        .input
+        .last_user_text
+        .clone()
+        .filter(|text| Some(text) != prompt_preview.as_ref());
     crate::server::live::LiveEvent {
         ts: record.ts.clone(),
         req_id: record.req_id.clone(),
         client: record.client.clone(),
         endpoint: record.endpoint.clone(),
         requested_model: record.requested_model.clone(),
-        prompt_preview: record.input.last_user_text.clone(),
+        prompt_preview,
+        prompt_full,
+        system_prompt: record.input.system_text.clone(),
         routing_mode: record.routing.mode.clone(),
         reason: record.routing.reason.clone(),
         matched_route: record.routing.matched_route.clone(),
@@ -1540,12 +1569,16 @@ fn now_rfc3339() -> String {
 /// Every accessor tolerates absence: a malformed-but-parseable body should
 /// produce a thin record, never a panic — the observer must not be the thing
 /// that breaks a request.
+///
+/// Prompt text comes back **in full**. The 200-character clip belongs to the
+/// trace file, not to the record, and is applied on the way there
+/// (`crate::record::Recorder::trace`) so the live feed can hand the dashboard
+/// the whole prompt to expand.
 fn extract_input(
     api: ApiKind,
     payload: &serde_json::Value,
     body_len: usize,
     stream: bool,
-    truncate_at: Option<usize>,
 ) -> TraceInput {
     let messages = match api {
         ApiKind::OpenaiResponses => payload.get("input"),
@@ -1558,10 +1591,8 @@ fn extract_input(
         _ => 0,
     };
 
-    let last_user_text =
-        last_user_text(api, messages).map(|t| crate::record::truncate(&t, truncate_at));
-    let system_text =
-        system_prompt_text(api, payload).map(|t| crate::record::truncate(&t, truncate_at));
+    let last_user_text = last_user_text(api, messages);
+    let system_text = system_prompt_text(api, payload);
 
     TraceInput {
         messages_n,
@@ -1663,6 +1694,7 @@ mod tests {
             headers: Vec::new(),
             inject_usage: true,
             timeout: crate::upstream::FIRST_BYTE_TIMEOUT,
+            is_utility_bypass: false,
         }
     }
 
@@ -1810,6 +1842,31 @@ mod tests {
         assert_eq!(event.candidates.len(), 1);
         assert_eq!(event.candidates[0].route, "role-writer");
         assert!((event.candidates[0].score - 0.9).abs() < 1e-6);
+        // Nothing was clipped, so there is no second copy to send.
+        assert!(event.prompt_full.is_none());
+    }
+
+    /// A prompt longer than the row can show is sent twice: clipped for the
+    /// collapsed row, whole for the expanded one. Without `prompt_full` the
+    /// dashboard could only ever show the first 200 characters, which is what
+    /// made a long prompt undiagnosable from the UI.
+    #[test]
+    fn live_event_from_carries_a_long_prompt_both_clipped_and_whole() {
+        let long = "a".repeat(300);
+        let mut record = test_trace_record(None);
+        record.input.last_user_text = Some(long.clone());
+        record.input.system_text = Some("You are a security monitor.".to_string());
+
+        let event = live_event_from(&record, 1, "success", 120, None, None);
+
+        let preview = event.prompt_preview.expect("the row still gets a preview");
+        assert_eq!(preview.chars().count(), 201); // 200 + ellipsis
+        assert!(preview.ends_with('…'));
+        assert_eq!(event.prompt_full.as_deref(), Some(long.as_str()));
+        assert_eq!(
+            event.system_prompt.as_deref(),
+            Some("You are a security monitor.")
+        );
     }
 
     #[cfg(feature = "semantic")]
@@ -1944,7 +2001,7 @@ mod tests {
             ],
             "tools": [{"name": "bash"}, {"name": "read"}],
         });
-        let input = extract_input(ApiKind::AnthropicMessages, &payload, 400, true, Some(200));
+        let input = extract_input(ApiKind::AnthropicMessages, &payload, 400, true);
         assert_eq!(input.messages_n, 3);
         assert_eq!(
             input.last_user_text.as_deref(),
@@ -1961,7 +2018,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"type": "function", "function": {"name": "write"}}],
         });
-        let input = extract_input(ApiKind::OpenaiChat, &payload, 40, false, None);
+        let input = extract_input(ApiKind::OpenaiChat, &payload, 40, false);
         assert_eq!(input.tools, vec!["write"]);
         assert!(!input.has_image);
     }
@@ -1969,25 +2026,26 @@ mod tests {
     #[test]
     fn responses_string_input_counts_as_one_message() {
         let payload = json!({ "input": "ping" });
-        let input = extract_input(ApiKind::OpenaiResponses, &payload, 20, false, Some(200));
+        let input = extract_input(ApiKind::OpenaiResponses, &payload, 20, false);
         assert_eq!(input.messages_n, 1);
         assert_eq!(input.last_user_text.as_deref(), Some("ping"));
     }
 
+    /// The record keeps prompt text whole — the 200-character clip is the
+    /// trace *file*'s policy (`Recorder::trace`), and the live feed needs the
+    /// untruncated text to expand a row.
     #[test]
-    fn long_user_text_is_truncated_with_a_marker() {
+    fn long_user_text_is_kept_in_full_on_the_record() {
         let long = "a".repeat(300);
-        let payload = json!({ "messages": [{"role": "user", "content": long}] });
-        let input = extract_input(ApiKind::AnthropicMessages, &payload, 400, false, Some(200));
-        let text = input.last_user_text.unwrap();
-        assert_eq!(text.chars().count(), 201); // 200 + ellipsis
-        assert!(text.ends_with('…'));
+        let payload = json!({ "messages": [{"role": "user", "content": long.clone()}] });
+        let input = extract_input(ApiKind::AnthropicMessages, &payload, 400, false);
+        assert_eq!(input.last_user_text.as_deref(), Some(long.as_str()));
     }
 
     #[test]
     fn absent_fields_produce_a_thin_record_not_a_panic() {
         let payload = json!({});
-        let input = extract_input(ApiKind::OpenaiChat, &payload, 2, false, None);
+        let input = extract_input(ApiKind::OpenaiChat, &payload, 2, false);
         assert_eq!(input.messages_n, 0);
         assert!(input.last_user_text.is_none());
         assert!(input.tools.is_empty());
@@ -1996,8 +2054,8 @@ mod tests {
     #[test]
     fn classification_texts_are_not_truncated_unlike_the_trace_log_version() {
         // `Embedder::embed` does its own bounding (800 chars); the 200-char
-        // truncation `extract_input` applies for the trace log must not
-        // leak into what actually gets classified.
+        // truncation the trace log applies must not leak into what actually
+        // gets classified.
         let long = "a".repeat(300);
         let payload = json!({ "messages": [{"role": "user", "content": long.clone()}] });
         let texts = classification_texts(ApiKind::AnthropicMessages, &payload);
@@ -2934,6 +2992,40 @@ mod tests {
             .expect("auto_mode resolves targets directly");
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].model_ref.model, "claude-haiku-fast");
+    }
+
+    /// `mark_utility_bypass_targets` is the one place `Target::is_utility_bypass`
+    /// gets set — this pins its contract directly rather than only through
+    /// the full `proxy()` handler (which would need a live upstream to
+    /// exercise end to end). Every `UtilityBypassResolution` variant must
+    /// mark its targets; every other outcome must leave them untouched.
+    #[test]
+    fn mark_utility_bypass_targets_marks_every_utility_bypass_variant() {
+        for outcome in [
+            SemanticOutcome::UtilityBypass(UtilityBypassResolution::AutoModeConfig),
+            SemanticOutcome::UtilityBypass(UtilityBypassResolution::RequestedModel),
+            SemanticOutcome::UtilityBypass(UtilityBypassResolution::DefaultFallback),
+        ] {
+            let mut resolution = route::Resolution {
+                route_name: "whatever".to_string(),
+                targets: vec![test_target(ApiKind::AnthropicMessages)],
+            };
+            mark_utility_bypass_targets(&mut resolution, &outcome);
+            assert!(
+                resolution.targets[0].is_utility_bypass,
+                "{outcome:?} should mark its targets"
+            );
+        }
+    }
+
+    #[test]
+    fn mark_utility_bypass_targets_leaves_ordinary_outcomes_untouched() {
+        let mut resolution = route::Resolution {
+            route_name: "role-writer".to_string(),
+            targets: vec![test_target(ApiKind::AnthropicMessages)],
+        };
+        mark_utility_bypass_targets(&mut resolution, &SemanticOutcome::Matched { texts_back: 0 });
+        assert!(!resolution.targets[0].is_utility_bypass);
     }
 
     /// Defensive fallback: if `Config::auto_mode` somehow fails to resolve at

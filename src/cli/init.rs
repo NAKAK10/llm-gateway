@@ -1799,6 +1799,7 @@ mod tests {
                         .collect(),
                     inject_usage: provider.inject_usage,
                     timeout: crate::upstream::FIRST_BYTE_TIMEOUT,
+                    is_utility_bypass: false,
                 },
                 false
             ),

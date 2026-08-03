@@ -44,7 +44,14 @@
 //!   instance) otherwise gets several hundred tokens of unrequested
 //!   reasoning, which is slow enough through a freshly spawned CLI process to
 //!   blow past the caller's own timeout (issue #17). This is guidance, not
-//!   an enforced cap: the model can still ignore it.
+//!   an enforced cap: the model can still ignore it. Worse, it previously
+//!   only fired when the caller's own payload set `max_tokens` — a
+//!   `<transcript>` utility call that omits `max_tokens` got no hint at all
+//!   and could ramble for as long as it liked (see the 2026-08-03 entry in
+//!   `docs/decisions.md`). `is_utility_bypass` (threaded in from
+//!   `crate::route::Target`, set only for that bypass) now makes
+//!   [`token_budget_hint`] fall back to a fixed default budget instead of
+//!   doing nothing.
 //!
 //! # Isolation, and why each flag is there
 //!
@@ -65,6 +72,16 @@
 //!   them.
 //! - `--strict-mcp-config` — no MCP servers, so no tool surface arrives that way
 //!   either.
+//!
+//! A `<transcript>` utility-bypass call (`is_utility_bypass`, set by
+//! `crate::server::proxy` and threaded through `crate::route::Target`) also
+//! gets `--no-session-persistence`: it is a one-shot judgment that will never
+//! be resumed, so writing a session transcript to disk for it is pure waste.
+//! Deliberately *not* included: `--effort low` would cut latency and tokens
+//! further, but it would also reduce how carefully this same call — Claude
+//! Code's own allow/deny judgment for a proposed agent action — gets
+//! reasoned about, which is not a trade to make on the gateway's own
+//! initiative (see the 2026-08-03 decisions.md entry).
 
 use serde_json::Value;
 
@@ -87,12 +104,25 @@ pub const STRIPPED_ENV: &[&str] = &[
 /// The program name looked up on `PATH`.
 pub const PROGRAM: &str = "claude";
 
+/// The CLI flag added for a utility-bypass call — see the module docs.
+const NO_SESSION_PERSISTENCE: &str = "--no-session-persistence";
+
 /// Build the child's arguments.
 ///
 /// `model` is passed through as given: the CLI accepts both aliases (`sonnet`,
 /// `opus`) and full ids, so `claude-cli/sonnet` and
 /// `claude-cli/claude-sonnet-4-6` both work without a mapping table here.
-pub fn args(model: &str, system: Option<&str>, streaming: bool, extra: &[String]) -> Vec<String> {
+///
+/// `is_utility_bypass` is `crate::route::Target::is_utility_bypass` — `true`
+/// only for Claude Code's own `<transcript>`-prefixed auto-mode judgment
+/// calls (see the module docs).
+pub fn args(
+    model: &str,
+    system: Option<&str>,
+    streaming: bool,
+    extra: &[String],
+    is_utility_bypass: bool,
+) -> Vec<String> {
     let mut args = vec!["-p".to_string()];
     if !super::codex_cli::is_cli_default(model) {
         args.push("--model".to_string());
@@ -124,6 +154,13 @@ pub fn args(model: &str, system: Option<&str>, streaming: bool, extra: &[String]
 
     if streaming {
         args.push("--include-partial-messages".to_string());
+    }
+
+    // Checked against `extra` rather than pushed unconditionally, in case an
+    // operator's own `providers.<name>.agent_args` already sets this flag —
+    // passing it twice risks the CLI's arg parser rejecting the duplicate.
+    if is_utility_bypass && !extra.iter().any(|a| a == NO_SESSION_PERSISTENCE) {
+        args.push(NO_SESSION_PERSISTENCE.to_string());
     }
 
     args.extend(extra.iter().cloned());
@@ -181,12 +218,30 @@ pub fn system(payload: &Value) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
+/// The budget assumed for a utility-bypass call whose payload sets no
+/// `max_tokens` of its own — Claude Code's internal judgment calls are a
+/// yes/no verdict, not a generation, so this only needs to be "small enough
+/// to keep a freshly spawned CLI process fast," not tuned to any particular
+/// answer shape.
+const UTILITY_BYPASS_DEFAULT_TOKEN_BUDGET: u64 = 20;
+
 /// A brevity instruction derived from the request's `max_tokens`, standing in
 /// for the sampling control the CLI has no flag for. Best-effort: it curbs
 /// the multi-hundred-token rambling measured on judgment-style utility calls
 /// (issue #17), but the model can still ignore it.
-fn token_budget_hint(payload: &Value) -> Option<String> {
-    let max_tokens = payload.get("max_tokens")?.as_u64()?;
+///
+/// Without `max_tokens` this used to do nothing at all — silently, since a
+/// caller expecting a short verdict does not necessarily send `max_tokens`.
+/// `is_utility_bypass` (`true` only for Claude Code's own `<transcript>`
+/// judgment calls — see the module docs) closes that gap by falling back to
+/// [`UTILITY_BYPASS_DEFAULT_TOKEN_BUDGET`] instead of returning `None`;
+/// ordinary requests are unaffected either way.
+fn token_budget_hint(payload: &Value, is_utility_bypass: bool) -> Option<String> {
+    let max_tokens = match payload.get("max_tokens").and_then(|v| v.as_u64()) {
+        Some(max_tokens) => max_tokens,
+        None if is_utility_bypass => UTILITY_BYPASS_DEFAULT_TOKEN_BUDGET,
+        None => return None,
+    };
     Some(format!(
         "IMPORTANT: Respond in at most about {max_tokens} tokens. Be direct \
          and concise — do not pad the answer with unrequested explanation or \
@@ -195,9 +250,13 @@ fn token_budget_hint(payload: &Value) -> Option<String> {
 }
 
 /// The full `--system-prompt` value: the caller's system text, if any, with
-/// [`token_budget_hint`] appended when the request set `max_tokens`.
-pub fn system_prompt(payload: &Value) -> Option<String> {
-    match (system(payload), token_budget_hint(payload)) {
+/// [`token_budget_hint`] appended whenever it has something to say (always,
+/// for a utility-bypass call — see [`token_budget_hint`]).
+pub fn system_prompt(payload: &Value, is_utility_bypass: bool) -> Option<String> {
+    match (
+        system(payload),
+        token_budget_hint(payload, is_utility_bypass),
+    ) {
         (Some(base), Some(hint)) => Some(format!("{base}\n\n{hint}")),
         (Some(base), None) => Some(base),
         (None, Some(hint)) => Some(hint),
@@ -659,7 +718,7 @@ mod tests {
 
     #[test]
     fn args_deny_tools_and_isolate_settings() {
-        let args = args("sonnet", None, false, &[]);
+        let args = args("sonnet", None, false, &[], false);
         // `--allowedTools ""` is deny-all; the empty string must be its own
         // argument, not omitted.
         let index = args.iter().position(|a| a == "--allowedTools").unwrap();
@@ -674,13 +733,13 @@ mod tests {
 
     #[test]
     fn streaming_asks_for_partial_messages() {
-        let args = args("opus", None, true, &[]);
+        let args = args("opus", None, true, &[], false);
         assert!(args.iter().any(|a| a == "--include-partial-messages"));
     }
 
     #[test]
     fn a_system_prompt_replaces_rather_than_appends() {
-        let args = args("sonnet", Some("You are terse."), false, &[]);
+        let args = args("sonnet", Some("You are terse."), false, &[], false);
         assert!(args
             .windows(2)
             .any(|w| w == ["--system-prompt", "You are terse."]));
@@ -689,14 +748,57 @@ mod tests {
 
     #[test]
     fn an_empty_system_prompt_is_not_passed_at_all() {
-        let args = args("sonnet", Some("   "), false, &[]);
+        let args = args("sonnet", Some("   "), false, &[], false);
         assert!(!args.iter().any(|a| a == "--system-prompt"));
     }
 
     #[test]
     fn extra_args_come_last_so_they_can_override() {
-        let args = args("sonnet", None, false, &["--add-dir".into(), "/tmp".into()]);
+        let args = args(
+            "sonnet",
+            None,
+            false,
+            &["--add-dir".into(), "/tmp".into()],
+            false,
+        );
         assert_eq!(&args[args.len() - 2..], &["--add-dir", "/tmp"]);
+    }
+
+    /// An ordinary (non-utility-bypass) call never gets the flag — proves
+    /// `is_utility_bypass` actually gates it rather than it always firing.
+    #[test]
+    fn ordinary_calls_do_not_get_no_session_persistence() {
+        let args = args("sonnet", None, false, &[], false);
+        assert!(!args.iter().any(|a| a == "--no-session-persistence"));
+    }
+
+    /// The one behavior change this whole fix is for: a `<transcript>`
+    /// utility-bypass call gets `--no-session-persistence` — a one-shot
+    /// judgment that will never be resumed has no use for a saved session.
+    #[test]
+    fn a_utility_bypass_call_gets_no_session_persistence() {
+        let args = args("sonnet", None, false, &[], true);
+        assert!(args.iter().any(|a| a == "--no-session-persistence"));
+    }
+
+    /// If an operator's own `providers.<name>.agent_args` already sets this
+    /// flag, it must not be pushed a second time — some CLI arg parsers
+    /// reject a duplicate flag outright.
+    #[test]
+    fn a_utility_bypass_call_does_not_duplicate_an_operator_configured_flag() {
+        let args = args(
+            "sonnet",
+            None,
+            false,
+            &["--no-session-persistence".into()],
+            true,
+        );
+        assert_eq!(
+            args.iter()
+                .filter(|a| *a == "--no-session-persistence")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -740,19 +842,44 @@ mod tests {
 
     #[test]
     fn token_budget_hint_is_present_when_max_tokens_is_set() {
-        let hint = token_budget_hint(&json!({"max_tokens": 64})).unwrap();
+        let hint = token_budget_hint(&json!({"max_tokens": 64}), false).unwrap();
         assert!(hint.contains("64"), "{hint}");
     }
 
     #[test]
     fn token_budget_hint_is_absent_without_max_tokens() {
-        assert!(token_budget_hint(&json!({})).is_none());
+        assert!(token_budget_hint(&json!({}), false).is_none());
+    }
+
+    /// The gap this whole fix closes: a utility-bypass call with no
+    /// `max_tokens` of its own used to get no hint at all, and could ramble
+    /// for as long as the model liked. It now falls back to
+    /// `UTILITY_BYPASS_DEFAULT_TOKEN_BUDGET`.
+    #[test]
+    fn token_budget_hint_falls_back_to_a_default_for_a_utility_bypass_request_without_max_tokens() {
+        let hint = token_budget_hint(&json!({}), true).unwrap();
+        assert!(
+            hint.contains(&UTILITY_BYPASS_DEFAULT_TOKEN_BUDGET.to_string()),
+            "{hint}"
+        );
+    }
+
+    /// A utility-bypass call that *does* set its own `max_tokens` keeps that
+    /// value — the default only fills the gap, it does not override.
+    #[test]
+    fn token_budget_hint_respects_a_utility_bypass_requests_own_max_tokens() {
+        let hint = token_budget_hint(&json!({"max_tokens": 64}), true).unwrap();
+        assert!(hint.contains("64"), "{hint}");
+        assert!(
+            !hint.contains(&UTILITY_BYPASS_DEFAULT_TOKEN_BUDGET.to_string()),
+            "{hint}"
+        );
     }
 
     #[test]
     fn system_prompt_appends_the_budget_hint_to_the_callers_system() {
         let payload = json!({"system": "You are terse.", "max_tokens": 64});
-        let combined = system_prompt(&payload).unwrap();
+        let combined = system_prompt(&payload, false).unwrap();
         assert!(combined.starts_with("You are terse."), "{combined}");
         assert!(combined.contains("64"), "{combined}");
     }
@@ -760,19 +887,34 @@ mod tests {
     #[test]
     fn system_prompt_is_just_the_hint_when_the_caller_has_no_system() {
         let payload = json!({"max_tokens": 64});
-        let combined = system_prompt(&payload).unwrap();
+        let combined = system_prompt(&payload, false).unwrap();
         assert!(combined.contains("64"), "{combined}");
     }
 
     #[test]
     fn system_prompt_is_just_the_callers_system_without_max_tokens() {
         let payload = json!({"system": "You are terse."});
-        assert_eq!(system_prompt(&payload).as_deref(), Some("You are terse."));
+        assert_eq!(
+            system_prompt(&payload, false).as_deref(),
+            Some("You are terse.")
+        );
     }
 
     #[test]
     fn system_prompt_is_none_when_neither_is_present() {
-        assert!(system_prompt(&json!({})).is_none());
+        assert!(system_prompt(&json!({}), false).is_none());
+    }
+
+    /// The other half of the fix, at the `system_prompt` level: a
+    /// utility-bypass call gets the default budget hint even with no
+    /// caller-set `max_tokens` and no caller-set system prompt at all.
+    #[test]
+    fn system_prompt_applies_the_default_budget_for_a_utility_bypass_request() {
+        let combined = system_prompt(&json!({}), true).unwrap();
+        assert!(
+            combined.contains(&UTILITY_BYPASS_DEFAULT_TOKEN_BUDGET.to_string()),
+            "{combined}"
+        );
     }
 
     #[test]

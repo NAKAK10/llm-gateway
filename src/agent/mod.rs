@@ -67,12 +67,13 @@ async fn spawn_claude(
     streaming: bool,
 ) -> Result<Spawned> {
     let cwd = scratch_dir()?;
-    let system = claude_cli::system_prompt(payload);
+    let system = claude_cli::system_prompt(payload, target.is_utility_bypass);
     let args = claude_cli::args(
         &target.model_ref.model,
         system.as_deref(),
         streaming,
         &target.agent_args,
+        target.is_utility_bypass,
     );
     let prompt = claude_cli::prompt(payload);
 

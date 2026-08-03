@@ -2,6 +2,85 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-08-03 — A utility-bypass call gets a real brevity floor and skips session persistence
+
+The owner's real gateway showed 26 `<auto-mode>` (`utility_bypass`) requests
+in a 5-minute window, all `attempt: 1` / `status: success` — no gateway-side
+retry, fallback, or error anywhere. They arrived in tight, non-overlapping
+groups of 5 identical requests (same payload bytes, confirmed via
+`tokens_est`): request N+1 started essentially the instant request N's
+response was delivered. Output length varied wildly for the *same* judgment,
+from 5 tokens up to 1425, over 4–19s per call. This is Claude Code's own
+internal auto-mode permission classifier re-issuing an identical judgment
+repeatedly — the same "Auto mode could not evaluate this action" failure
+mode the 2026-08-01 `Config::auto_mode` entry below already documents,
+happening even with `autoMode` pinned to a dedicated, non-shared target.
+
+**Blaming the model was rejected, correctly.** `autoMode` here points at
+`anthropic-subscription/sonnet` (a `claude-cli` subprocess), and the same
+model runs fine through the same transport for ordinary sessions in this
+setup — so "claude-cli/sonnet is slow, pin `autoMode` at something else"
+would have been treating a symptom of a *different, more specific* bug as
+the cause. The real gap was already half-documented in
+`claude_cli.rs`'s own doc comments: `token_budget_hint` — the only guard
+against "multi-hundred-token rambling on judgment-style utility calls"
+(issue #17) — is best-effort (the model can ignore it) **and only fires when
+the caller's own payload sets `max_tokens`**. Claude Code's internal
+judgment request may not set it at all, in which case the hint silently does
+nothing and the model is free to take as long as it likes. Even a 5-token
+answer got retried in the real log, which fits a client-side "the whole
+call took too long" give-up better than "the answer wasn't understood."
+
+**Decision: thread `Target::is_utility_bypass` down to the actual `claude -p`
+invocation, and use it for two purely mechanical fixes — nothing that
+changes how carefully the judgment itself gets made.** The fact "this
+request is the `<transcript>` bypass" was already fully computed inside
+`classify_request` (`SemanticOutcome::UtilityBypass`, all three of its
+resolutions) but discarded before reaching `agent::spawn` — it now survives
+as a field on `route::Target`, set in one place
+(`proxy::mark_utility_bypass_targets`, called right where `Resolution` is
+built from `semantic_attempt`, covering all three resolutions without
+repeating the mutation at each of `classify_request`'s three return sites).
+`agent::claude_cli::token_budget_hint` now falls back to a fixed
+`UTILITY_BYPASS_DEFAULT_TOKEN_BUDGET` (20) when `max_tokens` is absent *and*
+`is_utility_bypass` is set — closing exactly the gap above — and `args()`
+adds `--no-session-persistence` for the same targets: a one-shot judgment
+that will never be resumed gains nothing from a saved session, so skipping
+that disk write is a pure latency win with no behavioral change to the
+model's answer. Both are no-ops for every ordinary claude-cli request:
+`is_utility_bypass` defaults to `false` everywhere except this one bypass.
+
+**Deliberately excluded: `--effort low`.** It would cut latency and tokens
+further than either change above, but it would also reduce how carefully
+Claude Code's own allow/deny judgment for a proposed agent action gets
+reasoned about — a security-relevant decision, not an implementation detail
+— and that trade is the operator's to make, not the gateway's to assume.
+Confirmed with the owner and left out.
+
+## 2026-08-03 — The live feed carries the whole prompt; the trace log clips it
+
+`extract_input` used to apply `RecordMode::truncate_at()` (200 chars unless
+`--debug-full`) while *building* the `TraceRecord`, and `serve --ui`'s live
+feed reused that record's `last_user_text` verbatim. So the dashboard could
+only ever show the first 200 characters of a prompt, with `--debug-full` — a
+decision about **what goes on disk permanently** — as the only way to see
+more. A judgment-style request whose interesting part is 30k tokens in was
+undiagnosable from the dashboard, which is the one thing the dashboard is for.
+
+**Decision: the record holds prompt text in full, and the 200-char clip moves
+to the write boundary** (`Recorder::trace`). Truncation is a property of
+`trace-*.jsonl`, not of the record: the live feed is in-memory, per-tab, and
+gone the moment nothing is subscribed (see `server::live`'s module docs for
+why that was already a separate decision from `--debug`), so it can carry
+everything while the file keeps clipping. `LiveEvent` gained `prompt_full` and
+`system_prompt` alongside the existing `prompt_preview` — the preview is what
+the collapsed table row shows (always clipped, `--debug-full` or not: it is a
+row in a table), `prompt_full` is what an expanded row reads, and it is left
+`None` when the preview already *is* the whole text so a short prompt is not
+sent twice. The consequence is recorded in the README's security notes:
+reaching the dashboard now means seeing full prompt text in real time, which
+is what the one-time token, the `HttpOnly` cookie and the `Host` check guard.
+
 ## 2026-08-02 — `input_tokens` excludes cached tokens on the client-facing Anthropic shape too
 
 `usage::parse` normalizes OpenAI-shaped usage (`prompt_tokens`/`input_tokens`,

@@ -1146,6 +1146,44 @@ async fn a_completed_request_publishes_a_live_event() {
         event.prompt_preview.as_deref(),
         Some("hello from the live feed test")
     );
+    // Short enough that the preview *is* the whole prompt, so there is no
+    // second copy to send.
+    assert!(event.prompt_full.is_none());
+}
+
+/// A prompt longer than the table row can show still reaches the dashboard in
+/// full, so the row can be expanded to read it — and without `--debug`, since
+/// the live feed never touches disk. This is the end-to-end half of
+/// `live_event_from_carries_a_long_prompt_both_clipped_and_whole`.
+#[tokio::test]
+async fn a_live_event_carries_a_long_prompt_in_full_without_debug() {
+    let (upstream, _mock) = spawn_mock().await;
+    let (addr, live, _token) = spawn_gateway_with_live(translated_config(upstream), None).await;
+    let mut rx = live.subscribe();
+
+    let long = "あ".repeat(500);
+    reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "anything",
+            "messages": [{"role": "user", "content": long}],
+            "system": "you are a security monitor",
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a live event should arrive promptly")
+        .expect("the channel should not have closed");
+
+    let preview = event.prompt_preview.expect("the row still gets a preview");
+    assert_eq!(preview.chars().count(), 201); // 200 + ellipsis
+    assert_eq!(
+        event.prompt_full.as_deref().map(|t| t.chars().count()),
+        Some(500)
+    );
 }
 
 /// A build that turns the dashboard off entirely (`--ui` never passed)

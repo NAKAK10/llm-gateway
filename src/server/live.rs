@@ -84,11 +84,26 @@ pub struct LiveEvent {
     pub client: String,
     pub endpoint: String,
     pub requested_model: String,
-    /// Truncated the same way `TraceInput::last_user_text` is (200
-    /// characters unless `--debug-full`). `None` when the request carried no
-    /// user text to show.
+    /// The first 200 characters of the newest user text — what the dashboard
+    /// shows in the collapsed row. `None` when the request carried no user
+    /// text to show. Always clipped here regardless of `--debug-full`: this
+    /// is a row in a table, and `prompt_full` is what an expanded row reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_preview: Option<String>,
+    /// The same text **untruncated**, for the dashboard's expanded row.
+    ///
+    /// Independent of `--debug`/`--debug-full`, which govern what lands on
+    /// disk: this never leaves memory and lives only as long as a tab is
+    /// subscribed (see the module docs), and a preview that stops mid-sentence
+    /// is exactly the thing that made a prompt undiagnosable from the
+    /// dashboard alone. `None` when it would just repeat `prompt_preview`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_full: Option<String>,
+    /// The request's system prompt in full, same reasoning as `prompt_full` —
+    /// on an agent request this is the agent definition, which is often what
+    /// actually explains the route. `None` when the request carried none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
     /// `explicit`, `semantic`, `semantic_history`, `semantic_system`,
     /// `manual`, `no_classifier`, `no_text`, or `utility_bypass` — same
     /// vocabulary as `TraceRouting::mode`.
@@ -142,6 +157,8 @@ mod tests {
             endpoint: "/v1/messages".to_string(),
             requested_model: "claude-sonnet-4-6".to_string(),
             prompt_preview: Some("hello".to_string()),
+            prompt_full: None,
+            system_prompt: None,
             routing_mode: "semantic".to_string(),
             reason: "matched".to_string(),
             matched_route: "role-writer".to_string(),
