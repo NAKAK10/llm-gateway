@@ -26,6 +26,7 @@ mod responses_to_chat;
 
 pub use anthropic_to_chat::anthropic_to_chat;
 pub(crate) use anthropic_to_chat::system_text;
+pub(crate) use anthropic_to_chat::tool_result_text;
 pub use responses_to_anthropic::responses_to_anthropic;
 pub(crate) use responses_to_chat::message_text;
 pub use responses_to_chat::responses_to_chat;
