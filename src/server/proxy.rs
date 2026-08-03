@@ -1536,20 +1536,37 @@ fn classification_content_text(api: ApiKind, content: &serde_json::Value) -> Opt
                 ApiKind::OpenaiResponses => "input_text",
                 _ => "text",
             };
-            let parts: Vec<String> = blocks
-                .iter()
-                .filter_map(|b| match b.get("type").and_then(|t| t.as_str()) {
+            // `text`-type blocks are the message's own authored words; a
+            // `tool_result` block is quoted output the message merely
+            // carries alongside them. Joining in array order let a
+            // `tool_result` that happens to sit before the text block push
+            // that text out of first position — which broke the
+            // `<transcript>` utility-bypass check in `classify_request`
+            // (`texts.first().starts_with("<transcript>")`) for exactly the
+            // shape a permission-classifier call needing to show the tool
+            // result it is judging would use. Collecting `text` blocks first
+            // means the message's own words always lead the joined string,
+            // no matter where amid quoted tool output they were placed.
+            let mut text_parts = Vec::new();
+            let mut tool_result_parts = Vec::new();
+            for b in blocks {
+                match b.get("type").and_then(|t| t.as_str()) {
                     Some(t) if t == text_key_type => {
-                        b.get("text").and_then(|t| t.as_str()).map(str::to_string)
+                        if let Some(text) = b.get("text").and_then(|t| t.as_str()) {
+                            text_parts.push(text.to_string());
+                        }
                     }
                     Some("tool_result") => {
                         let text = crate::translate::request::tool_result_text(b.get("content"));
-                        (!text.is_empty()).then_some(text)
+                        if !text.is_empty() {
+                            tool_result_parts.push(text);
+                        }
                     }
-                    _ => None,
-                })
-                .collect();
-            (!parts.is_empty()).then(|| parts.join("\n"))
+                    _ => {}
+                }
+            }
+            text_parts.extend(tool_result_parts);
+            (!text_parts.is_empty()).then(|| text_parts.join("\n"))
         }
         _ => None,
     }
@@ -2226,6 +2243,31 @@ mod tests {
         ]});
         let texts = classification_texts(ApiKind::AnthropicMessages, &payload);
         assert_eq!(texts, vec!["line one\nline two"]);
+    }
+
+    #[test]
+    fn classification_texts_put_a_messages_own_text_before_a_tool_result_in_the_same_content_array()
+    {
+        // A single message can carry both a `tool_result` block and a
+        // `text` block together — e.g. Claude Code's internal auto-mode
+        // permission classifier attaching the tool result it is judging
+        // alongside its own `<transcript>`-wrapped yes/no question. Joining
+        // in raw array order let the `tool_result` (placed first here) push
+        // the message's own text out of first position, which broke the
+        // `<transcript>` bypass's `starts_with` check in `classify_request`.
+        // The message's own text must always lead, regardless of where the
+        // blocks fall in the array.
+        let payload = json!({ "messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "some tool call history"},
+                {"type": "text", "text": "<transcript>...</transcript>\nis this safe?"},
+            ]},
+        ]});
+        let texts = classification_texts(ApiKind::AnthropicMessages, &payload);
+        assert_eq!(
+            texts,
+            vec!["<transcript>...</transcript>\nis this safe?\nsome tool call history"]
+        );
     }
 
     #[test]
@@ -3062,6 +3104,42 @@ mod tests {
         assert_eq!(attempt.embed_ms, 0);
         assert!(attempt.decided_by_text.is_none());
         assert!(attempt.walk.is_empty());
+    }
+
+    /// Regression covered directly at the `classify_request` level, not
+    /// just `classification_texts`: a `<transcript>`-prefixed message whose
+    /// `content` array also carries a `tool_result` block ahead of the text
+    /// block must still bypass classification. Before the fix, joining
+    /// those blocks in raw array order pushed the `<transcript>` text out of
+    /// first position, the bypass's `starts_with` check missed it, and the
+    /// request fell through to ordinary semantic classification — exactly
+    /// the slow-target failure mode `Config::auto_mode` exists to prevent.
+    #[cfg(feature = "semantic")]
+    #[tokio::test]
+    async fn classify_request_bypasses_classification_for_a_transcript_message_that_also_carries_a_tool_result(
+    ) {
+        let (_dir, state) = test_state(classifiable_config());
+        let config = state.config.get();
+        let payload = json!({ "messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "some tool call history"},
+                {"type": "text", "text": "<transcript>...</transcript>\nis this safe?"},
+            ]},
+        ]});
+
+        let attempt = classify_request(
+            &state,
+            &config,
+            &payload,
+            ApiKind::AnthropicMessages,
+            "role-writer",
+        );
+
+        assert_eq!(
+            attempt.outcome,
+            SemanticOutcome::UtilityBypass(UtilityBypassResolution::RequestedModel)
+        );
+        assert_eq!(attempt.resolve_as, "role-writer");
     }
 
     /// System-prompt classification must never even be attempted on a

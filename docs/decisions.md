@@ -2,6 +2,40 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-08-03 — A message's own text leads a mixed `content` array, ahead of any `tool_result` block it also carries
+
+Reported failure: auto-mode judgment calls kept re-asking the same yes/no
+question, the same symptom the "brevity floor" entry below already fixed
+once. It resurfaced through a different door: the `tool_result`-joins-the-
+history-walk change directly below this entry (also 2026-08-03) made
+`classification_content_text` join a message's `text` and `tool_result`
+blocks in raw array order. Claude Code's internal `<transcript>` permission
+classifier can attach the tool result it is judging *ahead of* its own
+`<transcript>`-wrapped question in the same `content` array — a shape no
+existing test constructed. When it does, the joined string starts with the
+quoted tool output, not `<transcript>`, so `classify_request`'s bypass check
+(`texts.first().is_some_and(|t| t.starts_with("<transcript>"))`,
+`src/server/proxy.rs`) misses it. The request then falls through to ordinary
+semantic classification, can land on a slow shared target, and Claude
+Code's own client-side timeout gives up and retries the identical judgment
+— exactly the failure mode `Config::auto_mode` and the brevity-floor fix
+exist to prevent, just reached from a routing miss instead of a token
+budget miss.
+
+**Fix: collect `text`-type blocks first, `tool_result` blocks after**, in
+`classification_content_text` (`src/server/proxy.rs`) — regardless of their
+order in the source array. A message's own authored words are what the
+message is *about*; a `tool_result` block it also carries is quoted output
+alongside them, not a substitute for them, so it belongs after, not
+wherever the array happened to place it. This does not touch the
+2026-07-31/08-03 history-walk behavior below: a `tool_result`-*only*
+message (no text block at all) is unaffected, since there is nothing to put
+ahead of it either way. Covered directly at both the `classification_texts`
+level and the `classify_request` level (`src/server/proxy.rs`'s test
+module) with a `content` array carrying a `tool_result` block before a
+`<transcript>`-prefixed text block, so a future reordering-style change
+trips a test before it reaches production.
+
 ## 2026-08-03 — `tool_result` content joins the history walk instead of being treated as blank
 
 Reported failure: pasting a bare URL ("見て: https://github.com/.../issues/N")
