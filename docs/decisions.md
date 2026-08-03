@@ -2,6 +2,159 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-08-03 — Agent-CLI providers get a per-provider concurrency cap (issue #40)
+
+Re-auditing the gateway's own trace log restricted to just the current
+process's session (not the 3-day blend the fallback-warning entry below was
+based on, which mixed in earlier versions' behavior) found the failure burst
+had a precise shape: request volume jumped from a 5-20/minute baseline to
+109 and 81 requests in two consecutive minutes, and `anthropic-subscription`
+(the `claude-cli` transport) attempts in that exact window failed at
+50.2% and 35.9% — before and after, 0%. The trace records from that window
+show heavy parallel subagent fan-out (`cc_is_subagent=true`, many distinct
+tool lists, several `role-explorer`/`role-implementer`/`role-reviewer`
+requests within the same second). `agent::spawn` had no concurrency limiting
+anywhere — every request resolving to an agent-cli target spawned a `claude`
+child process immediately, no cap, no queue. A burst of concurrent requests
+spawning a burst of concurrent `claude -p` processes at once is a very
+plausible way to exhaust the local machine's process/fd limits or the
+subscription's own concurrent-session ceiling, both surfacing here as
+`http_502` (`agent::mod`'s `buffered_body`/`stream_body` turn "CLI exited
+non-zero" or "no parseable output" into `BAD_GATEWAY`).
+
+**`AgentLimiter`** (`src/agent/mod.rs`): one `tokio::sync::Semaphore` per
+provider id, process-wide (`static LIMITER: LazyLock<AgentLimiter>`), sized
+by the target's `max_concurrent` (new field, threaded through
+`route::build_target` the same way `timeout` already is) — defaulting to
+`DEFAULT_MAX_CONCURRENT` (8) when the provider's config sets no
+`maxConcurrent`. `spawn_claude`/`spawn_codex` acquire a permit *before*
+`Command::spawn()`, so a burst queues for a free slot instead of spawning
+unboundedly; the permit is held for however long the child actually runs,
+not just for the call into `agent::spawn` — for a streaming `claude-cli`
+response that means moving it into `stream_body`'s background task so it
+only drops once the child has actually exited, well after `spawn_claude`
+itself has returned.
+
+Not threaded through `AppState`: `agent::spawn` already has everything a
+limiter needs (the provider id and `max_concurrent`, both off `Target`)
+without adding a parameter through `upstream::send_with_fallback`'s generic
+`build` closure just for this. Same once-per-process-lifetime tradeoff
+`ui::pca::BasisCache` already accepts elsewhere: a provider's semaphore is
+sized the first time that provider id is used and kept for the process's
+life, so a hot-reloaded `maxConcurrent` change only takes effect for a
+provider id not already in use. `config::validate` rejects `maxConcurrent: 0`
+(would deadlock every request against that provider) and warns when an HTTP
+provider sets it (it only bounds local child processes, so it does nothing
+there) — the limiter itself also refuses to build a zero-permit semaphore as
+a last line of defense, degrading to "one at a time" rather than hanging if
+a malformed config somehow reaches it anyway.
+
+## 2026-08-03 — Failed upstream attempts keep *why*, not just a result code (issue #39)
+
+The same trace-log audit above needed to distinguish "the CLI wasn't logged
+in" from "the CLI crashed" from "the upstream returned a real 502" from "the
+network was down" for the burst of failures it was investigating — and
+could not, from the log alone. `TraceAttempt` (`src/record/trace_log.rs`)
+only ever recorded `result: "http_502"`/`"connect_error"`/`"timeout"` — a
+fixed vocabulary with nothing underneath it. The actual detail already
+existed in two places and was thrown away in both: `agent::mod`'s
+`buffered_body`/`spawn_codex` compute a real message (a CLI's stderr excerpt,
+its exit status, or its own reported reason) and serialize it into the
+*client-facing* error body, never keeping a copy anywhere `send_with_fallback`
+could reach; and a `reqwest::Error` on the plain-HTTP branch already gets
+logged via `tracing::info!` at the exact call site that discards it a line
+later.
+
+**`TraceAttempt.detail: Option<String>`** (new, additive field) carries this
+through wherever it's available: `agent::Spawned` grew the same field,
+populated by `buffered_body`/`spawn_codex`'s existing message and read by
+`send_with_fallback` before it pushes the attempt; the plain-HTTP branch's
+`connect_error`/`send_error`/`timeout` cases use the `reqwest::Error`'s own
+`to_string()` (already computed for the `tracing::info!` beside it); and a
+*retryable* HTTP status (moving on to another target, so this response is
+being discarded anyway, not forwarded) now reads its body for up to 500
+characters — many APIs put the actual reason (quota, auth, malformed
+request) there. The one HTTP case left `None` on purpose: the *final*
+attempt's body streams straight through to the client as `Accepted`, and
+reading it here to populate `detail` would empty the stream that response
+needs.
+
+**Not fixed, and now written down as its own gap:** a *streaming*
+`claude-cli` attempt's real outcome is invisible to `TraceAttempt` entirely,
+not just missing a detail string. `spawn_claude`'s streaming branch reports
+`status: OK` unconditionally, before the child has even run — confirmed
+against the same trace log: every `stream: true` request against
+`anthropic-subscription` recorded `ok_first_byte`, while every `http_502`
+and `timeout` came exclusively from `stream: false` requests. A child that
+fails mid-stream surfaces only as an SSE error frame injected by
+`stream_body`, after `send_with_fallback` has already recorded success and
+returned — invisible to trace/usage logging and to fallback alike. Fixing
+that needs the module's own stated invariant re-examined ("fallback only
+happens before the first response byte reaches the client") — filed
+separately rather than folded in here.
+
+## 2026-08-03 — `config check` warns when a route has no fallback target
+
+Auditing a real gateway's `trace-*.jsonl` (992 requests over 3 days) found
+routes with a `default`-only `model` — no `fallbacks` — failing 40-80% of
+their requests completely: `role-web-researcher` 80% (16/20), `role-reviewer`
+64.3% (45/70), `role-implementer` 40.4% (46/114). In every one of those
+cases the route's single target hit a transient failure
+(`upstream::send_with_fallback`'s `http_502`/`connect_error`/`timeout`
+results — a `claude-cli` subprocess crash or an upstream 502, not anything
+routing-related) with nothing configured to fall back to, so the request
+failed outright. Routes that already had a fallback (`default`,
+`role-chore`, `role-explorer`) recovered from the exact same class of
+failure instead.
+
+Not an error — some setups may accept the risk deliberately, and plenty of
+existing configs (including this one, before the trace-log audit above)
+run for a long time before it matters — but worth surfacing where an
+operator will actually see it before it costs them a chunk of failed
+requests. `validate` (`src/config/validate.rs`) now warns per-route when
+`model.fallbacks` is empty, same non-fatal `report.warn` mechanism as the
+existing "provider defined but unused" warning. Filed
+[issue #39](https://github.com/NAKAK10/llm-gateway/issues/39) for the
+harder half of the same audit: the trace log has no field for *why* an
+attempt failed (`TraceAttempt` only ever records `result: "http_502"` etc.,
+never the CLI's stderr or the `reqwest::Error` detail that's already
+computed and then discarded) — diagnosing the 502s above took reading the
+gateway's source, not its logs.
+
+## 2026-08-03 — A message's own text leads a mixed `content` array, ahead of any `tool_result` block it also carries
+
+Reported failure: auto-mode judgment calls kept re-asking the same yes/no
+question, the same symptom the "brevity floor" entry below already fixed
+once. It resurfaced through a different door: the `tool_result`-joins-the-
+history-walk change directly below this entry (also 2026-08-03) made
+`classification_content_text` join a message's `text` and `tool_result`
+blocks in raw array order. Claude Code's internal `<transcript>` permission
+classifier can attach the tool result it is judging *ahead of* its own
+`<transcript>`-wrapped question in the same `content` array — a shape no
+existing test constructed. When it does, the joined string starts with the
+quoted tool output, not `<transcript>`, so `classify_request`'s bypass check
+(`texts.first().is_some_and(|t| t.starts_with("<transcript>"))`,
+`src/server/proxy.rs`) misses it. The request then falls through to ordinary
+semantic classification, can land on a slow shared target, and Claude
+Code's own client-side timeout gives up and retries the identical judgment
+— exactly the failure mode `Config::auto_mode` and the brevity-floor fix
+exist to prevent, just reached from a routing miss instead of a token
+budget miss.
+
+**Fix: collect `text`-type blocks first, `tool_result` blocks after**, in
+`classification_content_text` (`src/server/proxy.rs`) — regardless of their
+order in the source array. A message's own authored words are what the
+message is *about*; a `tool_result` block it also carries is quoted output
+alongside them, not a substitute for them, so it belongs after, not
+wherever the array happened to place it. This does not touch the
+2026-07-31/08-03 history-walk behavior below: a `tool_result`-*only*
+message (no text block at all) is unaffected, since there is nothing to put
+ahead of it either way. Covered directly at both the `classification_texts`
+level and the `classify_request` level (`src/server/proxy.rs`'s test
+module) with a `content` array carrying a `tool_result` block before a
+`<transcript>`-prefixed text block, so a future reordering-style change
+trips a test before it reaches production.
+
 ## 2026-08-03 — `tool_result` content joins the history walk instead of being treated as blank
 
 Reported failure: pasting a bare URL ("見て: https://github.com/.../issues/N")

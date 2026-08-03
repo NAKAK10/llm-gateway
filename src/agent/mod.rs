@@ -24,11 +24,14 @@
 pub mod claude_cli;
 pub mod codex_cli;
 
+use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::{LazyLock, Mutex};
 
 use bytes::Bytes;
 use futures_util::Stream;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::error::{Error, Result};
 use crate::route::Target;
@@ -39,7 +42,74 @@ pub struct Spawned {
     pub status: http::StatusCode,
     pub headers: http::HeaderMap,
     pub body: super::upstream::BodyStream,
+    /// Set exactly when `status` is not a success — the same detail message
+    /// (CLI stderr excerpt, exit status, or the CLI's own reported reason)
+    /// that is also serialized into `body`'s error JSON, kept here as a
+    /// plain string too so `upstream::send_with_fallback` can put it on the
+    /// `TraceAttempt` it records (see issue #39). `None` for a streaming
+    /// attempt: `spawn_claude` reports `status: OK` for one unconditionally,
+    /// before the child has run at all, so there is nothing to report yet.
+    pub detail: Option<String>,
 }
+
+/// How many `claude -p`/`codex exec` child processes one provider may run at
+/// once when its config sets no `maxConcurrent` of its own.
+///
+/// A real gateway's trace log showed a burst of ~100 requests/minute (a
+/// parallel subagent fan-out) spawning that many `claude` processes with
+/// nothing to smooth it out, and roughly half came back `http_502` — see the
+/// 2026-08-03 entry in `docs/decisions.md` and issue #40. Conservative
+/// rather than tuned: cheap to raise per-provider via `maxConcurrent` once an
+/// operator knows their own machine's and subscription's real ceiling.
+pub const DEFAULT_MAX_CONCURRENT: u32 = 8;
+
+/// Bounds concurrent agent-CLI child processes, one [`Semaphore`] per
+/// provider id, so a burst of requests queues for a free slot instead of
+/// spawning every process at once (see [`DEFAULT_MAX_CONCURRENT`]).
+///
+/// A single process-wide instance ([`LIMITER`]) rather than something
+/// threaded through `AppState`: `crate::agent::spawn` already has everything
+/// it needs (the provider id and its `max_concurrent` off `Target`) without
+/// carrying a limiter reference through `upstream::send_with_fallback`'s
+/// generic `build` closure. A provider's semaphore is sized once, the first
+/// time that provider id is used, and kept for the process's life — the same
+/// once-per-process-lifetime tradeoff `ui::pca::BasisCache` already accepts
+/// for its own reasons; a hot-reloaded change to `maxConcurrent` takes effect
+/// only for a provider id not already in use.
+struct AgentLimiter {
+    semaphores: Mutex<HashMap<String, std::sync::Arc<Semaphore>>>,
+}
+
+impl AgentLimiter {
+    fn new() -> Self {
+        Self {
+            semaphores: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Wait for a free slot for `provider`, creating its semaphore (sized to
+    /// `max_concurrent`) the first time this provider id is seen.
+    async fn acquire(&self, provider: &str, max_concurrent: u32) -> OwnedSemaphorePermit {
+        let sem = {
+            // A `std::sync::Mutex` guarding only a hashmap lookup/insert — no
+            // `.await` while held, so this never blocks the runtime.
+            let mut map = self
+                .semaphores
+                .lock()
+                .expect("agent limiter mutex poisoned");
+            map.entry(provider.to_string())
+                .or_insert_with(|| {
+                    std::sync::Arc::new(Semaphore::new(max_concurrent.max(1) as usize))
+                })
+                .clone()
+        };
+        sem.acquire_owned()
+            .await
+            .expect("agent limiter semaphore is never closed")
+    }
+}
+
+static LIMITER: LazyLock<AgentLimiter> = LazyLock::new(AgentLimiter::new);
 
 /// Run one request against `target`'s agent CLI.
 ///
@@ -91,6 +161,14 @@ async fn spawn_claude(
         command.env_remove(name);
     }
 
+    // Held for however long the child process itself runs — including its
+    // full streaming lifetime, well past this function's return — so the cap
+    // actually bounds concurrently *running* processes, not just concurrent
+    // calls to this function. See [`AgentLimiter`].
+    let permit = LIMITER
+        .acquire(&target.model_ref.provider, target.max_concurrent)
+        .await;
+
     let mut child = command.spawn().map_err(|source| {
         Error::Other(format!(
             "could not start `{}` for provider `{}`: {source}. \
@@ -113,10 +191,11 @@ async fn spawn_claude(
         Ok(Spawned {
             status: http::StatusCode::OK,
             headers: sse_headers(),
-            body: stream_body(child, model),
+            body: stream_body(child, model, permit),
+            detail: None,
         })
     } else {
-        buffered_body(child, model).await
+        buffered_body(child, model, permit).await
     }
 }
 
@@ -146,6 +225,13 @@ async fn spawn_codex(
     for name in codex_cli::STRIPPED_ENV {
         command.env_remove(name);
     }
+
+    // Held until this function returns — codex is always buffered (see the
+    // doc comment above), so by then the child has already fully run; see
+    // [`AgentLimiter`].
+    let _permit = LIMITER
+        .acquire(&target.model_ref.provider, target.max_concurrent)
+        .await;
 
     let mut child = command.spawn().map_err(|source| {
         Error::Other(format!(
@@ -180,6 +266,7 @@ async fn spawn_codex(
                 status: http::StatusCode::OK,
                 headers,
                 body: Box::pin(futures_util::stream::once(async move { Ok(bytes) })),
+                detail: None,
             })
         }
         Err(failure) => {
@@ -206,6 +293,7 @@ async fn spawn_codex(
                 status: http::StatusCode::BAD_GATEWAY,
                 headers: json_headers(),
                 body: Box::pin(futures_util::stream::once(async move { Ok(bytes) })),
+                detail: Some(message),
             })
         }
     }
@@ -241,13 +329,21 @@ fn json_headers() -> http::HeaderMap {
 ///
 /// A reader task owns the child and pushes finished frames down a channel, which
 /// keeps the stream itself trivial and means the child is reaped by that task
-/// rather than by whoever polls last.
-fn stream_body(mut child: tokio::process::Child, model: String) -> super::upstream::BodyStream {
+/// rather than by whoever polls last. `permit` moves into that task too, so
+/// the concurrency slot it holds (see [`AgentLimiter`]) is only released once
+/// the child has actually exited — not when this function returns, well
+/// before the child's streaming output is done.
+fn stream_body(
+    mut child: tokio::process::Child,
+    model: String,
+    permit: OwnedSemaphorePermit,
+) -> super::upstream::BodyStream {
     use tokio::io::AsyncReadExt;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
 
     tokio::spawn(async move {
+        let _permit = permit;
         let mut converter = claude_cli::CliToAnthropic::new(model);
         let mut stdout = match child.stdout.take() {
             Some(stdout) => stdout,
@@ -319,12 +415,18 @@ fn stream_body(mut child: tokio::process::Child, model: String) -> super::upstre
     }))
 }
 
-/// Wait for the child and return one complete Anthropic message.
-async fn buffered_body(child: tokio::process::Child, model: String) -> Result<Spawned> {
+/// Wait for the child and return one complete Anthropic message. `permit` is
+/// only for its `Drop` — held until the child has fully run, then released.
+async fn buffered_body(
+    child: tokio::process::Child,
+    model: String,
+    permit: OwnedSemaphorePermit,
+) -> Result<Spawned> {
     let output = child.wait_with_output().await?;
+    drop(permit);
 
-    let (status, body) = match claude_cli::message_from_jsonl(&output.stdout, &model) {
-        Ok(message) => (http::StatusCode::OK, message),
+    let (status, body, detail) = match claude_cli::message_from_jsonl(&output.stdout, &model) {
+        Ok(message) => (http::StatusCode::OK, message, None),
         Err(detail) => {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let message = if stderr.is_empty() {
@@ -335,13 +437,11 @@ async fn buffered_body(child: tokio::process::Child, model: String) -> Result<Sp
                     stderr.chars().take(500).collect::<String>()
                 )
             };
-            (
-                http::StatusCode::BAD_GATEWAY,
-                serde_json::json!({
-                    "type": "error",
-                    "error": { "type": "api_error", "message": message },
-                }),
-            )
+            let body = serde_json::json!({
+                "type": "error",
+                "error": { "type": "api_error", "message": message },
+            });
+            (http::StatusCode::BAD_GATEWAY, body, Some(message))
         }
     };
 
@@ -350,6 +450,7 @@ async fn buffered_body(child: tokio::process::Child, model: String) -> Result<Sp
         status,
         headers: json_headers(),
         body: Box::pin(futures_util::stream::once(async move { Ok(bytes) })),
+        detail,
     })
 }
 
@@ -377,4 +478,60 @@ fn assert_body_is_a_byte_stream(
     body: super::upstream::BodyStream,
 ) -> impl Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send {
     body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The whole point of [`AgentLimiter`] (issue #40): once a provider is at
+    /// its cap, the next `acquire` must actually wait rather than handing out
+    /// an unbounded number of permits — and it must unblock the moment a
+    /// slot frees up, not stay stuck.
+    #[tokio::test]
+    async fn agent_limiter_queues_beyond_its_cap() {
+        let limiter = AgentLimiter::new();
+        let p1 = limiter.acquire("p", 2).await;
+        let _p2 = limiter.acquire("p", 2).await;
+
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(50), limiter.acquire("p", 2)).await;
+        assert!(
+            blocked.is_err(),
+            "a third acquire at cap 2 must not resolve until a permit is freed"
+        );
+
+        drop(p1);
+        let _p3 = tokio::time::timeout(Duration::from_millis(200), limiter.acquire("p", 2))
+            .await
+            .expect("dropping p1 should free a slot for the queued acquire");
+    }
+
+    /// Each provider id gets its own semaphore — a busy `claude-cli` provider
+    /// must never throttle an unrelated `codex-cli` (or a second `claude-cli`
+    /// alias) provider's requests.
+    #[tokio::test]
+    async fn agent_limiter_tracks_providers_independently() {
+        let limiter = AgentLimiter::new();
+        let _a = limiter.acquire("provider-a", 1).await;
+
+        let _b = tokio::time::timeout(Duration::from_millis(50), limiter.acquire("provider-b", 1))
+            .await
+            .expect("a different provider id must not share provider-a's limit");
+    }
+
+    /// `max_concurrent: 0` in a resolved `Target` would deadlock every
+    /// request against that provider forever — `validate` already rejects
+    /// this at config-load time (`config::validate`'s `maxConcurrent must be
+    /// at least 1` check), but the limiter itself also refuses to construct
+    /// a zero-permit semaphore, so a config that somehow reaches this point
+    /// anyway degrades to "one at a time" instead of hanging.
+    #[tokio::test]
+    async fn agent_limiter_treats_zero_as_one() {
+        let limiter = AgentLimiter::new();
+        let _p = tokio::time::timeout(Duration::from_millis(50), limiter.acquire("p", 0))
+            .await
+            .expect("a max_concurrent of 0 must still grant one permit, not hang forever");
+    }
 }

@@ -33,6 +33,12 @@ pub struct Target {
     /// `crate::upstream::FIRST_BYTE_TIMEOUT` when the provider config does not
     /// set its own `timeout_seconds`.
     pub timeout: std::time::Duration,
+    /// How many concurrent child processes this target's provider may run
+    /// when its transport is an agent CLI (`crate::agent`). Ignored by an
+    /// HTTP transport. Defaults to `crate::agent::DEFAULT_MAX_CONCURRENT` when
+    /// the provider config does not set its own `maxConcurrent` — see that
+    /// constant's doc comment for why this exists.
+    pub max_concurrent: u32,
     /// Set by `crate::server::proxy` for every target resolved inside the
     /// `<transcript>` bypass (`SemanticOutcome::UtilityBypass`, any of its
     /// three resolutions) — Claude Code's own internal auto-mode permission
@@ -126,6 +132,9 @@ fn build_target(model_ref: ModelRef, provider: &ProviderConfig) -> Target {
             .timeout_seconds
             .map(std::time::Duration::from_secs)
             .unwrap_or(crate::upstream::FIRST_BYTE_TIMEOUT),
+        max_concurrent: provider
+            .max_concurrent
+            .unwrap_or(crate::agent::DEFAULT_MAX_CONCURRENT),
         // Set by the caller (`crate::server::proxy`), never known here: this
         // function has no idea whether it's building an ordinary route's
         // targets or the `<transcript>` bypass's.
@@ -159,6 +168,7 @@ mod tests {
             transport: Default::default(),
             agent_args: Vec::new(),
             timeout_seconds: None,
+            max_concurrent: None,
         }
     }
 

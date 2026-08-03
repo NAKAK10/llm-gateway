@@ -263,6 +263,22 @@ pub struct ProviderConfig {
     /// Defaults to `crate::upstream::FIRST_BYTE_TIMEOUT` when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
+
+    /// How many `claude -p`/`codex exec` child processes this provider may
+    /// run at once. Ignored by an HTTP provider — its concurrency is bounded
+    /// by the upstream itself, not by anything local to spawn.
+    ///
+    /// Defaults to `crate::agent::DEFAULT_MAX_CONCURRENT` when absent. A real
+    /// gateway's trace log showed a burst of ~100 concurrent requests (a
+    /// parallel subagent fan-out) spawning that many `claude` processes at
+    /// once with nothing to smooth it out, and roughly half of them came back
+    /// as `http_502` — see the 2026-08-03 entry in `docs/decisions.md` and
+    /// issue #40. This caps that burst at the local process level, trading
+    /// "every request spawns immediately" for "requests beyond the cap queue
+    /// for a free slot" — the fix for the actual overload, not just a
+    /// fallback to recover from it after the fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
 }
 
 fn default_true() -> bool {
