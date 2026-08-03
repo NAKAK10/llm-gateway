@@ -700,6 +700,7 @@ fn count_tokens_locally(
                 target: target.to_string(),
                 result: "estimated_locally".to_string(),
                 ms: 0,
+                detail: None,
             }],
             None,
             semantic_attempt,
@@ -1806,6 +1807,7 @@ mod tests {
             headers: Vec::new(),
             inject_usage: true,
             timeout: crate::upstream::FIRST_BYTE_TIMEOUT,
+            max_concurrent: crate::agent::DEFAULT_MAX_CONCURRENT,
             is_utility_bypass: false,
         }
     }
@@ -2969,6 +2971,7 @@ mod tests {
                 transport: Default::default(),
                 agent_args: Vec::new(),
                 timeout_seconds: None,
+                max_concurrent: None,
             },
         );
         config.routes.insert(

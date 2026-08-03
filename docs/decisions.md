@@ -2,6 +2,97 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-08-03 — Agent-CLI providers get a per-provider concurrency cap (issue #40)
+
+Re-auditing the gateway's own trace log restricted to just the current
+process's session (not the 3-day blend the fallback-warning entry below was
+based on, which mixed in earlier versions' behavior) found the failure burst
+had a precise shape: request volume jumped from a 5-20/minute baseline to
+109 and 81 requests in two consecutive minutes, and `anthropic-subscription`
+(the `claude-cli` transport) attempts in that exact window failed at
+50.2% and 35.9% — before and after, 0%. The trace records from that window
+show heavy parallel subagent fan-out (`cc_is_subagent=true`, many distinct
+tool lists, several `role-explorer`/`role-implementer`/`role-reviewer`
+requests within the same second). `agent::spawn` had no concurrency limiting
+anywhere — every request resolving to an agent-cli target spawned a `claude`
+child process immediately, no cap, no queue. A burst of concurrent requests
+spawning a burst of concurrent `claude -p` processes at once is a very
+plausible way to exhaust the local machine's process/fd limits or the
+subscription's own concurrent-session ceiling, both surfacing here as
+`http_502` (`agent::mod`'s `buffered_body`/`stream_body` turn "CLI exited
+non-zero" or "no parseable output" into `BAD_GATEWAY`).
+
+**`AgentLimiter`** (`src/agent/mod.rs`): one `tokio::sync::Semaphore` per
+provider id, process-wide (`static LIMITER: LazyLock<AgentLimiter>`), sized
+by the target's `max_concurrent` (new field, threaded through
+`route::build_target` the same way `timeout` already is) — defaulting to
+`DEFAULT_MAX_CONCURRENT` (8) when the provider's config sets no
+`maxConcurrent`. `spawn_claude`/`spawn_codex` acquire a permit *before*
+`Command::spawn()`, so a burst queues for a free slot instead of spawning
+unboundedly; the permit is held for however long the child actually runs,
+not just for the call into `agent::spawn` — for a streaming `claude-cli`
+response that means moving it into `stream_body`'s background task so it
+only drops once the child has actually exited, well after `spawn_claude`
+itself has returned.
+
+Not threaded through `AppState`: `agent::spawn` already has everything a
+limiter needs (the provider id and `max_concurrent`, both off `Target`)
+without adding a parameter through `upstream::send_with_fallback`'s generic
+`build` closure just for this. Same once-per-process-lifetime tradeoff
+`ui::pca::BasisCache` already accepts elsewhere: a provider's semaphore is
+sized the first time that provider id is used and kept for the process's
+life, so a hot-reloaded `maxConcurrent` change only takes effect for a
+provider id not already in use. `config::validate` rejects `maxConcurrent: 0`
+(would deadlock every request against that provider) and warns when an HTTP
+provider sets it (it only bounds local child processes, so it does nothing
+there) — the limiter itself also refuses to build a zero-permit semaphore as
+a last line of defense, degrading to "one at a time" rather than hanging if
+a malformed config somehow reaches it anyway.
+
+## 2026-08-03 — Failed upstream attempts keep *why*, not just a result code (issue #39)
+
+The same trace-log audit above needed to distinguish "the CLI wasn't logged
+in" from "the CLI crashed" from "the upstream returned a real 502" from "the
+network was down" for the burst of failures it was investigating — and
+could not, from the log alone. `TraceAttempt` (`src/record/trace_log.rs`)
+only ever recorded `result: "http_502"`/`"connect_error"`/`"timeout"` — a
+fixed vocabulary with nothing underneath it. The actual detail already
+existed in two places and was thrown away in both: `agent::mod`'s
+`buffered_body`/`spawn_codex` compute a real message (a CLI's stderr excerpt,
+its exit status, or its own reported reason) and serialize it into the
+*client-facing* error body, never keeping a copy anywhere `send_with_fallback`
+could reach; and a `reqwest::Error` on the plain-HTTP branch already gets
+logged via `tracing::info!` at the exact call site that discards it a line
+later.
+
+**`TraceAttempt.detail: Option<String>`** (new, additive field) carries this
+through wherever it's available: `agent::Spawned` grew the same field,
+populated by `buffered_body`/`spawn_codex`'s existing message and read by
+`send_with_fallback` before it pushes the attempt; the plain-HTTP branch's
+`connect_error`/`send_error`/`timeout` cases use the `reqwest::Error`'s own
+`to_string()` (already computed for the `tracing::info!` beside it); and a
+*retryable* HTTP status (moving on to another target, so this response is
+being discarded anyway, not forwarded) now reads its body for up to 500
+characters — many APIs put the actual reason (quota, auth, malformed
+request) there. The one HTTP case left `None` on purpose: the *final*
+attempt's body streams straight through to the client as `Accepted`, and
+reading it here to populate `detail` would empty the stream that response
+needs.
+
+**Not fixed, and now written down as its own gap:** a *streaming*
+`claude-cli` attempt's real outcome is invisible to `TraceAttempt` entirely,
+not just missing a detail string. `spawn_claude`'s streaming branch reports
+`status: OK` unconditionally, before the child has even run — confirmed
+against the same trace log: every `stream: true` request against
+`anthropic-subscription` recorded `ok_first_byte`, while every `http_502`
+and `timeout` came exclusively from `stream: false` requests. A child that
+fails mid-stream surfaces only as an SSE error frame injected by
+`stream_body`, after `send_with_fallback` has already recorded success and
+returned — invisible to trace/usage logging and to fallback alike. Fixing
+that needs the module's own stated invariant re-examined ("fallback only
+happens before the first response byte reaches the client") — filed
+separately rather than folded in here.
+
 ## 2026-08-03 — `config check` warns when a route has no fallback target
 
 Auditing a real gateway's `trace-*.jsonl` (992 requests over 3 days) found

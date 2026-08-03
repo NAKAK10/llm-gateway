@@ -1418,6 +1418,7 @@ pub fn build_config_with_auth(
                 transport: Default::default(),
                 agent_args: Vec::new(),
                 timeout_seconds: None,
+                max_concurrent: None,
             },
         );
     }
@@ -1448,6 +1449,7 @@ pub fn build_config_with_auth(
                 transport: Default::default(),
                 agent_args: Vec::new(),
                 timeout_seconds: None,
+                max_concurrent: None,
             },
         );
     }
@@ -1559,6 +1561,7 @@ pub fn build_config_with_auth(
                 transport,
                 agent_args: Vec::new(),
                 timeout_seconds: None,
+                max_concurrent: None,
             },
         );
     }
@@ -1799,6 +1802,7 @@ mod tests {
                         .collect(),
                     inject_usage: provider.inject_usage,
                     timeout: crate::upstream::FIRST_BYTE_TIMEOUT,
+                    max_concurrent: crate::agent::DEFAULT_MAX_CONCURRENT,
                     is_utility_bypass: false,
                 },
                 false

@@ -206,6 +206,7 @@ mod tests {
                 target: "anthropic/claude-sonnet-4-6".to_string(),
                 result: "ok_first_byte".to_string(),
                 ms: 250,
+                detail: None,
             }],
             usage: None,
         }
@@ -228,6 +229,7 @@ mod tests {
             target: "openrouter-anthropic/anthropic/claude-sonnet-4-6".to_string(),
             result: "http_429".to_string(),
             ms: 80,
+            detail: None,
         });
         assert_eq!(
             format_line(&record),

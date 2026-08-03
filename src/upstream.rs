@@ -132,6 +132,7 @@ pub async fn send_with_fallback(
                         target: target.to_string(),
                         result: "timeout".to_string(),
                         ms: started.elapsed().as_millis() as u64,
+                        detail: Some(format!("no response within {:?}", target.timeout)),
                     });
                     if is_last {
                         break;
@@ -147,6 +148,7 @@ pub async fn send_with_fallback(
                             target: target.to_string(),
                             result: format!("http_{}", spawned.status.as_u16()),
                             ms: started.elapsed().as_millis() as u64,
+                            detail: spawned.detail.clone(),
                         });
                         continue;
                     }
@@ -159,6 +161,7 @@ pub async fn send_with_fallback(
                             format!("http_{}", spawned.status.as_u16())
                         },
                         ms: started.elapsed().as_millis() as u64,
+                        detail: spawned.detail.clone(),
                     });
                     return Ok(Accepted {
                         status: spawned.status,
@@ -177,6 +180,7 @@ pub async fn send_with_fallback(
                         target: target.to_string(),
                         result: "spawn_error".to_string(),
                         ms: started.elapsed().as_millis() as u64,
+                        detail: Some(err.to_string()),
                     });
                     if is_last {
                         break;
@@ -201,6 +205,7 @@ pub async fn send_with_fallback(
                         target: target.to_string(),
                         result: "key_unresolved".to_string(),
                         ms: started.elapsed().as_millis() as u64,
+                        detail: Some(err.to_string()),
                     });
                     continue;
                 }
@@ -223,6 +228,7 @@ pub async fn send_with_fallback(
                     target: target.to_string(),
                     result: "timeout".to_string(),
                     ms,
+                    detail: Some(format!("no response within {:?}", target.timeout)),
                 });
                 if is_last {
                     break;
@@ -240,6 +246,7 @@ pub async fn send_with_fallback(
                     target: target.to_string(),
                     result: result.to_string(),
                     ms,
+                    detail: Some(err.to_string()),
                 });
                 if is_last {
                     break;
@@ -249,11 +256,20 @@ pub async fn send_with_fallback(
                 let status = response.status();
                 let retryable = matches!(status.as_u16(), 408 | 429 | 500..=599);
                 if retryable && !is_last {
+                    // Safe to read this response's body for a diagnostic
+                    // excerpt: it is being discarded in favor of the next
+                    // fallback target, never forwarded to the client, unlike
+                    // the body below on the path that returns `Accepted`.
+                    let detail = response.text().await.ok().and_then(|text| {
+                        let trimmed = text.trim();
+                        (!trimmed.is_empty()).then(|| trimmed.chars().take(500).collect::<String>())
+                    });
                     attempts.push(TraceAttempt {
                         n,
                         target: target.to_string(),
                         result: format!("http_{}", status.as_u16()),
                         ms,
+                        detail,
                     });
                     continue;
                 }
@@ -266,6 +282,7 @@ pub async fn send_with_fallback(
                         format!("http_{}", status.as_u16())
                     },
                     ms,
+                    detail: None,
                 });
                 return Ok(Accepted {
                     status: http::StatusCode::from_u16(response.status().as_u16())
@@ -368,6 +385,7 @@ mod tests {
             headers: Vec::new(),
             inject_usage: true,
             timeout: FIRST_BYTE_TIMEOUT,
+            max_concurrent: crate::agent::DEFAULT_MAX_CONCURRENT,
             is_utility_bypass: false,
         }
     }
@@ -456,6 +474,82 @@ mod tests {
         assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0].result, "key_unresolved");
         assert_eq!(attempts[1].result, "connect_error");
+        // Issue #39: a failed attempt must carry *why*, not just a result
+        // code — both branches populate `detail` from the same
+        // `Error`/`reqwest::Error` already being logged via `tracing::info!`
+        // at the same call site.
+        assert!(
+            attempts[0].detail.as_deref().is_some_and(|d| !d.is_empty()),
+            "{:?}",
+            attempts[0].detail
+        );
+        assert!(
+            attempts[1].detail.as_deref().is_some_and(|d| !d.is_empty()),
+            "{:?}",
+            attempts[1].detail
+        );
+    }
+
+    /// Issue #39: a retryable HTTP status (moving on to the next target, so
+    /// this response is discarded rather than forwarded) should keep the
+    /// upstream's own error body as `detail` — many APIs put the actual
+    /// reason (quota, auth, malformed request) there, and it would otherwise
+    /// be read once and thrown away.
+    #[tokio::test]
+    async fn a_retryable_status_captures_the_response_body_as_detail() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "quota exceeded for this key",
+                )
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let base = format!("http://{addr}");
+        let resolution = Resolution {
+            route_name: "r".into(),
+            targets: vec![
+                target(ApiKind::AnthropicMessages, &base),
+                target(ApiKind::AnthropicMessages, &base),
+            ],
+        };
+        let http = client().unwrap();
+        let mut attempts = Vec::new();
+        let result = send_with_fallback(
+            &http,
+            &resolution,
+            |_t| {
+                Ok(Attempt {
+                    body: b"{}".to_vec(),
+                    payload: serde_json::json!({}),
+                    streaming: false,
+                    headers: http::HeaderMap::new(),
+                    count_tokens: false,
+                })
+            },
+            &mut attempts,
+        )
+        .await;
+
+        // Both targets return 500 — the second (last) one is still forwarded
+        // to the caller as the final answer, same as any other exhausted
+        // fallback chain.
+        assert!(result.is_ok());
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].result, "http_500");
+        assert_eq!(
+            attempts[0].detail.as_deref(),
+            Some("quota exceeded for this key")
+        );
+        // The final, forwarded attempt's body is streamed to the client
+        // instead — reading it here would empty the stream `Accepted` needs
+        // to hand back, so it stays `None` rather than double-reading it.
+        assert_eq!(attempts[1].detail, None);
     }
 
     #[test]

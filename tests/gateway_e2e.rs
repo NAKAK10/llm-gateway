@@ -225,6 +225,7 @@ fn provider(base: &str, api: ApiKind) -> ProviderConfig {
         transport: Default::default(),
         agent_args: Vec::new(),
         timeout_seconds: None,
+        max_concurrent: None,
     }
 }
 

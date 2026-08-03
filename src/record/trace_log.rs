@@ -146,6 +146,18 @@ pub struct TraceAttempt {
     /// `ok_first_byte`, `http_429`, `connect_error`, `timeout`, …
     pub result: String,
     pub ms: u64,
+    /// Why, when `result` isn't a success — an agent CLI's stderr excerpt or
+    /// exit status, or a `reqwest::Error`'s own message for a plain HTTP
+    /// target. `result` alone collapses "the CLI wasn't logged in," "the CLI
+    /// crashed," "the upstream returned a real 502," and "the network was
+    /// down" into the same string; this is the field that tells them apart.
+    /// `None` for a successful attempt, and for a failure this simply wasn't
+    /// available for (issue #39's remaining gap: a streaming agent-cli
+    /// attempt's eventual failure surfaces only as an SSE error frame, after
+    /// this attempt has already been recorded as a success — see the
+    /// 2026-08-03 entry in `docs/decisions.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -224,6 +236,7 @@ mod tests {
                 target: "anthropic/claude-sonnet-4-6".to_string(),
                 result: "ok_first_byte".to_string(),
                 ms: 120,
+                detail: None,
             }],
             usage: Some(TraceUsage {
                 in_tok: 12,
