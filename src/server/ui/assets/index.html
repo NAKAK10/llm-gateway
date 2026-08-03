@@ -163,6 +163,35 @@
   }
   .bar-track { background: var(--panel-2); border-radius: 3px; height: 6px; width: 100%; overflow: hidden; }
   .bar-fill { background: var(--accent); height: 100%; }
+  .usage-live-chart {
+    display: flex;
+    align-items: flex-end;
+    gap: 1.5rem;
+    height: 14rem;
+    padding: 0.5rem 0.5rem 0;
+    overflow-x: auto;
+  }
+  .uvbar { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; flex: 0 0 auto; width: 4.5rem; }
+  .uvbar-value { font-family: var(--mono); font-size: 0.76rem; color: var(--muted); margin-bottom: 0.35rem; }
+  .uvbar-fill {
+    width: 2.4rem;
+    border-radius: 4px 4px 0 0;
+    min-height: 2px;
+    display: flex;
+    flex-direction: column-reverse;
+    overflow: hidden;
+  }
+  .uvseg { width: 100%; }
+  .uvbar-label {
+    margin-top: 0.5rem;
+    font-size: 0.72rem;
+    color: var(--text);
+    text-align: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 4.5rem;
+  }
   #map-svg { width: 100%; height: 60vh; background: var(--panel-2); border-radius: 8px; }
   .legend { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; margin-top: 0.75rem; font-size: 0.78rem; }
   .legend-item { display: flex; align-items: center; gap: 0.35rem; color: var(--muted); }
@@ -248,6 +277,20 @@
         <tfoot id="usage-total"></tfoot>
       </table>
       <div id="usage-empty" class="empty" style="display: none">No usage recorded yet.</div>
+    </div>
+    <div class="panel">
+      <h2>Live cumulative token usage</h2>
+      <div class="controls">
+        <label>bucket
+          <select id="usage-live-window">
+            <option value="1m">1 min</option>
+            <option value="5m" selected>5 min</option>
+            <option value="15m">15 min</option>
+          </select>
+        </label>
+      </div>
+      <div class="usage-live-chart" id="usage-live-chart"></div>
+      <div class="legend" id="usage-live-legend"></div>
     </div>
   </section>
 </main>
@@ -415,6 +458,7 @@
         return;
       }
       addLiveRow(ev);
+      recordUsageLive(ev);
       if (ev.point) {
         mapPoints.push({ x: ev.point[0], y: ev.point[1], route: ev.matched_route, ts: Date.now() });
         while (mapPoints.length > MAX_MAP_POINTS) mapPoints.shift();
@@ -512,6 +556,116 @@
     }
   }
   setInterval(plotLivePoints, 2000);
+
+  // ---- live cumulative token usage ---------------------------------------
+  // Deliberately independent of the on-disk `/api/usage` table above: it
+  // reuses the same `/api/live` stream the Live tab already consumes rather
+  // than adding a new endpoint or any server-side aggregation state, so it
+  // only reflects activity seen since this dashboard tab connected — same
+  // in-memory-only lifetime the Live tab already has.
+  //
+  // One bar per clock-aligned bucket (e.g. 22:45, 22:50, 22:55, 23:00 for a
+  // 5-minute bucket), each bar's height the running total of every token
+  // seen up to that bucket's end — never per-bucket-only, always the whole
+  // session's cumulative total, so the chart reads as "usage climbing over
+  // time," not a series of independent snapshots. Each bar is stacked by
+  // model (same `colorFor` used by the live table and vector map) so which
+  // model is driving that growth is visible at a glance, not just the total.
+  const usageLiveEvents = []; // {ts, model, tokens}, oldest first, append-only
+  // Bounds memory for a dashboard tab left open a long time; at one entry
+  // per completed request this comfortably outlasts any real session.
+  const USAGE_LIVE_MAX_EVENTS = 20000;
+  const USAGE_LIVE_BUCKET_COUNT = 12;
+  const USAGE_LIVE_WINDOWS = { "1m": 60 * 1000, "5m": 5 * 60 * 1000, "15m": 15 * 60 * 1000 };
+  const usageLiveWindowSelect = document.getElementById("usage-live-window");
+  const usageLiveChart = document.getElementById("usage-live-chart");
+  const usageLiveLegend = document.getElementById("usage-live-legend");
+
+  function recordUsageLive(ev) {
+    const tokens = (ev.in_tok || 0) + (ev.out_tok || 0) + (ev.cache_read_tok || 0) + (ev.cache_write_tok || 0);
+    if (tokens <= 0) return;
+    usageLiveEvents.push({ ts: Date.now(), model: `${ev.provider}/${ev.model}`, tokens });
+    if (usageLiveEvents.length > USAGE_LIVE_MAX_EVENTS) usageLiveEvents.shift();
+  }
+
+  function fmtBucketLabel(ts) {
+    const d = new Date(ts);
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  }
+
+  function renderUsageLiveBars() {
+    if (usageLiveEvents.length === 0) {
+      usageLiveChart.innerHTML = `<div class="empty">no requests yet</div>`;
+      usageLiveLegend.innerHTML = "";
+      return;
+    }
+    const bucketMs = USAGE_LIVE_WINDOWS[usageLiveWindowSelect.value] || USAGE_LIVE_WINDOWS["5m"];
+    const now = Date.now();
+    const currentBucketStart = Math.floor(now / bucketMs) * bucketMs;
+    const firstEventBucketStart = Math.floor(usageLiveEvents[0].ts / bucketMs) * bucketMs;
+    const startBucket = Math.max(
+      firstEventBucketStart,
+      currentBucketStart - (USAGE_LIVE_BUCKET_COUNT - 1) * bucketMs
+    );
+
+    // A single forward pass accumulates each model's running total as it
+    // crosses each bucket boundary — events are append-only in timestamp
+    // order, so nothing needs re-summing from scratch per bucket. Each
+    // bucket keeps its own snapshot (`new Map(running)`) since the running
+    // totals keep changing after it's recorded.
+    let idx = 0;
+    const running = new Map(); // model -> cumulative tokens
+    const bars = [];
+    for (let bucketStart = startBucket; bucketStart <= currentBucketStart; bucketStart += bucketMs) {
+      const bucketEnd = bucketStart + bucketMs;
+      while (idx < usageLiveEvents.length && usageLiveEvents[idx].ts < bucketEnd) {
+        const e = usageLiveEvents[idx];
+        running.set(e.model, (running.get(e.model) || 0) + e.tokens);
+        idx++;
+      }
+      const grand = [...running.values()].reduce((a, b) => a + b, 0);
+      bars.push({ label: fmtBucketLabel(bucketStart), grand, totals: new Map(running) });
+    }
+
+    // Stacking order is fixed to the latest bucket's ranking — heaviest
+    // model at the bottom of every bar — so a model's segment stays in the
+    // same visual band across bars instead of reshuffling bucket to bucket.
+    const order = [...bars[bars.length - 1].totals.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([model]) => model);
+    const max = bars[bars.length - 1].grand || 1;
+
+    usageLiveChart.innerHTML = bars
+      .map((bar) => {
+        const outerPct = Math.max(2, (bar.grand / max) * 100);
+        const segments = order
+          .map((model) => {
+            const value = bar.totals.get(model) || 0;
+            if (value <= 0) return "";
+            const segPct = bar.grand > 0 ? (value / bar.grand) * 100 : 0;
+            return `<div class="uvseg" style="height:${segPct}%;background:${colorFor(model)}" title="${escapeHtml(model)}: ${fmtNum(value)}"></div>`;
+          })
+          .join("");
+        return `
+          <div class="uvbar">
+            <span class="uvbar-value">${fmtNum(bar.grand)}</span>
+            <div class="uvbar-fill" style="height:${outerPct}%">${segments}</div>
+            <span class="uvbar-label">${bar.label}</span>
+          </div>
+        `;
+      })
+      .join("");
+
+    usageLiveLegend.innerHTML = order
+      .map(
+        (model) =>
+          `<span class="legend-item"><span class="legend-dot" style="background:${colorFor(model)}"></span>${escapeHtml(model)}</span>`
+      )
+      .join("");
+  }
+  usageLiveWindowSelect.addEventListener("change", renderUsageLiveBars);
+  renderUsageLiveBars();
+  setInterval(renderUsageLiveBars, 2000);
 
   // ---- usage ------------------------------------------------------------
   const usageRows = document.getElementById("usage-rows");
