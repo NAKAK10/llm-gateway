@@ -230,7 +230,11 @@ fn tool_result_message(block: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({"role": "tool", "tool_call_id": tool_use_id, "content": content})
 }
 
-fn tool_result_text(content: Option<&serde_json::Value>) -> String {
+/// `pub(crate)`, re-exported via `translate::request`, for
+/// `server::proxy::classification_content_text` to reuse — the
+/// string-or-array-of-blocks handling a `tool_result` block's `content` can
+/// take is exactly this, and duplicating it there would drift from this one.
+pub(crate) fn tool_result_text(content: Option<&serde_json::Value>) -> String {
     match content {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(blocks)) => text_blocks(blocks).join("\n"),

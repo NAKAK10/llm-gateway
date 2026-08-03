@@ -66,17 +66,19 @@ use crate::semantic::index::SYSTEM_CLASSIFICATION_THRESHOLD;
 #[cfg(not(feature = "semantic"))]
 const SYSTEM_CLASSIFICATION_THRESHOLD: f32 = 0.50;
 
-/// How many of the request's user texts (newest first) classification tries
-/// before falling back to the reserved `default` route.
+/// How many of the request's classifiable texts (newest first) classification
+/// tries before falling back to the reserved `default` route.
 ///
-/// Agentic clients routinely send turns whose newest user message is a
-/// `tool_result` with no text, or a short reply ("continue", "yes") that
-/// scores below the threshold on its own. The conversation history that
-/// arrives with every request already holds the instruction such a turn is
-/// continuing, so classification walks back to the most recent user text
-/// that clears the threshold instead of keeping per-conversation state in
-/// the gateway. The bound exists only to cap work on pathological inputs;
-/// each embed is sub-millisecond, so eight is generous, not tight.
+/// Agentic clients routinely send turns whose newest message is a short
+/// reply ("continue", "yes") that scores below the threshold on its own, or
+/// carries no text at all. The conversation history that arrives with every
+/// request already holds richer signal such a turn is continuing — the
+/// user's own earlier text, or (see [`classification_texts`]'s doc comment)
+/// a `tool_result`/`role: "tool"`/`function_call_output` an agent's tool
+/// call already produced — so classification walks back to the most recent
+/// candidate that clears the threshold instead of keeping per-conversation
+/// state in the gateway. The bound exists only to cap work on pathological
+/// inputs; each embed is sub-millisecond, so eight is generous, not tight.
 #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
 const HISTORY_WALK_LIMIT: usize = 8;
 
@@ -1407,15 +1409,35 @@ fn classify_request(
     }
 }
 
-/// Every user message's text, newest first, untruncated — the candidate
-/// texts for semantic classification.
+/// Every message's classifiable text, newest first, untruncated — the
+/// candidate texts for semantic classification.
 ///
-/// A user message with no text — an Anthropic `tool_result` turn, an
-/// image-only message — contributes nothing rather than an empty entry, so
-/// the history walk only ever spends its bounded attempts on text that can
-/// actually score. `Embedder::embed` does its own bounding (800 chars / 64
-/// tokens), so the 200-character truncation `extract_input` applies for the
-/// trace log must not leak into what gets classified.
+/// This is more than plain user text: a `tool_result` block (Anthropic), a
+/// `role: "tool"` message (`openai-chat`), or a `function_call_output` item
+/// (`openai-responses`) all count too, via [`classification_content_text`].
+/// Only a message with *no* text anywhere — a bare image, a `tool_result`
+/// with no `content` at all — contributes nothing, so the history walk only
+/// ever spends its bounded attempts on text that can actually score.
+/// `Embedder::embed` does its own bounding (800 chars / 64 tokens), so the
+/// 200-character truncation `extract_input` applies for the trace log must
+/// not leak into what gets classified.
+///
+/// Tool-result content used to be excluded outright — see the 2026-07-31
+/// entry in `docs/decisions.md` for `HISTORY_WALK_LIMIT`'s original
+/// reasoning, "walk past a turn with no signal to find the instruction it's
+/// continuing." That assumed a `tool_result` never *is* the instruction,
+/// only ever masks one. It sometimes is: a bare URL classifies as a trivial
+/// chore, but the content an agent fetches from it afterward can reveal the
+/// task is not trivial at all — and that content, once it lands in history,
+/// deserves the same shot at deciding routing that ordinary user text gets.
+/// Being newest-first is what makes this safe rather than a free-for-all:
+/// fetched content only wins if it is more recent than whatever user text
+/// would otherwise have decided the route, exactly the same recency rule
+/// that already governs plain conversation. See the entry in
+/// `docs/decisions.md` this change adds for the last-resort-tier design that
+/// was considered and rejected instead (it cannot fix the bug it was meant
+/// to fix — the walk finds the stale original text long before reaching a
+/// tier tried only after it exhausts).
 ///
 /// Every `<system-reminder>` block is stripped out of each text before it is
 /// considered (see [`strip_system_reminders`]): Claude Code's harness injects
@@ -1450,13 +1472,86 @@ fn classification_texts(api: ApiKind, payload: &serde_json::Value) -> Vec<String
         Some(serde_json::Value::Array(items)) => items
             .iter()
             .rev()
-            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-            .filter_map(|m| m.get("content"))
-            .filter_map(|content| content_text(api, content))
+            .filter(|item| is_classification_source(item))
+            .filter_map(|item| classification_item_text(api, item))
             .map(|text| strip_system_reminders(&text))
             .filter(|text| !text.trim().is_empty())
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+/// Whether `item` — one entry of `messages` (Anthropic/`openai-chat`) or
+/// `input` (`openai-responses`) — can carry classifiable text at all, for
+/// [`classification_texts`]'s filter.
+///
+/// `role: "user"` covers ordinary text and, for Anthropic, `tool_result`
+/// blocks nested in its `content` (they share the same envelope — see
+/// `docs/`'s Anthropic tool-result shape). `role: "tool"` is `openai-chat`'s
+/// standalone tool-result message. `openai-responses`' `function_call_output`
+/// items carry no `role` field at all, so they need their own check.
+#[cfg_attr(not(feature = "semantic"), allow(dead_code))]
+fn is_classification_source(item: &serde_json::Value) -> bool {
+    matches!(
+        item.get("role").and_then(|r| r.as_str()),
+        Some("user") | Some("tool")
+    ) || item.get("type").and_then(|t| t.as_str()) == Some("function_call_output")
+}
+
+/// Pulls the classifiable text out of one `messages`/`input` item — the
+/// `openai-responses` `function_call_output` shape (`output` is a sibling of
+/// `type`, not nested under `content`) needs its own branch; everything else
+/// reads its `content` field via [`classification_content_text`].
+#[cfg_attr(not(feature = "semantic"), allow(dead_code))]
+fn classification_item_text(api: ApiKind, item: &serde_json::Value) -> Option<String> {
+    if api == ApiKind::OpenaiResponses
+        && item.get("type").and_then(|t| t.as_str()) == Some("function_call_output")
+    {
+        return match item.get("output") {
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(other) => Some(other.to_string()),
+            None => None,
+        };
+    }
+    classification_content_text(api, item.get("content")?)
+}
+
+/// Like [`content_text`], but for classification only: also reads a
+/// `tool_result` block's own `content` (Anthropic) and a `role: "tool"`
+/// message's plain-string `content` (`openai-chat`, already handled by the
+/// `Value::String` arm shared with ordinary text).
+///
+/// A deliberate fork rather than a change to `content_text` itself:
+/// `content_text` is also used by [`system_prompt_text`] (a system prompt
+/// never carries a `tool_result` block, so this would be a no-op there
+/// anyway) and by `last_user_text` (`extract_input`'s trace-log summary of
+/// "what did the user last say") — changing that field's meaning to include
+/// tool-result content is a separate decision this change does not make.
+#[cfg_attr(not(feature = "semantic"), allow(dead_code))]
+fn classification_content_text(api: ApiKind, content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(blocks) => {
+            let text_key_type = match api {
+                ApiKind::OpenaiResponses => "input_text",
+                _ => "text",
+            };
+            let parts: Vec<String> = blocks
+                .iter()
+                .filter_map(|b| match b.get("type").and_then(|t| t.as_str()) {
+                    Some(t) if t == text_key_type => {
+                        b.get("text").and_then(|t| t.as_str()).map(str::to_string)
+                    }
+                    Some("tool_result") => {
+                        let text = crate::translate::request::tool_result_text(b.get("content"));
+                        (!text.is_empty()).then_some(text)
+                    }
+                    _ => None,
+                })
+                .collect();
+            (!parts.is_empty()).then(|| parts.join("\n"))
+        }
+        _ => None,
     }
 }
 
@@ -2080,17 +2175,102 @@ mod tests {
     }
 
     #[test]
-    fn classification_texts_skip_textless_user_messages() {
-        // The everyday agentic turn: the newest user message is a bare
-        // `tool_result` with no text block at all. It must contribute
-        // nothing, leaving the last real instruction as the newest text.
+    fn classification_texts_skip_textless_tool_results() {
+        // A `tool_result` with no `content` field at all is genuinely
+        // blank — unlike one carrying real content (see the tests below),
+        // it must still contribute nothing.
         let payload = json!({ "messages": [
             {"role": "user", "content": "この関数のテストを書いて"},
             {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}]},
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1"}]},
         ]});
         let texts = classification_texts(ApiKind::AnthropicMessages, &payload);
         assert_eq!(texts, vec!["この関数のテストを書いて"]);
+    }
+
+    #[test]
+    fn classification_texts_prefer_a_newer_tool_result_over_an_older_user_message() {
+        // The bug this change fixes: a bare URL scores against a trivial
+        // route on its own, but the content an agent fetches from it
+        // afterward — landing here as a `tool_result` — is newer and more
+        // informative, so it must be tried first, not skipped in favor of
+        // the stale original message.
+        let payload = json!({ "messages": [
+            {"role": "user", "content": "見て: https://example.com/issues/1"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "gh", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "issue body: implement a distributed consensus protocol"},
+            ]},
+        ]});
+        let texts = classification_texts(ApiKind::AnthropicMessages, &payload);
+        assert_eq!(
+            texts,
+            vec![
+                "issue body: implement a distributed consensus protocol",
+                "見て: https://example.com/issues/1",
+            ]
+        );
+    }
+
+    #[test]
+    fn classification_texts_read_array_tool_result_content() {
+        // A `tool_result` block's own `content` can itself be an array of
+        // text blocks rather than a plain string.
+        let payload = json!({ "messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "text", "text": "line one"},
+                    {"type": "text", "text": "line two"},
+                ]},
+            ]},
+        ]});
+        let texts = classification_texts(ApiKind::AnthropicMessages, &payload);
+        assert_eq!(texts, vec!["line one\nline two"]);
+    }
+
+    #[test]
+    fn classification_texts_read_openai_chat_tool_messages() {
+        let payload = json!({ "messages": [
+            {"role": "user", "content": "見て: https://example.com/issues/1"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1"}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "issue body: complex spec"},
+        ]});
+        let texts = classification_texts(ApiKind::OpenaiChat, &payload);
+        assert_eq!(
+            texts,
+            vec![
+                "issue body: complex spec",
+                "見て: https://example.com/issues/1"
+            ]
+        );
+    }
+
+    #[test]
+    fn classification_texts_read_openai_responses_function_call_output() {
+        let payload = json!({ "input": [
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "見て: https://example.com/issues/1"},
+            ]},
+            {"type": "function_call", "call_id": "call_1", "name": "gh"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "issue body: complex spec"},
+        ]});
+        let texts = classification_texts(ApiKind::OpenaiResponses, &payload);
+        assert_eq!(
+            texts,
+            vec![
+                "issue body: complex spec",
+                "見て: https://example.com/issues/1"
+            ]
+        );
+    }
+
+    #[test]
+    fn classification_texts_json_encode_a_non_string_function_call_output() {
+        let payload = json!({ "input": [
+            {"type": "function_call_output", "call_id": "call_1", "output": {"temp_f": 72}},
+        ]});
+        let texts = classification_texts(ApiKind::OpenaiResponses, &payload);
+        assert_eq!(texts, vec!["{\"temp_f\":72}"]);
     }
 
     #[test]
@@ -2804,8 +2984,11 @@ mod tests {
         // loaded model.
         let (_dir, state) = test_state(classifiable_config());
         let config = state.config.get();
+        // A `tool_result` with no `content` at all — genuinely textless,
+        // unlike one carrying real content (which now *does* classify; see
+        // `classification_texts_prefer_a_newer_tool_result_over_an_older_user_message`).
         let payload = json!({ "messages": [
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1"}]},
         ]});
 
         let attempt = classify_request(

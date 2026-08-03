@@ -113,21 +113,29 @@ For that fallback, the gateway embeds the **newest user text**, compares it
 against every route's `description` with static `model2vec-rs` embeddings,
 and picks the top match if it clears the fixed cosine threshold **0.45**.
 
-When the newest user text does not clear the bar — or the newest user message
-carries no text at all, which is the normal state of an agentic turn whose last
-message is a `tool_result` — the gateway **walks back through earlier user
-texts** (up to 8) and takes the most recent one that clears the threshold. A
-conversation keeps its route across "continue"-style turns and tool-result
+When the newest user text does not clear the bar — or the newest message
+carries no text at all — the gateway **walks back through earlier
+classifiable texts** (up to 8) and takes the most recent one that clears the
+threshold. This walk isn't limited to plain user text: a `tool_result` block
+(Anthropic), a `role: "tool"` message (OpenAI Chat), or a `function_call_output`
+item (OpenAI Responses) all count too, in true chronological order alongside
+ordinary messages. This matters for agentic sessions — if a user pastes a bare
+URL with no other context, that alone might only clear the bar for a trivial
+route; once the agent's own tools fetch what the URL actually points to, that
+fetched content becomes the newest classifiable text on the next turn and gets
+first shot at deciding the route, instead of the walk finding the earlier,
+shallower message first. A conversation keeps its route across "continue"-style
 turns without the gateway holding any per-conversation state: the history that
-arrives with every request is the state. A genuine topic change still wins
-immediately, because the newest text is always tried first. If nothing in the
-walk clears the bar — or classification cannot run at all — the reserved
-`default` route is used. Before any of this, every candidate text has
+arrives with every request is the state. A genuine topic change — or newly
+fetched content that reveals one — still wins immediately, because the newest
+text is always tried first. If nothing in the walk clears the bar — or
+classification cannot run at all — the reserved `default` route is used.
+Before any of this, every candidate text has
 `<system-reminder>...</system-reminder>` blocks stripped out — harness
 boilerplate (Claude Code injects one into every session's first user message),
-not the user's own words — and a message left blank afterward counts as no
-text and is skipped just like a textless `tool_result` turn; only the
-classification input is affected, the payload sent to the provider never
+not the user's own words — and a message left blank afterward (or a
+`tool_result` with no content at all) counts as no text and is skipped; only
+the classification input is affected, the payload sent to the provider never
 changes.
 
 Important consequences:

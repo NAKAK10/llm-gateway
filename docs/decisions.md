@@ -2,6 +2,91 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-08-03 — `tool_result` content joins the history walk instead of being treated as blank
+
+Reported failure: pasting a bare URL ("見て: https://github.com/.../issues/N")
+with no other text classifies against whatever route fits a short, trivial
+request — reasonably, since that's genuinely all the text says. The problem
+surfaces afterward: once an agent's own tools fetch what the URL points to
+(`gh issue view`, a web fetch, …) and the result lands in conversation
+history as a `tool_result` block, that content — which might reveal the task
+is not trivial at all — never gets a chance to influence routing on later
+turns either. `classification_texts`/`content_text` only ever read `type:
+"text"` blocks from `role: "user"` messages; a `tool_result` block
+(Anthropic), a `role: "tool"` message (OpenAI Chat), or a
+`function_call_output` item (OpenAI Responses) contributed nothing, by
+design — an existing test asserted exactly that.
+
+**First design considered, and rejected after tracing through the actual
+scenario: a last-resort third tier**, tried only after the existing
+system-prompt tier and user-text history walk both miss, leaving those two
+tiers' order, thresholds, and tests completely untouched. This does not fix
+the bug. On the turn right after the fetch, the newest *user-role* message in
+the request is the `tool_result` — but the walk already treats a textless
+`tool_result` as blank and keeps going *past* it, straight back to the
+original "見て: <url>" message, which still clears the trivial route's
+threshold on its own. The user-text tier never misses in this scenario, so a
+tier tried only after it exhausts never runs, and the session stays pinned
+to the trivial route forever.
+
+Researched how comparable OSS/commercial routers handle "more signal becomes
+available as a session progresses": RouteLLM, Aurelio Labs'
+`semantic-router`, LiteLLM Router, FrugalGPT, Not Diamond, OpenRouter's
+auto-router, and Cursor's router. None widen a single classification pass —
+FrugalGPT scores a cheap model's own output and escalates only if it looks
+insufficient; Cursor re-runs its classifier on each new agent turn's
+accumulated context rather than pinning one decision for a whole session.
+That pattern — "a separate, later decision point" — is what motivated the
+rejected tier design above. It turned out to be the wrong shape for this
+specific bug regardless: the issue here isn't that a second decision point is
+missing, it's that the *existing* history walk (built in the 2026-07-31 entry
+below specifically to walk past a turn with no real signal, "continue," a
+bare `tool_result`, to find "the instruction such a turn is continuing") was
+built on an assumption that no longer holds universally: that a `tool_result`
+never *is* that instruction, only ever masks one. Sometimes it is — the
+fetched content can be more informative than what it followed.
+
+**Built: `classification_texts` no longer filters to `role: "user"` +
+`type: "text"` only.** `role: "tool"` (OpenAI Chat) and `function_call_output`
+items (OpenAI Responses, which carry no `role` field and so were dropped
+outright before) now count, and Anthropic's `tool_result` blocks (nested
+inside a `role: "user"` message) are read via a new
+`classification_content_text` — a fork of `content_text`, not a change to it,
+because `content_text` is shared with `system_prompt_text` (where a
+`tool_result` block never appears anyway) and `last_user_text` (`extract_input`'s
+trace-log "what did the user last say" field — changing what that field means
+is a separate decision this entry does not make). The walk itself, its
+threshold (`CLASSIFICATION_THRESHOLD = 0.45`, same as ordinary user text — real
+external content, not harness boilerplate, so it doesn't need the stricter
+system-prompt bar), and `HISTORY_WALK_LIMIT` are all unchanged; only what
+counts as a candidate text at each history position changed. Being
+newest-first is what makes this safe rather than a free-for-all: fetched
+content only wins if it's more recent than whatever would otherwise have
+decided the route — the same recency rule that already governs plain
+conversation. No new `SemanticOutcome` variant or trace field was needed
+either — `Matched { texts_back }` still means exactly what it did, and
+`decided_by_text` (truncated to 200 chars) already shows, after the fact,
+whether a match came from ordinary conversation or fetched tool content.
+Anthropic's own `tool_result`-content string-or-array-of-blocks handling
+already existed in `translate/request/anthropic_to_chat.rs`'s
+`tool_result_text`/`text_blocks` — made `pub(crate)` and reused rather than
+reimplemented.
+
+**Accepted tradeoff, not fully mitigated:** tool output can be noisy (a large
+diff, raw command output) and could in principle false-positive against an
+unrelated route's `description`, the same way `<system-reminder>` boilerplate
+did before it was special-cased (2026-07-31 entry below). Unlike that case,
+there's no fixed, recognizable string to strip — genuine tool output varies
+per project and per tool. No new mitigation was added beyond what already
+protects ordinary noisy user text: the embedder's own 800-char/64-token
+bound per candidate, and requiring a candidate to actually clear
+`CLASSIFICATION_THRESHOLD` before it wins.
+
+**Still forward-looking only, same as any per-request router:** this cannot
+change which model answered the turn where the URL was first pasted, before
+anything was fetched — only later turns, once the fetched content is itself
+the newest classifiable text in history.
+
 ## 2026-08-03 — A utility-bypass call gets a real brevity floor and skips session persistence
 
 The owner's real gateway showed 26 `<auto-mode>` (`utility_bypass`) requests
