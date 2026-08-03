@@ -2,6 +2,34 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-08-03 — `config check` warns when a route has no fallback target
+
+Auditing a real gateway's `trace-*.jsonl` (992 requests over 3 days) found
+routes with a `default`-only `model` — no `fallbacks` — failing 40-80% of
+their requests completely: `role-web-researcher` 80% (16/20), `role-reviewer`
+64.3% (45/70), `role-implementer` 40.4% (46/114). In every one of those
+cases the route's single target hit a transient failure
+(`upstream::send_with_fallback`'s `http_502`/`connect_error`/`timeout`
+results — a `claude-cli` subprocess crash or an upstream 502, not anything
+routing-related) with nothing configured to fall back to, so the request
+failed outright. Routes that already had a fallback (`default`,
+`role-chore`, `role-explorer`) recovered from the exact same class of
+failure instead.
+
+Not an error — some setups may accept the risk deliberately, and plenty of
+existing configs (including this one, before the trace-log audit above)
+run for a long time before it matters — but worth surfacing where an
+operator will actually see it before it costs them a chunk of failed
+requests. `validate` (`src/config/validate.rs`) now warns per-route when
+`model.fallbacks` is empty, same non-fatal `report.warn` mechanism as the
+existing "provider defined but unused" warning. Filed
+[issue #39](https://github.com/NAKAK10/llm-gateway/issues/39) for the
+harder half of the same audit: the trace log has no field for *why* an
+attempt failed (`TraceAttempt` only ever records `result: "http_502"` etc.,
+never the CLI's stderr or the `reqwest::Error` detail that's already
+computed and then discarded) — diagnosing the 502s above took reading the
+gateway's source, not its logs.
+
 ## 2026-08-03 — A message's own text leads a mixed `content` array, ahead of any `tool_result` block it also carries
 
 Reported failure: auto-mode judgment calls kept re-asking the same yes/no
