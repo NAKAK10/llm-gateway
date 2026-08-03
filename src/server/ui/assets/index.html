@@ -91,6 +91,54 @@
   td.wrap { white-space: normal; max-width: 32rem; color: var(--muted); }
   td.clip { max-width: 12rem; overflow: hidden; text-overflow: ellipsis; }
   tr:hover td { background: var(--panel-2); }
+  /* Live rows are click-to-expand; the caret is the only affordance that
+     survives a table row, so it doubles as the open/closed state. */
+  tr.live-row { cursor: pointer; }
+  tr.live-row.open td { background: var(--panel-2); }
+  .caret { display: inline-block; width: 0.9rem; color: var(--muted); transition: transform 0.12s ease; }
+  /* Three lines of the preview, then ellipsis — a 200-character prompt would
+     otherwise make one row four times the height of every other. The rest is
+     one click away. */
+  .preview {
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  tr.live-row.open .caret { transform: rotate(90deg); color: var(--text); }
+  tr.detail-row > td { padding: 0; border-bottom: 1px solid var(--border); }
+  tr.detail-row.hidden { display: none; }
+  .detail {
+    background: var(--bg);
+    padding: 0.75rem 1rem 1rem 2rem;
+    display: grid;
+    gap: 0.75rem;
+  }
+  .detail h3 {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    font-weight: 600;
+    margin: 0 0 0.3rem;
+  }
+  .detail pre {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 0.76rem;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.6rem 0.75rem;
+    max-height: 26rem;
+    overflow: auto;
+  }
+  .detail .meta { display: flex; flex-wrap: wrap; gap: 0.35rem 1.25rem; font-size: 0.76rem; color: var(--muted); }
+  .detail .meta b { color: var(--text); font-weight: 500; font-family: var(--mono); }
+  .detail .note { font-size: 0.76rem; color: var(--muted); font-style: italic; }
   .badge {
     display: inline-block;
     padding: 0.05rem 0.45rem;
@@ -260,23 +308,89 @@
   const mapPoints = []; // recent {x, y, route, ts} for the vector map overlay
   const MAX_MAP_POINTS = 200;
 
+  // The expanded half of a live row: the prompt in full plus the routing
+  // metadata that never fits in the table. Built lazily on first open — a
+  // 30k-token prompt per row would otherwise be parsed into the DOM 300 times
+  // over for rows nobody ever looks at.
+  function detailHtml(ev) {
+    const prompt = ev.prompt_full || ev.prompt_preview;
+    const meta = [
+      ["req", ev.req_id],
+      ["endpoint", ev.endpoint],
+      ["requested", ev.requested_model],
+      ["mode", ev.routing_mode],
+      ["api", ev.api],
+      ["translation", ev.translation],
+      ["score", ev.score == null ? null : ev.score.toFixed(3)],
+      ["attempt", ev.attempt],
+      ["stream", ev.streaming ? "yes" : "no"],
+      ["in", fmtNum(ev.in_tok || 0)],
+      ["out", fmtNum(ev.out_tok || 0)],
+      ["cache r/w", `${fmtNum(ev.cache_read_tok || 0)} / ${fmtNum(ev.cache_write_tok || 0)}`],
+    ]
+      .filter(([, v]) => v != null && v !== "")
+      .map(([k, v]) => `<span>${escapeHtml(k)} <b>${escapeHtml(v)}</b></span>`)
+      .join("");
+
+    const parts = [`<div class="meta">${meta}</div>`];
+    parts.push(
+      `<div><h3>prompt</h3>` +
+        (prompt
+          ? `<pre>${escapeHtml(prompt)}</pre>`
+          : `<div class="note">this request carried no user text</div>`) +
+        `</div>`
+    );
+    if (ev.system_prompt) {
+      parts.push(`<div><h3>system prompt</h3><pre>${escapeHtml(ev.system_prompt)}</pre></div>`);
+    }
+    parts.push(`<div><h3>routing reason</h3><pre>${escapeHtml(ev.reason)}</pre></div>`);
+    if (ev.candidates && ev.candidates.length > 0) {
+      const rows = ev.candidates
+        .map((c) => `${c.route.padEnd(24, " ")} ${c.score.toFixed(4)}`)
+        .join("\n");
+      parts.push(`<div><h3>candidates</h3><pre>${escapeHtml(rows)}</pre></div>`);
+    }
+    if (ev.error) {
+      parts.push(`<div><h3>error</h3><pre>${escapeHtml(ev.error)}</pre></div>`);
+    }
+    return `<div class="detail">${parts.join("")}</div>`;
+  }
+
   function addLiveRow(ev) {
     liveEmpty.style.display = "none";
     const tr = document.createElement("tr");
+    tr.className = "live-row";
     const badgeClass = ev.status === "success" ? "success" : ev.status === "aborted" ? "aborted" : "error";
     const tokens = (ev.in_tok || 0) + (ev.out_tok || 0) + (ev.cache_read_tok || 0) + (ev.cache_write_tok || 0);
     tr.innerHTML = `
       <td>${escapeHtml(fmtTime(ev.ts))}</td>
       <td class="clip" title="${escapeHtml(ev.client)}">${escapeHtml(ev.client)}</td>
-      <td class="wrap" title="${escapeHtml(ev.prompt_preview || "")}">${escapeHtml(ev.prompt_preview || "—")}</td>
+      <td class="wrap"><div class="preview"><span class="caret">▸</span>${escapeHtml(ev.prompt_preview || "—")}</div></td>
       <td class="route-pill">${escapeHtml(ev.matched_route)}</td>
       <td>${escapeHtml(ev.provider)}/${escapeHtml(ev.model)}</td>
       <td><span class="badge ${badgeClass}">${escapeHtml(ev.status)}</span></td>
       <td class="num">${fmtNum(ev.dur_ms)}</td>
       <td class="num">${fmtNum(tokens)}</td>
     `;
+
+    const detail = document.createElement("tr");
+    detail.className = "detail-row hidden";
+    detail.innerHTML = `<td colspan="8"></td>`;
+    let built = false;
+    tr.addEventListener("click", () => {
+      if (!built) {
+        detail.firstElementChild.innerHTML = detailHtml(ev);
+        built = true;
+      }
+      const open = detail.classList.toggle("hidden");
+      tr.classList.toggle("open", !open);
+    });
+
+    // Prepended as a pair, newest first, so the detail row always sits
+    // directly under its own row.
+    liveRows.prepend(detail);
     liveRows.prepend(tr);
-    while (liveRows.children.length > MAX_ROWS) {
+    while (liveRows.children.length > MAX_ROWS * 2) {
       liveRows.removeChild(liveRows.lastChild);
     }
   }

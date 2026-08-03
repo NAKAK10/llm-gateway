@@ -9,7 +9,9 @@
 //!   prose.
 //!
 //! Trace records contain prompt text. User messages are truncated to
-//! [`TRUNCATE_CHARS`] unless `--debug-full` was given.
+//! [`TRUNCATE_CHARS`] on their way into the file unless `--debug-full` was
+//! given — see [`Recorder::trace`] for why the clip lives at the write
+//! boundary rather than in the record.
 
 pub mod retention;
 pub mod trace_log;
@@ -134,8 +136,28 @@ impl Recorder {
     }
 
     /// Queue a trace line. Dropped silently unless `--debug` is on.
-    pub fn trace(&self, record: trace_log::TraceRecord) {
+    ///
+    /// Truncation happens **here**, not where the record is built: a
+    /// `TraceRecord` carries the prompt text in full so `serve --ui`'s live
+    /// feed can show all of it (in memory, for as long as a tab is open),
+    /// and clipping it to [`TRUNCATE_CHARS`] is a property of *this file on
+    /// disk* rather than of the record. Doing it at the boundary keeps the
+    /// two decisions independent — see the module docs on `crate::server::live`
+    /// for why the dashboard is not gated on `--debug` at all.
+    pub fn trace(&self, mut record: trace_log::TraceRecord) {
         if self.mode.debug {
+            let limit = self.mode.truncate_at();
+            if limit.is_some() {
+                for text in [
+                    &mut record.input.last_user_text,
+                    &mut record.input.system_text,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    *text = truncate(text, limit);
+                }
+            }
             let _ = self.tx.send(Entry::Trace(Box::new(record)));
         }
     }
@@ -236,7 +258,25 @@ mod tests {
         };
         let recorder = Recorder::start(dir.path().to_path_buf(), mode).unwrap();
 
-        recorder.trace(trace_log::TraceRecord {
+        recorder.trace(trace_record(None, None));
+
+        // Give any (wrongly) queued write a moment to land, then confirm
+        // nothing was ever written to disk.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let now = time::OffsetDateTime::now_utc();
+        let path = dir.path().join(trace_log::file_name(
+            now.year(),
+            now.month() as u8,
+            now.day(),
+        ));
+        assert!(!path.exists());
+    }
+
+    fn trace_record(
+        last_user_text: Option<&str>,
+        system_text: Option<&str>,
+    ) -> trace_log::TraceRecord {
+        trace_log::TraceRecord {
             ts: "2026-07-30T00:00:00Z".to_string(),
             req_id: "id".to_string(),
             client: "claude-code".to_string(),
@@ -244,8 +284,8 @@ mod tests {
             requested_model: "claude-sonnet-4-6".to_string(),
             input: trace_log::TraceInput {
                 messages_n: 1,
-                last_user_text: None,
-                system_text: None,
+                last_user_text: last_user_text.map(String::from),
+                system_text: system_text.map(String::from),
                 tokens_est: 1,
                 tools: vec![],
                 has_image: false,
@@ -271,18 +311,73 @@ mod tests {
             },
             attempts: vec![],
             usage: None,
-        });
+        }
+    }
 
-        // Give any (wrongly) queued write a moment to land, then confirm
-        // nothing was ever written to disk.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    /// Read back whatever `trace` wrote for today, waiting for the background
+    /// writer to land it.
+    async fn written_trace(dir: &std::path::Path) -> trace_log::TraceRecord {
         let now = time::OffsetDateTime::now_utc();
-        let path = dir.path().join(trace_log::file_name(
+        let path = dir.join(trace_log::file_name(
             now.year(),
             now.month() as u8,
             now.day(),
         ));
-        assert!(!path.exists());
+        for _ in 0..100 {
+            if let Ok(c) = std::fs::read_to_string(&path) {
+                if let Some(line) = c.lines().next() {
+                    return serde_json::from_str(line).unwrap();
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("trace record was never written to {}", path.display());
+    }
+
+    /// The record itself carries prompt text in full (the live feed needs it
+    /// that way); the clip is applied on the way to disk.
+    #[tokio::test]
+    async fn trace_text_is_truncated_on_its_way_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::start(
+            dir.path().to_path_buf(),
+            RecordMode {
+                usage: false,
+                debug: true,
+                debug_full: false,
+            },
+        )
+        .unwrap();
+
+        let long = "a".repeat(TRUNCATE_CHARS + 100);
+        recorder.trace(trace_record(Some(&long), Some(&long)));
+
+        let record = written_trace(dir.path()).await;
+        for text in [record.input.last_user_text, record.input.system_text] {
+            let text = text.expect("both texts were recorded");
+            assert_eq!(text.chars().count(), TRUNCATE_CHARS + 1); // + ellipsis
+            assert!(text.ends_with('…'));
+        }
+    }
+
+    #[tokio::test]
+    async fn debug_full_writes_trace_text_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::start(
+            dir.path().to_path_buf(),
+            RecordMode {
+                usage: false,
+                debug: true,
+                debug_full: true,
+            },
+        )
+        .unwrap();
+
+        let long = "a".repeat(TRUNCATE_CHARS + 100);
+        recorder.trace(trace_record(Some(&long), None));
+
+        let record = written_trace(dir.path()).await;
+        assert_eq!(record.input.last_user_text.as_deref(), Some(long.as_str()));
     }
 
     fn usage_record(ts: String, in_tok: u64) -> usage_log::UsageRecord {

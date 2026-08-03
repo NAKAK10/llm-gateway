@@ -35,7 +35,8 @@ pub struct TraceRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceInput {
     pub messages_n: usize,
-    /// Truncated to 200 characters unless `--debug-full`.
+    /// Held in full on the record; truncated to 200 characters on its way to
+    /// disk unless `--debug-full` (see `crate::record::Recorder::trace`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_user_text: Option<String>,
     /// The request's system prompt (agent definition), truncated the same

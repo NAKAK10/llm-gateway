@@ -33,6 +33,14 @@ pub struct Target {
     /// `crate::upstream::FIRST_BYTE_TIMEOUT` when the provider config does not
     /// set its own `timeout_seconds`.
     pub timeout: std::time::Duration,
+    /// Set by `crate::server::proxy` for every target resolved inside the
+    /// `<transcript>` bypass (`SemanticOutcome::UtilityBypass`, any of its
+    /// three resolutions) — Claude Code's own internal auto-mode permission
+    /// judgment, not a real user turn. An agent-CLI transport reads this to
+    /// trim its own overhead for a call that expects a fast, short verdict
+    /// (see `crate::agent::claude_cli`); an HTTP transport ignores it
+    /// entirely. Always `false` from ordinary route resolution.
+    pub is_utility_bypass: bool,
 }
 
 impl std::fmt::Display for Target {
@@ -118,6 +126,10 @@ fn build_target(model_ref: ModelRef, provider: &ProviderConfig) -> Target {
             .timeout_seconds
             .map(std::time::Duration::from_secs)
             .unwrap_or(crate::upstream::FIRST_BYTE_TIMEOUT),
+        // Set by the caller (`crate::server::proxy`), never known here: this
+        // function has no idea whether it's building an ordinary route's
+        // targets or the `<transcript>` bypass's.
+        is_utility_bypass: false,
     }
 }
 
@@ -182,6 +194,17 @@ mod tests {
         assert_eq!(r.route_name, "role-writer");
         assert_eq!(r.targets.len(), 2);
         assert_eq!(r.targets[0].model_ref.model, "qwen/qwen3.5");
+    }
+
+    /// `is_utility_bypass` is set later, by `crate::server::proxy`, for the
+    /// one case (Claude Code's `<transcript>` auto-mode calls) that needs it
+    /// — ordinary resolution, whether by route name or by `resolve_model`
+    /// directly, must never set it itself.
+    #[test]
+    fn build_target_defaults_is_utility_bypass_to_false() {
+        let c = config();
+        let r = resolve(&c, "role-writer").unwrap();
+        assert!(r.targets.iter().all(|t| !t.is_utility_bypass));
     }
 
     #[test]
