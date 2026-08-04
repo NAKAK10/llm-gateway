@@ -39,19 +39,20 @@
 //! - **Sampling controls.** `temperature`, `top_p` and `stop_sequences` have
 //!   no CLI equivalent and are dropped. `max_tokens` has no equivalent
 //!   either, but is approximated by appending a brevity instruction to the
-//!   system prompt (see [`system_prompt`]) — a caller expecting a short
-//!   verdict (Claude Code's own `<transcript>`-prefixed utility calls, for
-//!   instance) otherwise gets several hundred tokens of unrequested
-//!   reasoning, which is slow enough through a freshly spawned CLI process to
-//!   blow past the caller's own timeout (issue #17). This is guidance, not
-//!   an enforced cap: the model can still ignore it. Worse, it previously
-//!   only fired when the caller's own payload set `max_tokens` — a
-//!   `<transcript>` utility call that omits `max_tokens` got no hint at all
-//!   and could ramble for as long as it liked (see the 2026-08-03 entry in
-//!   `docs/decisions.md`). `is_utility_bypass` (threaded in from
-//!   `crate::route::Target`, set only for that bypass) now makes
-//!   [`token_budget_hint`] fall back to a fixed default budget instead of
-//!   doing nothing.
+//!   system prompt (see [`system_prompt`]) for ordinary requests — a caller
+//!   expecting a short answer otherwise risks several hundred tokens of
+//!   unrequested reasoning, which is slow enough through a freshly spawned
+//!   CLI process to blow past the caller's own timeout (issue #17). This is
+//!   guidance, not an enforced cap: the model can still ignore it.
+//!   `is_utility_bypass` (threaded in from `crate::route::Target`, set only
+//!   for Claude Code's own `<transcript>`-prefixed judgment calls) turns this
+//!   off entirely instead: that caller parses the response against its own
+//!   contract, and appending anything risks breaking the parse. A brevity
+//!   hint was tried there too (falling back to a fixed default budget when
+//!   `max_tokens` was absent — see the 2026-08-03 entry in
+//!   `docs/decisions.md`), but it did not stop the resends; see the
+//!   2026-08-04 entry for what was measured and why the hint was dropped for
+//!   this caller instead.
 //!
 //! # Isolation, and why each flag is there
 //!
@@ -218,30 +219,26 @@ pub fn system(payload: &Value) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
-/// The budget assumed for a utility-bypass call whose payload sets no
-/// `max_tokens` of its own — Claude Code's internal judgment calls are a
-/// yes/no verdict, not a generation, so this only needs to be "small enough
-/// to keep a freshly spawned CLI process fast," not tuned to any particular
-/// answer shape.
-const UTILITY_BYPASS_DEFAULT_TOKEN_BUDGET: u64 = 20;
-
 /// A brevity instruction derived from the request's `max_tokens`, standing in
 /// for the sampling control the CLI has no flag for. Best-effort: it curbs
 /// the multi-hundred-token rambling measured on judgment-style utility calls
 /// (issue #17), but the model can still ignore it.
 ///
-/// Without `max_tokens` this used to do nothing at all — silently, since a
-/// caller expecting a short verdict does not necessarily send `max_tokens`.
-/// `is_utility_bypass` (`true` only for Claude Code's own `<transcript>`
-/// judgment calls — see the module docs) closes that gap by falling back to
-/// [`UTILITY_BYPASS_DEFAULT_TOKEN_BUDGET`] instead of returning `None`;
-/// ordinary requests are unaffected either way.
+/// Never fires for a utility-bypass call, regardless of `max_tokens`. Those
+/// are Claude Code's own `<transcript>`-prefixed judgment calls, and the
+/// caller parses the response against a contract it wrote — appending
+/// anything to that system prompt risks breaking the parse. (An earlier
+/// version appended a default budget here instead; trace logs showed the
+/// same judgment being resent five times in a row, each resend firing right
+/// after the previous response was delivered — content rejection, not a
+/// timeout. See the 2026-08-04 entry in `docs/decisions.md`.) Ordinary
+/// requests are unaffected: `max_tokens` present still yields a hint, absent
+/// still yields `None`.
 fn token_budget_hint(payload: &Value, is_utility_bypass: bool) -> Option<String> {
-    let max_tokens = match payload.get("max_tokens").and_then(|v| v.as_u64()) {
-        Some(max_tokens) => max_tokens,
-        None if is_utility_bypass => UTILITY_BYPASS_DEFAULT_TOKEN_BUDGET,
-        None => return None,
-    };
+    if is_utility_bypass {
+        return None;
+    }
+    let max_tokens = payload.get("max_tokens").and_then(|v| v.as_u64())?;
     Some(format!(
         "IMPORTANT: Respond in at most about {max_tokens} tokens. Be direct \
          and concise — do not pad the answer with unrequested explanation or \
@@ -250,8 +247,9 @@ fn token_budget_hint(payload: &Value, is_utility_bypass: bool) -> Option<String>
 }
 
 /// The full `--system-prompt` value: the caller's system text, if any, with
-/// [`token_budget_hint`] appended whenever it has something to say (always,
-/// for a utility-bypass call — see [`token_budget_hint`]).
+/// [`token_budget_hint`] appended whenever it has something to say. For a
+/// utility-bypass call that is never — [`token_budget_hint`] always returns
+/// `None` there — so the caller's system text passes through unmodified.
 pub fn system_prompt(payload: &Value, is_utility_bypass: bool) -> Option<String> {
     match (
         system(payload),
@@ -851,29 +849,21 @@ mod tests {
         assert!(token_budget_hint(&json!({}), false).is_none());
     }
 
-    /// The gap this whole fix closes: a utility-bypass call with no
-    /// `max_tokens` of its own used to get no hint at all, and could ramble
-    /// for as long as the model liked. It now falls back to
-    /// `UTILITY_BYPASS_DEFAULT_TOKEN_BUDGET`.
+    /// A utility-bypass call without its own `max_tokens` gets no hint at
+    /// all — appending anything to that caller's system prompt risks
+    /// breaking its own response parse (see the 2026-08-04 entry in
+    /// `docs/decisions.md`).
     #[test]
-    fn token_budget_hint_falls_back_to_a_default_for_a_utility_bypass_request_without_max_tokens() {
-        let hint = token_budget_hint(&json!({}), true).unwrap();
-        assert!(
-            hint.contains(&UTILITY_BYPASS_DEFAULT_TOKEN_BUDGET.to_string()),
-            "{hint}"
-        );
+    fn token_budget_hint_is_absent_for_a_utility_bypass_request_without_max_tokens() {
+        assert!(token_budget_hint(&json!({}), true).is_none());
     }
 
-    /// A utility-bypass call that *does* set its own `max_tokens` keeps that
-    /// value — the default only fills the gap, it does not override.
+    /// A utility-bypass call that *does* set its own `max_tokens` still gets
+    /// no hint — the flag disables the hint unconditionally, it does not
+    /// merely fill a gap.
     #[test]
-    fn token_budget_hint_respects_a_utility_bypass_requests_own_max_tokens() {
-        let hint = token_budget_hint(&json!({"max_tokens": 64}), true).unwrap();
-        assert!(hint.contains("64"), "{hint}");
-        assert!(
-            !hint.contains(&UTILITY_BYPASS_DEFAULT_TOKEN_BUDGET.to_string()),
-            "{hint}"
-        );
+    fn token_budget_hint_is_absent_for_a_utility_bypass_request_with_max_tokens() {
+        assert!(token_budget_hint(&json!({"max_tokens": 64}), true).is_none());
     }
 
     #[test]
@@ -906,15 +896,18 @@ mod tests {
     }
 
     /// The other half of the fix, at the `system_prompt` level: a
-    /// utility-bypass call gets the default budget hint even with no
-    /// caller-set `max_tokens` and no caller-set system prompt at all.
+    /// utility-bypass call's system text passes through completely
+    /// unmodified, even when the payload sets `max_tokens` — the caller
+    /// parses the response against its own contract, so nothing gets
+    /// appended.
     #[test]
-    fn system_prompt_applies_the_default_budget_for_a_utility_bypass_request() {
-        let combined = system_prompt(&json!({}), true).unwrap();
-        assert!(
-            combined.contains(&UTILITY_BYPASS_DEFAULT_TOKEN_BUDGET.to_string()),
-            "{combined}"
+    fn system_prompt_passes_a_utility_bypass_requests_system_through_unmodified() {
+        let payload = json!({"system": "You are terse.", "max_tokens": 64});
+        assert_eq!(
+            system_prompt(&payload, true).as_deref(),
+            Some("You are terse.")
         );
+        assert!(system_prompt(&json!({"max_tokens": 64}), true).is_none());
     }
 
     #[test]

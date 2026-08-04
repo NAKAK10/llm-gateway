@@ -119,6 +119,16 @@ pub async fn send_with_fallback(
         // — a hung child process is otherwise indistinguishable from one still
         // working, and fallback would never trigger.
         if target.transport.is_agent_cli() {
+            let dropped = crate::agent::dropped_by_transport(&attempt.payload);
+            if let Some(dropped) = &dropped {
+                tracing::warn!(
+                    target_name = %target,
+                    tools = dropped.tools,
+                    assistant_prefill = dropped.assistant_prefill,
+                    flattened_messages = dropped.flattened_messages,
+                    "agent-CLI transport cannot carry this request's structure; it was dropped"
+                );
+            }
             let outcome = tokio::time::timeout(
                 target.timeout,
                 crate::agent::spawn(target, &attempt.payload, attempt.streaming),
@@ -133,6 +143,7 @@ pub async fn send_with_fallback(
                         result: "timeout".to_string(),
                         ms: started.elapsed().as_millis() as u64,
                         detail: Some(format!("no response within {:?}", target.timeout)),
+                        dropped: dropped.clone(),
                     });
                     if is_last {
                         break;
@@ -149,6 +160,7 @@ pub async fn send_with_fallback(
                             result: format!("http_{}", spawned.status.as_u16()),
                             ms: started.elapsed().as_millis() as u64,
                             detail: spawned.detail.clone(),
+                            dropped: dropped.clone(),
                         });
                         continue;
                     }
@@ -162,6 +174,7 @@ pub async fn send_with_fallback(
                         },
                         ms: started.elapsed().as_millis() as u64,
                         detail: spawned.detail.clone(),
+                        dropped: dropped.clone(),
                     });
                     return Ok(Accepted {
                         status: spawned.status,
@@ -181,6 +194,7 @@ pub async fn send_with_fallback(
                         result: "spawn_error".to_string(),
                         ms: started.elapsed().as_millis() as u64,
                         detail: Some(err.to_string()),
+                        dropped: dropped.clone(),
                     });
                     if is_last {
                         break;
@@ -206,6 +220,7 @@ pub async fn send_with_fallback(
                         result: "key_unresolved".to_string(),
                         ms: started.elapsed().as_millis() as u64,
                         detail: Some(err.to_string()),
+                        dropped: None,
                     });
                     continue;
                 }
@@ -229,6 +244,7 @@ pub async fn send_with_fallback(
                     result: "timeout".to_string(),
                     ms,
                     detail: Some(format!("no response within {:?}", target.timeout)),
+                    dropped: None,
                 });
                 if is_last {
                     break;
@@ -247,6 +263,7 @@ pub async fn send_with_fallback(
                     result: result.to_string(),
                     ms,
                     detail: Some(err.to_string()),
+                    dropped: None,
                 });
                 if is_last {
                     break;
@@ -270,6 +287,7 @@ pub async fn send_with_fallback(
                         result: format!("http_{}", status.as_u16()),
                         ms,
                         detail,
+                        dropped: None,
                     });
                     continue;
                 }
@@ -283,6 +301,7 @@ pub async fn send_with_fallback(
                     },
                     ms,
                     detail: None,
+                    dropped: None,
                 });
                 return Ok(Accepted {
                     status: http::StatusCode::from_u16(response.status().as_u16())

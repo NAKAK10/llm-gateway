@@ -34,6 +34,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::error::{Error, Result};
+use crate::record::trace_log::DroppedByTransport;
 use crate::route::Target;
 
 /// A spawned upstream, shaped like the HTTP one so `upstream::Accepted` can hold
@@ -110,6 +111,40 @@ impl AgentLimiter {
 }
 
 static LIMITER: LazyLock<AgentLimiter> = LazyLock::new(AgentLimiter::new);
+
+/// What an agent-CLI transport's translation is about to throw away from
+/// `payload`, for the trace log — see [`crate::record::trace_log::DroppedByTransport`]
+/// and the module docs on [`claude_cli`] ("What is lost, and why"). `None`
+/// when nothing would be dropped, so callers can record `Option::None`
+/// instead of an all-empty object.
+///
+/// Pure inspection: this does not change what gets sent. `spawn` and its
+/// helpers ([`claude_cli::prompt`], [`claude_cli::system_prompt`]) already do
+/// the actual dropping independently of this function.
+pub fn dropped_by_transport(payload: &serde_json::Value) -> Option<DroppedByTransport> {
+    let tools = payload
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .filter(|tools| !tools.is_empty())
+        .map(|tools| tools.len());
+
+    let messages = payload.get("messages").and_then(|v| v.as_array());
+    let assistant_prefill = messages
+        .and_then(|m| m.last())
+        .and_then(|last| last.get("role"))
+        .and_then(|r| r.as_str())
+        .is_some_and(|role| role == "assistant");
+    let flattened_messages = messages
+        .map(|m| m.len())
+        .filter(|&n| n >= 2);
+
+    let dropped = DroppedByTransport {
+        tools,
+        assistant_prefill,
+        flattened_messages,
+    };
+    (!dropped.is_empty()).then_some(dropped)
+}
 
 /// Run one request against `target`'s agent CLI.
 ///
@@ -195,7 +230,143 @@ async fn spawn_claude(
             detail: None,
         })
     } else {
-        buffered_body(child, model, permit).await
+        buffered_body(child, model, permit, target.is_utility_bypass).await
+    }
+}
+
+/// Diagnostic-only, opt-in dump of a buffered `claude -p` round trip.
+///
+/// This exists to answer one question: what does `claude -p` actually return
+/// for `is_utility_bypass` requests (the Claude Code Auto Mode security
+/// monitor), whose response length has been observed swinging from ~5 tokens
+/// to ~1000 for what looks like the same input. Input-side causes (tools,
+/// assistant prefill, brevity-hint injection) are already ruled out by
+/// measurement, so this records the response side instead: the CLI's raw
+/// stdout/stderr and what `message_from_jsonl` made of them.
+///
+/// Silent no-op unless `LLM_GATEWAY_UTILITY_DUMP` is set to a file path — with
+/// it unset this module behaves exactly as before, no I/O and no formatting
+/// work performed.
+mod utility_dump {
+    use std::io::Write;
+
+    const ENV_VAR: &str = "LLM_GATEWAY_UTILITY_DUMP";
+
+    /// Append one record for `stdout`/`stderr`/the `message_from_jsonl`
+    /// outcome to the path named by `LLM_GATEWAY_UTILITY_DUMP`, if set.
+    ///
+    /// Only called for `is_utility_bypass` targets (see call site in
+    /// `buffered_body`) — non-bypass traffic is not what's under
+    /// investigation and this stays silent for it regardless of the env var.
+    /// Any I/O failure (bad path, permissions) is swallowed after a
+    /// `tracing::warn!`: a diagnostic dump must never be able to break a
+    /// request that would otherwise have succeeded.
+    pub(super) fn record(stdout: &[u8], stderr: &[u8], outcome: &Result<serde_json::Value, String>) {
+        let Some(path) = std::env::var_os(ENV_VAR) else {
+            return;
+        };
+        let record = format_record(stdout, stderr, outcome);
+        let result = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(record.as_bytes()));
+        if let Err(source) = result {
+            tracing::warn!(
+                path = %std::path::Path::new(&path).display(),
+                %source,
+                "could not write LLM_GATEWAY_UTILITY_DUMP record"
+            );
+        }
+    }
+
+    /// Render one human-readable record. Pulled out from [`record`] so it can
+    /// be unit-tested without touching the filesystem.
+    fn format_record(stdout: &[u8], stderr: &[u8], outcome: &Result<serde_json::Value, String>) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stdout_text = String::from_utf8_lossy(stdout);
+        let stderr_text = String::from_utf8_lossy(stderr).trim().to_string();
+
+        let mut out = String::new();
+        out.push_str(&"=".repeat(80));
+        out.push('\n');
+        out.push_str(&format!("timestamp_unix: {now}\n"));
+        out.push_str(&format!("stdout_bytes: {}\n", stdout.len()));
+        out.push_str("--- stdout (raw JSONL) ---\n");
+        out.push_str(&stdout_text);
+        if !stdout_text.ends_with('\n') {
+            out.push('\n');
+        }
+        if !stderr_text.is_empty() {
+            out.push_str("--- stderr ---\n");
+            out.push_str(&stderr_text);
+            out.push('\n');
+        }
+        match outcome {
+            Ok(message) => {
+                out.push_str("message_from_jsonl: OK\n");
+                out.push_str("--- final body ---\n");
+                out.push_str(
+                    &serde_json::to_string_pretty(message)
+                        .unwrap_or_else(|_| message.to_string()),
+                );
+                out.push('\n');
+            }
+            Err(detail) => {
+                out.push_str("message_from_jsonl: ERROR\n");
+                out.push_str("--- error detail ---\n");
+                out.push_str(detail);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn formats_a_successful_record() {
+            let outcome = Ok(serde_json::json!({"type": "message", "content": []}));
+            let text = format_record(b"{\"type\":\"assistant\"}\n", b"", &outcome);
+            assert!(text.contains("stdout_bytes: 21"));
+            assert!(text.contains("{\"type\":\"assistant\"}"));
+            assert!(text.contains("message_from_jsonl: OK"));
+            assert!(text.contains("\"type\": \"message\""));
+            assert!(!text.contains("--- stderr ---"));
+        }
+
+        #[test]
+        fn formats_a_failed_record_with_stderr() {
+            let outcome: Result<serde_json::Value, String> =
+                Err("no assistant message found".to_string());
+            let text = format_record(b"", b"  usage limit reached  \n", &outcome);
+            assert!(text.contains("stdout_bytes: 0"));
+            assert!(text.contains("--- stderr ---\nusage limit reached"));
+            assert!(text.contains("message_from_jsonl: ERROR"));
+            assert!(text.contains("no assistant message found"));
+        }
+
+        /// With the env var unset, `record` must not touch the filesystem at
+        /// all — the whole point of the opt-in is that a gateway that never
+        /// sets `LLM_GATEWAY_UTILITY_DUMP` behaves exactly as before.
+        #[test]
+        fn record_is_a_no_op_without_the_env_var() {
+            // SAFETY: no other test in this process reads or writes this
+            // specific env var, so there is no data race on it here.
+            unsafe {
+                std::env::remove_var(ENV_VAR);
+            }
+            let outcome = Ok(serde_json::json!({}));
+            // If this touched the filesystem with no path configured it
+            // would panic well before returning; reaching here is the
+            // assertion.
+            record(b"stdout", b"stderr", &outcome);
+        }
     }
 }
 
@@ -417,15 +588,25 @@ fn stream_body(
 
 /// Wait for the child and return one complete Anthropic message. `permit` is
 /// only for its `Drop` — held until the child has fully run, then released.
+///
+/// `is_utility_bypass` gates nothing about the request or response — it only
+/// decides whether [`utility_dump::record`] writes a diagnostic copy of this
+/// round trip (see that module's docs).
 async fn buffered_body(
     child: tokio::process::Child,
     model: String,
     permit: OwnedSemaphorePermit,
+    is_utility_bypass: bool,
 ) -> Result<Spawned> {
     let output = child.wait_with_output().await?;
     drop(permit);
 
-    let (status, body, detail) = match claude_cli::message_from_jsonl(&output.stdout, &model) {
+    let jsonl_result = claude_cli::message_from_jsonl(&output.stdout, &model);
+    if is_utility_bypass {
+        utility_dump::record(&output.stdout, &output.stderr, &jsonl_result);
+    }
+
+    let (status, body, detail) = match jsonl_result {
         Ok(message) => (http::StatusCode::OK, message, None),
         Err(detail) => {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -533,5 +714,53 @@ mod tests {
         let _p = tokio::time::timeout(Duration::from_millis(50), limiter.acquire("p", 0))
             .await
             .expect("a max_concurrent of 0 must still grant one permit, not hang forever");
+    }
+
+    #[test]
+    fn dropped_by_transport_reports_tool_count() {
+        let payload = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "a"}, {"name": "b"}],
+        });
+        let dropped = dropped_by_transport(&payload).expect("tools were dropped");
+        assert_eq!(dropped.tools, Some(2));
+        assert!(!dropped.assistant_prefill);
+        assert_eq!(dropped.flattened_messages, None);
+    }
+
+    #[test]
+    fn dropped_by_transport_flags_assistant_prefill() {
+        let payload = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "partial"},
+            ],
+        });
+        let dropped = dropped_by_transport(&payload).expect("prefill was dropped");
+        assert!(dropped.assistant_prefill);
+        assert_eq!(dropped.flattened_messages, Some(2));
+    }
+
+    #[test]
+    fn dropped_by_transport_is_none_when_nothing_would_be_dropped() {
+        let payload = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        assert!(dropped_by_transport(&payload).is_none());
+    }
+
+    #[test]
+    fn dropped_by_transport_counts_flattened_messages() {
+        let payload = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "one"},
+                {"role": "assistant", "content": "two"},
+                {"role": "user", "content": "three"},
+            ],
+        });
+        let dropped = dropped_by_transport(&payload).expect("messages were flattened");
+        assert_eq!(dropped.flattened_messages, Some(3));
+        // Last message is user, not assistant.
+        assert!(!dropped.assistant_prefill);
     }
 }

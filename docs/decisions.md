@@ -2,6 +2,110 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-08-04 — Why an `<auto-mode>` judgment is resent five times: `claude -p` cannot hold the caller to a response format
+
+The 2026-08-03 entry below diagnosed this as a client giving up on a slow
+response and blamed `token_budget_hint`'s missing floor. That was wrong, and
+so were two further readings tried on top of it. What the caller actually
+rejects is the *shape* of the answer, and the reason it comes back
+misshapen is that this transport has no mechanism left to constrain it.
+
+**The evidence, finally obtained by dumping what `claude -p` returns.** Six
+consecutive judgment responses for the same action (`LLM_GATEWAY_UTILITY_DUMP`,
+added in this change):
+
+| # | chars | verdict tag |
+|---|---|---|
+| 1 | 1597 | `<block>` never closed |
+| 2 | 1113 | `<block>` never closed |
+| 3 | 1629 | `<block>…</block>` — well formed |
+| 4 | **7** | `<block>` and nothing else |
+| 5 | 1149 | no tag at all ("Nothing here meets the bar for blocking") |
+| 6 | 1978 | no tag at all ("This is a clear-cut allow.") |
+
+One of six is parseable. Claude Code's auto-mode classifier wants a tagged
+verdict; five of six are unusable, so it re-asks, hits its five-attempt
+ceiling, and reports "Auto mode could not evaluate this action and is
+blocking it for safety." Fifteen consecutive actions were blocked that way
+in the owner's session. Records 1, 2, 5 and 6 end on a *completed sentence* —
+nothing was truncated. The model simply finished its reasoning without
+emitting the closing tag.
+
+**Record 4 is this gateway's own fault, and is what `token_budget_hint` now
+stops causing.** A seven-character answer — the opening tag alone — is what
+"IMPORTANT: Respond in at most about 20 tokens. Be direct and concise — do
+not pad the answer with unrequested explanation or reasoning" produces when
+appended to a prompt whose required form is `<block>` *reasoning* `</block>`.
+The instruction and the contract contradict each other outright. So
+`token_budget_hint` now returns `None` unconditionally for
+`is_utility_bypass`, regardless of `max_tokens`, and
+`UTILITY_BYPASS_DEFAULT_TOKEN_BUDGET` is gone. Ordinary requests keep the
+issue #17 guard in full: a caller that sets its own `max_tokens` is asking
+for exactly this hint and has no parsing contract to break.
+
+**This is a partial fix and nothing pretends otherwise.** It removes one of
+two failure modes. The other — a completed answer with no closing tag — this
+transport cannot prevent, because every way of holding a model to a format
+is gone by the time the request reaches `claude -p`:
+
+| how you would normally enforce it | via `claude -p` |
+|---|---|
+| `stop_sequences` (halt at `</block>`) | dropped — no CLI equivalent |
+| `max_tokens` as a hard cap | dropped — only approximable by instruction |
+| assistant prefill | no mechanism |
+| `tools` / structured output | dropped |
+
+**Repairing the response was rejected outright.** Records 5 and 6 argue for
+allowing the action; synthesising an `<allow>` wrapper around that would make
+the gateway the author of a security verdict it did not make. Not a
+trade-off worth having — the gateway forwards judgments, it does not issue
+them.
+
+So a faithful fix means an HTTP transport, where those four controls survive.
+`anthropic-subscription` cannot be one: a Pro/Max plan is a Claude Code
+credential, not an API key (see `src/agent/claude_cli.rs`'s own opening
+note), which is why `claude-cli` exists at all. Repurposing the stored OAuth
+credential to call the API directly was raised and refused — that is
+credential transplantation, not configuration. Pointing `autoMode` at a
+provider whose key the operator actually holds is available and legitimate;
+so is not running Auto Mode. Both are the operator's call, and neither is
+made here.
+
+**Three readings were measured and discarded before this one. Recorded so
+they are not re-walked:**
+
+1. *The appended brevity hint breaks the parse.* Removed it entirely, so the
+   caller's prompt passed through byte-for-byte. Three fresh judgments: 5, 5,
+   5 resends. No change to the count — the hint causes record 4, not records
+   1, 2, 5 and 6. (Reverted at the time as "disproven"; re-applied once the
+   dump showed record 4.)
+2. *The monitor wants a `tool_use` verdict `claude -p` cannot produce.*
+   `TraceInput.tools` was empty on all 120 requests. These calls carry no
+   tools. Nothing was built.
+3. *An assistant prefill is being flattened into the transcript.* The
+   `dropped` field added here answered it on the first judgment that arrived:
+   `assistant_prefill: false`, two user messages, nothing else lost.
+
+**The instrumentation added here exists because none of that was visible.**
+`TraceAttempt.dropped` now records what an agent-CLI transport discarded per
+attempt — tool count, assistant prefill, flattened message count — with a
+`tracing::warn!` alongside it. It immediately surfaced something larger than
+the judgment bug: **429 of 759 tool-bearing requests were reaching a
+`claude-cli` target**, one dropping 113 tool definitions and flattening 12
+messages, another 107 and 23 — every one of them logged `success`. Routing
+was deliberately left untouched: diverting those to an HTTP fallback would
+silently move the owner's main traffic onto a different model, which is a
+decision, not a bugfix.
+
+**What made this take a full day.** A gateway-level `success` was read as the
+feature working, when it only meant the subprocess exited cleanly — a monitor
+built on that signal reported "no failures" through fifteen blocked actions.
+And the five-resend count was read as evidence of *design* ("24 of 24 groups
+land on exactly five, a retry loop would sometimes succeed on the first try")
+when a 100 %-failure loop produces that same invariant. The same number fit
+both stories; only the response body could separate them, and it was the one
+thing never looked at. Dump the payload before theorising about it.
+
 ## 2026-08-04 — `providers add` and `route add`/`edit`: mutating an existing config without `init`'s full regeneration
 
 `init` is the only command that writes `config.json`, and it always
@@ -291,6 +395,16 @@ anything was fetched — only later turns, once the fetched content is itself
 the newest classifiable text in history.
 
 ## 2026-08-03 — A utility-bypass call gets a real brevity floor and skips session persistence
+
+> **Superseded 2026-08-04 (see the entry above).** The premise below — that
+> the client gives up because the *call took too long* — is wrong. It rejects
+> the answer's **shape**: the dumped responses carry an unclosed `<block>`
+> tag, or none at all. The brevity floor added here did not change the resend
+> count, and one of its outcomes (a 20-token budget yielding `<block>` and
+> nothing else) turned out to be a failure mode of its own, so
+> `token_budget_hint` no longer fires for these calls at all.
+> `--no-session-persistence`, also added here, is unaffected and still worth
+> keeping on its own latency merits.
 
 The owner's real gateway showed 26 `<auto-mode>` (`utility_bypass`) requests
 in a 5-minute window, all `attempt: 1` / `status: success` — no gateway-side

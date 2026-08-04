@@ -701,6 +701,7 @@ fn count_tokens_locally(
                 result: "estimated_locally".to_string(),
                 ms: 0,
                 detail: None,
+                dropped: None,
             }],
             None,
             semantic_attempt,

@@ -158,6 +158,41 @@ pub struct TraceAttempt {
     /// 2026-08-03 entry in `docs/decisions.md`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// What an agent-CLI transport's translation threw away for this attempt —
+    /// see `crate::agent::dropped_by_transport`. `None` on an HTTP target,
+    /// which carries the request faithfully and has nothing to report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped: Option<DroppedByTransport>,
+}
+
+/// What an agent-CLI transport could not carry from the original request —
+/// see the module docs on `src/agent/claude_cli.rs` ("What is lost, and why")
+/// for the full explanation of why each of these is unavoidable for that
+/// transport, not a bug to fix.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DroppedByTransport {
+    /// How many `tools` the payload carried. Discarded outright: there is no
+    /// way to hand a foreign tool schema to an agent CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<usize>,
+    /// Whether the last message was `role: assistant` (a prefill). The CLI has
+    /// no equivalent mechanism, so this collapses into labeled text like
+    /// everything else in the flattened prompt.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub assistant_prefill: bool,
+    /// How many `messages` were flattened into a single prompt, when more
+    /// than one. `None` when there was only one message to begin with, since
+    /// no flattening happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flattened_messages: Option<usize>,
+}
+
+impl DroppedByTransport {
+    /// Whether nothing was actually dropped — the case a `TraceAttempt`
+    /// should record as `None` rather than an all-empty object.
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_none() && !self.assistant_prefill && self.flattened_messages.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -237,6 +272,7 @@ mod tests {
                 result: "ok_first_byte".to_string(),
                 ms: 120,
                 detail: None,
+                dropped: None,
             }],
             usage: Some(TraceUsage {
                 in_tok: 12,

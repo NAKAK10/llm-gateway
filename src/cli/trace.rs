@@ -207,6 +207,7 @@ mod tests {
                 result: "ok_first_byte".to_string(),
                 ms: 250,
                 detail: None,
+                dropped: None,
             }],
             usage: None,
         }
@@ -230,6 +231,7 @@ mod tests {
             result: "http_429".to_string(),
             ms: 80,
             detail: None,
+            dropped: None,
         });
         assert_eq!(
             format_line(&record),
