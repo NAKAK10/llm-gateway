@@ -42,7 +42,7 @@ pub const CONFIG_MODE: u32 = 0o600;
 /// Timestamped (to the second) rather than a fixed `.bak` name, so running
 /// `init` over an existing config more than once never silently discards an
 /// earlier backup — each confirmed regeneration keeps its own copy.
-fn backup_path_for(config_path: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn backup_path_for(config_path: &std::path::Path) -> std::path::PathBuf {
     let stamp = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "unknown-time".to_string())

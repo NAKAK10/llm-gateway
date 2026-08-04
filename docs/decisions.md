@@ -2,6 +2,56 @@
 
 Newest first. Each entry records *why*, because the code alone can't.
 
+## 2026-08-04 — `providers add` and `route add`/`edit`: mutating an existing config without `init`'s full regeneration
+
+`init` is the only command that writes `config.json`, and it always
+regenerates the *whole* file — every provider, route, and key currently in
+it — asking first, backing up first. That is the right default for a fresh
+setup, but wrong for "I already have a working config, I just want to add
+Ollama" or "change one route's model": regenerating from scratch would mean
+re-answering the entire wizard (every provider, every role, every key
+storage choice) just to change one line, discarding whatever hand-edits had
+accumulated since `init` last ran.
+
+**`providers add`** and **`route add`/`route edit`** (`src/cli/providers.rs`,
+`src/cli/route_cmd.rs`) instead read the existing file, apply exactly one
+change, validate the result, and write it back — a genuine read-modify-write
+rather than `init`'s regenerate-and-ask. The shared plumbing
+(`src/cli/config_write.rs`) does three things every one of these commands
+needs and none of them should reimplement: back up the existing file the
+same way `init` does (`backup_path_for`, now `pub(crate)` instead of private
+to `init`), refuse to write if `config::validate` finds a new error (warnings
+are printed but don't block — same non-fatal treatment `config check`
+already gives them), and set `0600` permissions on the result (`init`'s
+`CONFIG_MODE`, reused rather than redefined).
+
+**Same headless-or-interactive shape for all three commands, driven by "was
+enough given on the command line to skip asking":** `providers add --preset
+ollama-local` needs no key and writes immediately; a bare `providers add`
+walks the same preset menu `init` already offers (`KnownProvider::ALL`,
+`src/cli/init.rs`) plus a custom-provider path, then asks how to store the
+key exactly the way `init` would. `route add`/`route edit` follow the same
+rule per field: give `--model`/`--description`/`--fallback` and it's applied
+directly; give less, and cliclack prompts for whatever's missing, pre-filled
+with the current value on `edit` so accepting every default is a no-op.
+`route edit` with no name at all is the one case that needs a lookup step
+first — a `cliclack::select` over every configured route name — before the
+same per-field prompts run.
+
+**Deliberately not built:** a live `/models` probe for `route add`/`edit`'s
+model prompt, the way `init`'s `choose_model` does for a `KnownProvider`.
+`choose_model` only knows how to reach a *preset* provider's endpoint — a
+route's model can point at any provider already in the config, preset or
+fully custom, and reverse-mapping an arbitrary configured provider back to a
+`KnownProvider` to reuse that probe is fragile (id or `base_url` could differ
+from every preset's own). A free-text `<provider>/<model>` prompt is honest
+about what this command can and can't check ahead of time — `validate`
+still catches an undefined provider or a malformed string once written, same
+as a hand-edit would. `providers edit`/`providers remove`/`route remove`
+also don't exist yet — nobody asked for them, and a hand-edit remains one
+line away for now; `providers add`'s duplicate-id error says so explicitly
+rather than pretending the gap isn't there.
+
 ## 2026-08-03 — Agent-CLI providers get a per-provider concurrency cap (issue #40)
 
 Re-auditing the gateway's own trace log restricted to just the current

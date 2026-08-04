@@ -50,11 +50,33 @@ enum Command {
     /// Show routing decisions recorded with `--debug`.
     Trace(TraceArgs),
 
-    /// Check that every configured provider is reachable.
-    Providers,
+    /// Check that every configured provider is reachable, or add a new one.
+    Providers {
+        #[command(subcommand)]
+        action: Option<ProviderAction>,
+    },
+
+    /// Add or change a route in `config.json`.
+    #[command(subcommand)]
+    Route(RouteAction),
 
     /// Check for a newer release and install it.
     Update(UpdateArgs),
+}
+
+#[derive(Subcommand)]
+enum ProviderAction {
+    /// Add a new provider to `config.json`.
+    Add(cli::providers::AddArgs),
+}
+
+#[derive(Subcommand)]
+enum RouteAction {
+    /// Add a new route to `config.json`.
+    Add(cli::route_cmd::AddArgs),
+
+    /// Change an existing route in `config.json`.
+    Edit(cli::route_cmd::EditArgs),
 }
 
 #[derive(Args)]
@@ -237,10 +259,16 @@ fn run() -> Result<()> {
             client: args.client,
         }),
 
-        Command::Providers => {
+        Command::Providers { action: None } => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(cli::providers::run())
         }
+        Command::Providers {
+            action: Some(ProviderAction::Add(args)),
+        } => cli::providers::add(args),
+
+        Command::Route(RouteAction::Add(args)) => cli::route_cmd::add(args),
+        Command::Route(RouteAction::Edit(args)) => cli::route_cmd::edit(args),
 
         Command::Update(args) => {
             let runtime = tokio::runtime::Runtime::new()?;

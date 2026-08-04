@@ -279,7 +279,7 @@
       <div id="usage-empty" class="empty" style="display: none">No usage recorded yet.</div>
     </div>
     <div class="panel">
-      <h2>Live cumulative token usage</h2>
+      <h2>Live token usage</h2>
       <div class="controls">
         <label>bucket
           <select id="usage-live-window">
@@ -557,7 +557,7 @@
   }
   setInterval(plotLivePoints, 2000);
 
-  // ---- live cumulative token usage ---------------------------------------
+  // ---- live token usage ---------------------------------------------------
   // Deliberately independent of the on-disk `/api/usage` table above: it
   // reuses the same `/api/live` stream the Live tab already consumes rather
   // than adding a new endpoint or any server-side aggregation state, so it
@@ -565,12 +565,12 @@
   // in-memory-only lifetime the Live tab already has.
   //
   // One bar per clock-aligned bucket (e.g. 22:45, 22:50, 22:55, 23:00 for a
-  // 5-minute bucket), each bar's height the running total of every token
-  // seen up to that bucket's end — never per-bucket-only, always the whole
-  // session's cumulative total, so the chart reads as "usage climbing over
-  // time," not a series of independent snapshots. Each bar is stacked by
-  // model (same `colorFor` used by the live table and vector map) so which
-  // model is driving that growth is visible at a glance, not just the total.
+  // 5-minute bucket), each bar's height only the tokens seen *within that
+  // bucket's own window* — not a running total — so the chart reads as
+  // "usage per period," and a quiet bucket after a busy one visibly drops
+  // back down. Each bar is stacked by model (same `colorFor` used by the
+  // live table and vector map) so which model drove that period's usage is
+  // visible at a glance, not just the total.
   const usageLiveEvents = []; // {ts, model, tokens}, oldest first, append-only
   // Bounds memory for a dashboard tab left open a long time; at one entry
   // per completed request this comfortably outlasts any real session.
@@ -608,32 +608,37 @@
       currentBucketStart - (USAGE_LIVE_BUCKET_COUNT - 1) * bucketMs
     );
 
-    // A single forward pass accumulates each model's running total as it
-    // crosses each bucket boundary — events are append-only in timestamp
-    // order, so nothing needs re-summing from scratch per bucket. Each
-    // bucket keeps its own snapshot (`new Map(running)`) since the running
-    // totals keep changing after it's recorded.
+    // A single forward pass buckets each event once — events are append-only
+    // in timestamp order, so each event is only ever considered for the one
+    // bucket window it falls in (no re-summing from scratch per bucket).
     let idx = 0;
-    const running = new Map(); // model -> cumulative tokens
     const bars = [];
     for (let bucketStart = startBucket; bucketStart <= currentBucketStart; bucketStart += bucketMs) {
       const bucketEnd = bucketStart + bucketMs;
+      const totals = new Map(); // model -> tokens within this bucket only
       while (idx < usageLiveEvents.length && usageLiveEvents[idx].ts < bucketEnd) {
         const e = usageLiveEvents[idx];
-        running.set(e.model, (running.get(e.model) || 0) + e.tokens);
+        totals.set(e.model, (totals.get(e.model) || 0) + e.tokens);
         idx++;
       }
-      const grand = [...running.values()].reduce((a, b) => a + b, 0);
-      bars.push({ label: fmtBucketLabel(bucketStart), grand, totals: new Map(running) });
+      const grand = [...totals.values()].reduce((a, b) => a + b, 0);
+      bars.push({ label: fmtBucketLabel(bucketStart), grand, totals });
     }
 
-    // Stacking order is fixed to the latest bucket's ranking — heaviest
+    // Stacking order is ranked by each model's total across the whole
+    // visible window (not just one bucket, which may be empty) — heaviest
     // model at the bottom of every bar — so a model's segment stays in the
     // same visual band across bars instead of reshuffling bucket to bucket.
-    const order = [...bars[bars.length - 1].totals.entries()]
+    const windowTotals = new Map();
+    for (const bar of bars) {
+      for (const [model, value] of bar.totals) {
+        windowTotals.set(model, (windowTotals.get(model) || 0) + value);
+      }
+    }
+    const order = [...windowTotals.entries()]
       .sort((a, b) => b[1] - a[1])
       .map(([model]) => model);
-    const max = bars[bars.length - 1].grand || 1;
+    const max = Math.max(1, ...bars.map((bar) => bar.grand));
 
     usageLiveChart.innerHTML = bars
       .map((bar) => {
